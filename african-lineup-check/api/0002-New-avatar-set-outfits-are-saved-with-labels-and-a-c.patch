@@ -1,0 +1,510 @@
+From ae95b5c5ee62c1b37e2ed026ee8fc4e0b0aa4aa4 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:52:07 +0000
+Subject: [PATCH 2/5] New avatar-set outfits are saved with labels and a clean
+ name
+
+The Studio saves a new race outfit with a picture and a name made from the typed
+words, and no labels. Now the European picture gets the same two AI reads as a
+Studio clothes picture (its name, then the picture), the African picture and each
+race plate copy the European row's labels, and a franchise or brand name the word
+list knows is taken out of the saved name. A label read that gives nothing is
+logged as clothes.labels failed (it was silent); the outfit is still saved.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/lib/server/authoring/createPublish.ts     |   3 +
+ .../server/catalog/setOutfitLabels.test.ts    | 198 ++++++++++++++++++
+ src/lib/server/catalog/setOutfitLabels.ts     | 111 ++++++++++
+ .../server/clothesGeneration/classifiers.ts   |  42 +++-
+ src/lib/server/clothesGeneration/lifecycle.ts |   5 +-
+ .../clothesGeneration/outfitPromptCheck.ts    |   9 +
+ 6 files changed, 358 insertions(+), 10 deletions(-)
+ create mode 100644 src/lib/server/catalog/setOutfitLabels.test.ts
+ create mode 100644 src/lib/server/catalog/setOutfitLabels.ts
+
+diff --git a/src/lib/server/authoring/createPublish.ts b/src/lib/server/authoring/createPublish.ts
+index 25df460..080587b 100644
+--- a/src/lib/server/authoring/createPublish.ts
++++ b/src/lib/server/authoring/createPublish.ts
+@@ -7,6 +7,7 @@ import {
+ 	type CreateWardrobeInput
+ } from '$lib/server/authoring/createLibraryAssets';
+ import { copyCustomOutfitSeedMaster } from '$lib/server/catalog/customOutfitSeed';
++import { withSetOutfitLabels } from '$lib/server/catalog/setOutfitLabels';
+ import { dispatchAuthoringJob } from '$lib/server/authoring/jobs/dispatch';
+ import { createPublishResponse } from '$lib/server/authoring/jobs/authoringJobs';
+ 
+@@ -22,6 +23,8 @@ export async function createWardrobeAndDispatch(
+ 			uploadId: input.uploadId,
+ 			externalId: input.externalId
+ 		});
++		// A new avatar-set outfit arrives with a picture and a name only: its labels are read (or copied) here.
++		input = await withSetOutfitLabels(prisma, input);
+ 	}
+ 	const result = await createWardrobePublish(prisma, input);
+ 	if (result.created) {
+diff --git a/src/lib/server/catalog/setOutfitLabels.test.ts b/src/lib/server/catalog/setOutfitLabels.test.ts
+new file mode 100644
+index 0000000..e353081
+--- /dev/null
++++ b/src/lib/server/catalog/setOutfitLabels.test.ts
+@@ -0,0 +1,198 @@
++import type { PrismaClient } from '@prisma/client';
++import sharp from 'sharp';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++import type { CreateWardrobeInput } from '$lib/server/authoring/createLibraryAssets';
++import { EMPTY_CLOTHES_TAXONOMY } from '$lib/server/taxonomy/wardrobeTaxonomy';
++
++const r2 = vi.hoisted(() => ({ getR2ObjectBuffer: vi.fn(), privateAuthoringBucket: () => 'authoring' }));
++vi.mock('$lib/server/authoring/r2', () => r2);
++const reads = vi.hoisted(() => ({ words: vi.fn(), picture: vi.fn() }));
++vi.mock('$lib/server/clothesGeneration/classifiers', async (importOriginal) => ({
++	...(await importOriginal<typeof import('$lib/server/clothesGeneration/classifiers')>()),
++	inferClothesPromptIntent: reads.words,
++	classifyClothesVision: reads.picture
++}));
++const taxonomy = vi.hoisted(() => ({ clothes: vi.fn(), costume: vi.fn() }));
++vi.mock('$lib/server/taxonomy/wardrobeTaxonomyPersist', () => ({
++	loadClothesTaxonomyMap: taxonomy.clothes,
++	loadCostumeTaxonomyMap: taxonomy.costume
++}));
++
++import { withSetOutfitLabels } from './setOutfitLabels';
++
++const clothes = { findFirst: vi.fn() };
++const costume = { findFirst: vi.fn() };
++const prisma = { clothes, costume } as unknown as PrismaClient;
++const TRACKSUIT = { ...EMPTY_CLOTHES_TAXONOMY, colours: ['red'], composition: 'separates', uses: ['sport'] };
++
++function outfit(externalId: string, name: string, kind: 'clothes' | 'costume' = 'clothes'): CreateWardrobeInput {
++	return { kind, organizationId: 'org_1', projectId: 'proj_1', avatarId: 'dd80126a', uploadId: 'upload_1', name, externalId };
++}
++
++beforeEach(async () => {
++	vi.spyOn(console, 'error').mockImplementation(() => {});
++	vi.spyOn(console, 'info').mockImplementation(() => {});
++	r2.getR2ObjectBuffer.mockResolvedValue(
++		await sharp({ create: { width: 64, height: 64, channels: 4, background: { r: 200, g: 0, b: 0, alpha: 1 } } })
++			.png()
++			.toBuffer()
++	);
++	reads.words.mockResolvedValue({
++		enhancedDescription: 'a racing tracksuit',
++		labels: { taxonomy: { ...EMPTY_CLOTHES_TAXONOMY, uses: ['sport'] }, country: 'Italy', description: null, name: 'Racing Tracksuit' },
++		confidence: {}
++	});
++	reads.picture.mockResolvedValue({
++		colours: ['red'],
++		composition: 'separates',
++		uniform: null,
++		universe: null,
++		era: null,
++		description: 'A red zipped racing tracksuit with white side stripes.',
++		name: 'Red Tracksuit',
++		confidence: { colours: 0.9, composition: 0.9 }
++	});
++});
++
++afterEach(() => {
++	vi.restoreAllMocks();
++	vi.clearAllMocks();
++	vi.useRealTimers();
++});
++
++describe('labels for a new avatar-set outfit', () => {
++	it('reads the European picture and its name, and saves the merged labels with it', async () => {
++		const labelled = await withSetOutfitLabels(
++			prisma,
++			outfit('avatar-set-outfit-seed:09hmxcmk:racing_tracksuit_ab12cd:european', 'Racing tracksuit')
++		);
++		expect(r2.getR2ObjectBuffer).toHaveBeenCalledWith(
++			'authoring',
++			'projects/proj_1/avatar-sets/09hmxcmk/clothes/european/racing_tracksuit_ab12cd.png'
++		);
++		expect(reads.words).toHaveBeenCalledWith(expect.objectContaining({ rawPrompt: 'Racing tracksuit', avatarId: 'dd80126a' }));
++		// the picture read gets the 384 px copy on a plain background
++		const sent = Buffer.from(reads.picture.mock.calls[0]![0].imagePngBase64 as string, 'base64');
++		expect((await sharp(sent).metadata()).width).toBe(384);
++		expect(labelled).toMatchObject({
++			name: 'Racing tracksuit',
++			taxonomy: TRACKSUIT,
++			description: 'A red zipped racing tracksuit with white side stripes.',
++			country: 'Italy'
++		});
++		expect(console.error).not.toHaveBeenCalled();
++	});
++
++	it('copies the European labels onto the African picture and onto a race plate of the same outfit', async () => {
++		clothes.findFirst.mockResolvedValue({ id: 'row_1', description: 'A red tracksuit.', country: 'Italy' });
++		taxonomy.clothes.mockResolvedValue(new Map([['row_1', TRACKSUIT]]));
++
++		const african = await withSetOutfitLabels(
++			prisma,
++			outfit('avatar-set-outfit-seed:09hmxcmk:racing_tracksuit_ab12cd:african', 'Racing tracksuit · African')
++		);
++		expect(clothes.findFirst).toHaveBeenLastCalledWith(
++			expect.objectContaining({
++				where: {
++					projectId: 'proj_1',
++					deletedAt: null,
++					externalId: 'avatar-set-outfit-seed:09hmxcmk:racing_tracksuit_ab12cd:european'
++				}
++			})
++		);
++		expect(african).toMatchObject({ taxonomy: TRACKSUIT, description: 'A red tracksuit.', country: 'Italy' });
++
++		const plate = await withSetOutfitLabels(
++			prisma,
++			outfit('avatar-set-outfit:dd80126a:racing_tracksuit_ab12cd--middle-eastern', 'Racing tracksuit (Middle Eastern)')
++		);
++		expect(clothes.findFirst).toHaveBeenLastCalledWith(
++			expect.objectContaining({
++				where: expect.objectContaining({
++					externalId: { startsWith: 'avatar-set-', contains: '-seed:', endsWith: ':racing_tracksuit_ab12cd:european' }
++				})
++			})
++		);
++		expect(plate).toMatchObject({ taxonomy: TRACKSUIT, country: 'Italy' });
++		expect(reads.words).not.toHaveBeenCalled();
++		expect(reads.picture).not.toHaveBeenCalled();
++	});
++
++	it('copies from the costume rows for a costume', async () => {
++		costume.findFirst.mockResolvedValue({ id: 'row_2', description: null, country: null });
++		taxonomy.costume.mockResolvedValue(new Map([['row_2', TRACKSUIT]]));
++		const african = await withSetOutfitLabels(
++			prisma,
++			outfit('avatar-set-outfit-seed:xp8qtdvc:jumpsuit_vfsuax:african', 'Black jumpsuit · African', 'costume')
++		);
++		expect(african.taxonomy).toEqual(TRACKSUIT);
++		expect(clothes.findFirst).not.toHaveBeenCalled();
++	});
++
++	it('takes a franchise or brand name out of the saved name, and says so', async () => {
++		const labelled = await withSetOutfitLabels(
++			prisma,
++			outfit('avatar-set-outfit-seed:09hmxcmk:spider_man_hoodie_ab12cd:european', 'Spider-Man hoodie')
++		);
++		expect(labelled.name).not.toMatch(/spider/i);
++		expect(labelled.name?.[0]).toBe(labelled.name?.[0]?.toUpperCase());
++		expect(reads.words).toHaveBeenCalledWith(expect.objectContaining({ rawPrompt: labelled.name }));
++		expect(console.info).toHaveBeenCalledWith(
++			'clothes.labels name cleaned',
++			expect.objectContaining({ from: 'Spider-Man hoodie', to: labelled.name })
++		);
++	});
++
++	it('still saves the outfit, and logs why, when the reads give nothing or the picture cannot be loaded', async () => {
++		reads.words.mockResolvedValue(null);
++		reads.picture.mockResolvedValue(null);
++		const european = outfit('avatar-set-outfit-seed:09hmxcmk:racing_tracksuit_ab12cd:european', 'Racing tracksuit');
++		expect(await withSetOutfitLabels(prisma, european)).toMatchObject({ taxonomy: EMPTY_CLOTHES_TAXONOMY, description: null });
++
++		r2.getR2ObjectBuffer.mockRejectedValue(new Error('missing projects/proj_1/…'));
++		expect(await withSetOutfitLabels(prisma, european)).toEqual(european);
++		expect(console.error).toHaveBeenCalledWith('clothes.labels failed', {
++			read: 'picture',
++			why: 'missing projects/proj_1/…',
++			externalId: european.externalId
++		});
++	});
++
++	it('does not wait more than 10 s for a read', async () => {
++		vi.useFakeTimers();
++		reads.words.mockReturnValue(new Promise(() => {}));
++		const pending = withSetOutfitLabels(
++			prisma,
++			outfit('avatar-set-outfit-seed:09hmxcmk:racing_tracksuit_ab12cd:european', 'Racing tracksuit')
++		);
++		await vi.waitFor(() => expect(reads.picture).toHaveBeenCalled());
++		await vi.advanceTimersByTimeAsync(10_000);
++		// the picture read still counts
++		expect(await pending).toMatchObject({ taxonomy: { colours: ['red'], uses: [] }, country: null });
++		expect(console.error).toHaveBeenCalledWith('clothes.labels failed', { read: 'words', why: 'no answer in 10 s' });
++	});
++
++	it('logs an African picture whose European row is missing, and leaves a catalogue race plate alone', async () => {
++		clothes.findFirst.mockResolvedValue(null);
++		const african = outfit('avatar-set-outfit-seed:09hmxcmk:racing_tracksuit_ab12cd:african', 'Racing tracksuit · African');
++		expect(await withSetOutfitLabels(prisma, african)).toEqual(african);
++		expect(console.error).toHaveBeenCalledWith('clothes.labels failed', {
++			read: 'copy',
++			why: 'the European picture of this outfit has no saved row',
++			externalId: african.externalId
++		});
++		vi.mocked(console.error).mockClear();
++		const catalogue = outfit('avatar-set-outfit:dd80126a:satin_suit--european', 'satin_suit (european)');
++		expect(await withSetOutfitLabels(prisma, catalogue)).toEqual(catalogue);
++		expect(console.error).not.toHaveBeenCalled();
++	});
++
++	it('leaves every other save as it is', async () => {
++		const plain = outfit('avatar-set-clothes:dd80126a:nurse', 'nurse');
++		expect(await withSetOutfitLabels(prisma, plain)).toBe(plain);
++		const withLabels = { ...outfit('avatar-set-outfit-seed:09hmxcmk:a_b:european', 'A b'), taxonomy: { ...TRACKSUIT } };
++		expect(await withSetOutfitLabels(prisma, withLabels)).toEqual(withLabels);
++		expect(reads.picture).not.toHaveBeenCalled();
++	});
++});
+diff --git a/src/lib/server/catalog/setOutfitLabels.ts b/src/lib/server/catalog/setOutfitLabels.ts
+new file mode 100644
+index 0000000..2b06e4a
+--- /dev/null
++++ b/src/lib/server/catalog/setOutfitLabels.ts
+@@ -0,0 +1,111 @@
++/**
++ * Labels for a new avatar-set outfit when the Studio saves it (the two-step race outfits of raceOutfitSteps.ts).
++ * The Studio sends only the picture and a name made from the words the author typed.
++ *
++ * - The European picture is read like a Studio "+ New clothes" picture: one AI read of the name, one of the picture,
++ *   merged. Its labels, description and country are saved with the row.
++ * - The African picture and every race plate of that outfit copy the European row's labels.
++ * - The name loses any franchise, character or brand name the word list knows.
++ *
++ * A failed read is logged (`clothes.labels failed`) and the outfit is still saved, without those labels.
++ */
++import type { PrismaClient } from '@prisma/client';
++
++import type { CreateWardrobeInput } from '$lib/server/authoring/createLibraryAssets';
++import { getR2ObjectBuffer, privateAuthoringBucket } from '$lib/server/authoring/r2';
++import { classifyClothesVision, inferClothesPromptIntent, logLabelsFailed } from '$lib/server/clothesGeneration/classifiers';
++import { visionClassifierRendition } from '$lib/server/clothesGeneration/compositeRgba';
++import { EMPTY_CLOTHES_LABELS, reconcileClothesLabels } from '$lib/server/clothesGeneration/labels';
++import { outfitWordsWithoutNames } from '$lib/server/clothesGeneration/outfitPromptCheck';
++import { loadClothesTaxonomyMap, loadCostumeTaxonomyMap } from '$lib/server/taxonomy/wardrobeTaxonomyPersist';
++import { customOutfitSeedAuthoringKey, parseCustomOutfitSeedExternalId } from './customOutfitSeed';
++
++/** The longest wait for one AI read; the save does not wait longer for labels. */
++const READ_TIMEOUT_MS = 10_000;
++/** A race plate of an outfit kept from the browser: `avatar-set-outfit:{avatarId}:{outfit}--{race}`. */
++const RACE_PLATE = /^avatar-set-outfit:[^:]+:(.+?)--[a-z-]+$/;
++
++type Labels = Pick<CreateWardrobeInput, 'taxonomy' | 'description' | 'country'>;
++
++export async function withSetOutfitLabels(prisma: PrismaClient, input: CreateWardrobeInput): Promise<CreateWardrobeInput> {
++	if (input.kind === 'hair' || !input.externalId) return input;
++	const seed = parseCustomOutfitSeedExternalId(input.externalId);
++	const racePlateOf = seed ? null : (RACE_PLATE.exec(input.externalId)?.[1] ?? null);
++	if (!seed && !racePlateOf) return input;
++
++	const named = { ...input, ...(input.name ? { name: cleanName(input.name, input.externalId) } : {}) };
++	// A caller that already has labels keeps them.
++	if (input.taxonomy) return named;
++	try {
++		if (seed?.ethnicity === 'european') {
++			const png = await getR2ObjectBuffer(privateAuthoringBucket(), customOutfitSeedAuthoringKey(input.projectId, seed));
++			return { ...named, ...(await labelsFromPicture(png, named.name ?? '', input.avatarId)) };
++		}
++		const copied = await europeanLabels(prisma, input, seed ? null : racePlateOf);
++		// A race plate with no new-outfit row behind it is a catalogue outfit: not labelled here.
++		if (!copied && seed) logLabelsFailed('copy', 'the European picture of this outfit has no saved row', input.externalId);
++		return copied ? { ...named, ...copied } : named;
++	} catch (error) {
++		logLabelsFailed(seed?.ethnicity === 'european' ? 'picture' : 'copy', error, input.externalId);
++		return named;
++	}
++}
++
++/** The name without franchise, character or brand names, starting with a capital. */
++function cleanName(name: string, externalId: string): string {
++	const cleaned = outfitWordsWithoutNames(name);
++	if (cleaned.removed.length === 0) return name;
++	const words = cleaned.words.charAt(0).toUpperCase() + cleaned.words.slice(1);
++	console.info('clothes.labels name cleaned', { externalId, from: name, to: words, removed: cleaned.removed });
++	return words;
++}
++
++async function labelsFromPicture(png: Buffer, name: string, avatarId: string): Promise<Labels> {
++	const rendition = await visionClassifierRendition(png);
++	const [intent, visual] = await Promise.all([
++		withinLimit('words', inferClothesPromptIntent({ rawPrompt: name, avatarId, userOverrides: null, userOverrideDimensions: [] })),
++		withinLimit('picture', classifyClothesVision({ imagePngBase64: rendition.toString('base64') }))
++	]);
++	const labels = reconcileClothesLabels({
++		userOverrides: null,
++		userOverrideDimensions: [],
++		promptIntent: intent?.labels ?? EMPTY_CLOTHES_LABELS,
++		visual
++	});
++	return { taxonomy: { ...labels.taxonomy }, description: labels.description, country: labels.country };
++}
++
++function withinLimit<T>(read: 'words' | 'picture', work: Promise<T | null>): Promise<T | null> {
++	let timer: ReturnType<typeof setTimeout> | undefined;
++	const limit = new Promise<null>((resolve) => {
++		timer = setTimeout(() => {
++			logLabelsFailed(read, `no answer in ${READ_TIMEOUT_MS / 1000} s`);
++			resolve(null);
++		}, READ_TIMEOUT_MS);
++	});
++	return Promise.race([work, limit]).finally(() => clearTimeout(timer));
++}
++
++/** The labels saved with the European picture of the same outfit: `racePlateOf` names it for a race plate. */
++async function europeanLabels(
++	prisma: PrismaClient,
++	input: CreateWardrobeInput,
++	racePlateOf: string | null
++): Promise<Labels | null> {
++	const where = {
++		projectId: input.projectId,
++		deletedAt: null,
++		externalId: racePlateOf
++			? { startsWith: 'avatar-set-', contains: '-seed:', endsWith: `:${racePlateOf}:european` }
++			: input.externalId!.replace(/:african$/, ':european')
++	};
++	const select = { id: true, description: true, country: true } as const;
++	const row =
++		input.kind === 'costume'
++			? await prisma.costume.findFirst({ where, select })
++			: await prisma.clothes.findFirst({ where, select });
++	if (!row) return null;
++	const load = input.kind === 'costume' ? loadCostumeTaxonomyMap : loadClothesTaxonomyMap;
++	const taxonomy = (await load(prisma, [row.id])).get(row.id);
++	return { taxonomy: taxonomy ? { ...taxonomy } : null, description: row.description, country: row.country };
++}
+diff --git a/src/lib/server/clothesGeneration/classifiers.ts b/src/lib/server/clothesGeneration/classifiers.ts
+index 08ec099..4290210 100644
+--- a/src/lib/server/clothesGeneration/classifiers.ts
++++ b/src/lib/server/clothesGeneration/classifiers.ts
+@@ -17,6 +17,18 @@ import {
+ 	type ClothesVisualClassification
+ } from './labels';
+ 
++/**
++ * A label read that gave nothing: which one, and why. The outfit is still saved, without those labels, so this log is
++ * the only sign.
++ */
++export function logLabelsFailed(read: 'words' | 'picture' | 'copy', why: unknown, externalId?: string): void {
++	console.error('clothes.labels failed', {
++		read,
++		why: why instanceof Error ? why.message : String(why),
++		...(externalId ? { externalId } : {})
++	});
++}
++
+ function enabledSlugs(dimension: TaxonomyDimension): string[] {
+ 	return PLATFORM_TAXONOMY_REGISTRY.filter((row) => row.dimension === dimension && row.enabled).map(
+ 		(row) => row.slug
+@@ -50,7 +62,11 @@ export async function inferClothesPromptIntent(args: {
+ 	readonly userOverrideDimensions: readonly string[];
+ }): Promise<ClothesPromptIntent | null> {
+ 	const apiKey = getOpenRouterApiKey();
+-	if (!apiKey) return null;
++	if (!apiKey) {
++		logLabelsFailed('words', 'no OpenRouter key');
++		return null;
++	}
++	let why: unknown = 'the answer could not be read';
+ 	const system = [
+ 		'You infer wardrobe taxonomy intent for avatar clothes generation.',
+ 		'Return ONLY JSON matching the schema. Use only allowed slugs. Never invent ids.',
+@@ -91,7 +107,8 @@ export async function inferClothesPromptIntent(args: {
+ 				response_format: { type: 'json_object' }
+ 			});
+ 			return parsePromptIntent(extractJsonObject(result.text), args.rawPrompt);
+-		} catch {
++		} catch (error) {
++			why = error;
+ 			return null;
+ 		}
+ 	};
+@@ -100,6 +117,7 @@ export async function inferClothesPromptIntent(args: {
+ 	if (first && !isBlankClothesLabels(first.labels)) return first;
+ 	const second = await runOnce();
+ 	if (second && !isBlankClothesLabels(second.labels)) return second;
++	if (!second && !first) logLabelsFailed('words', why);
+ 	return second ?? first;
+ }
+ 
+@@ -107,7 +125,11 @@ export async function classifyClothesVision(args: {
+ 	readonly imagePngBase64: string;
+ }): Promise<ClothesVisualClassification | null> {
+ 	const apiKey = getOpenRouterApiKey();
+-	if (!apiKey) return null;
++	if (!apiKey) {
++		logLabelsFailed('picture', 'no OpenRouter key');
++		return null;
++	}
++	let why: unknown = 'the answer could not be read';
+ 
+ 	const system = [
+ 		'Classify garments only from the image. Ignore skin, face, background, hair.',
+@@ -162,7 +184,10 @@ export async function classifyClothesVision(args: {
+ 					]
+ 				})
+ 			});
+-			if (!response.ok) return null;
++			if (!response.ok) {
++				why = `the text model answered ${response.status}`;
++				return null;
++			}
+ 			const body = (await response.json()) as {
+ 				choices?: { message?: { content?: unknown } }[];
+ 			};
+@@ -182,12 +207,13 @@ export async function classifyClothesVision(args: {
+ 			if (!text.trim()) return null;
+ 			const parsed = parseVisualClassification(extractJsonObject(text));
+ 			return isBlankVisualClassification(parsed) ? null : parsed;
+-		} catch {
++		} catch (error) {
++			why = error;
+ 			return null;
+ 		}
+ 	};
+ 
+-	const first = await runOnce();
+-	if (first) return first;
+-	return runOnce();
++	const result = (await runOnce()) ?? (await runOnce());
++	if (!result) logLabelsFailed('picture', why);
++	return result;
+ }
+diff --git a/src/lib/server/clothesGeneration/lifecycle.ts b/src/lib/server/clothesGeneration/lifecycle.ts
+index da7aa2d..cd70d29 100644
+--- a/src/lib/server/clothesGeneration/lifecycle.ts
++++ b/src/lib/server/clothesGeneration/lifecycle.ts
+@@ -55,7 +55,7 @@ import {
+ 	replaceClothesTaxonomy,
+ 	replaceCostumeTaxonomy
+ } from '$lib/server/taxonomy/wardrobeTaxonomyPersist';
+-import { classifyClothesVision, inferClothesPromptIntent } from './classifiers';
++import { classifyClothesVision, inferClothesPromptIntent, logLabelsFailed } from './classifiers';
+ import { checkOutfitPrompt } from './outfitPromptCheck';
+ import { compositeRgbAndAlpha, previewWebpFromRgba, visionClassifierRendition } from './compositeRgba';
+ import {
+@@ -617,7 +617,8 @@ async function finalizeSucceededJob(
+ 	try {
+ 		const rendition = await visionClassifierRendition(composited.png);
+ 		visual = await classifyClothesVision({ imagePngBase64: rendition.toString('base64') });
+-	} catch {
++	} catch (error) {
++		logLabelsFailed('picture', error);
+ 		visual = null;
+ 	}
+ 
+diff --git a/src/lib/server/clothesGeneration/outfitPromptCheck.ts b/src/lib/server/clothesGeneration/outfitPromptCheck.ts
+index 6915b34..b80ed71 100644
+--- a/src/lib/server/clothesGeneration/outfitPromptCheck.ts
++++ b/src/lib/server/clothesGeneration/outfitPromptCheck.ts
+@@ -231,6 +231,15 @@ export function checkOutfitWords(
+ 	if (NUDITY.test(text) || (wearer !== 'male' && BARE_CHEST.test(text))) {
+ 		throw new AuthoringError(422, 'OUTFIT_NUDITY', OUTFIT_NUDITY_MESSAGE);
+ 	}
++	return outfitWordsWithoutNames(text);
++}
++
++/**
++ * The word list's name rules on their own, with no nudity refusal: for words whose picture has already been drawn
++ * and checked (an outfit's saved name).
++ */
++export function outfitWordsWithoutNames(description: string): { readonly words: string; readonly removed: readonly string[] } {
++	const text = description.trim();
+ 	const removed: string[] = [];
+ 	let words = text;
+ 	for (const { pattern, to } of nameRules) {
+-- 
+2.50.1 (Apple Git-155)
+

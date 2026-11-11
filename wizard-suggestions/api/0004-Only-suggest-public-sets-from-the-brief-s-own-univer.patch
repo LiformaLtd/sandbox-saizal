@@ -1,0 +1,398 @@
+From ac900661ddb17c759406d4b532fcf68085ab9173 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:02:45 +0000
+Subject: [PATCH 4/5] Only suggest public sets from the brief's own universe
+
+The setup AI now names the brief's universe (setUniverse, one of the
+platform universe labels: contemporary, historical, fantasy,
+science-fiction, supernatural), and each public set line shows its own
+universe. The server keeps only suggested sets in that universe and logs
+any it drops, so a modern police stop can no longer get a fantasy desert
+path. Public sets with no universe label are not offered (logged), since
+they cannot be checked. setUniverse is not sent on to the Studio.
+
+Real AI check (5 calls, 10 Nov): police stop -> 3 modern park paths,
+car mechanic -> none (no garage set exists), hotel -> 3 hotel lobby views,
+dwarf blacksmith -> 3 Dwarven Depths sets, 1940s radio operator -> 3
+1940s sets. No set needed dropping.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../generateExperienceSetupDetails.test.ts    | 25 ++++++
+ .../generateExperienceSetupDetails.ts         | 12 ++-
+ ...jectSetupDetailsGenerationEndpoint.test.ts |  2 +
+ .../platform/setSuggestionChoices.test.ts     | 78 ++++++++++++++++---
+ .../server/platform/setSuggestionChoices.ts   | 51 +++++++++---
+ 5 files changed, 144 insertions(+), 24 deletions(-)
+
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.test.ts b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+index 74d0783..f241c48 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.test.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+@@ -190,6 +190,27 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 		expect(parseGeneratedExperienceSetupDetails(JSON.stringify(base))?.suggestedClothesIds).toEqual([]);
+ 	});
+ 
++	it('keeps a known set universe and leaves out any other value', () => {
++		const base = {
++			title: 'Valid',
++			description: 'ok',
++			introduction: '',
++			characterName: 'Ada',
++			characterRole: 'Tutor',
++			characterPersonality: '',
++			characterInstructions: '',
++			setName: 'Room',
++			setDescription: 'A bright room in the daytime.',
++			startingMessage: 'Hello.',
++			systemInstructions: 'Help the participant practise.'
++		};
++		expect(parseGeneratedExperienceSetupDetails(JSON.stringify({ ...base, setUniverse: ' Fantasy ' }))?.setUniverse).toBe(
++			'fantasy'
++		);
++		expect(parseGeneratedExperienceSetupDetails(JSON.stringify({ ...base, setUniverse: 'space opera' }))?.setUniverse).toBeUndefined();
++		expect(parseGeneratedExperienceSetupDetails(JSON.stringify(base))?.setUniverse).toBeUndefined();
++	});
++
+ 	it('snaps a nearby age and a spaced ethnicity onto the character form values', () => {
+ 		expect(
+ 			parseGeneratedExperienceSetupDetails(
+@@ -243,5 +264,9 @@ describe('EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT', () => {
+ 		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain('southeast-asian');
+ 		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain('setDescription');
+ 		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain('At most 800 characters');
++		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain(
++			'exactly one of "contemporary", "historical", "fantasy", "science-fiction", "supernatural"'
++		);
++		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain('Suggest only sets whose universe is setUniverse');
+ 	});
+ });
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.ts b/src/lib/server/platform/generateExperienceSetupDetails.ts
+index e77c102..fe97f2b 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.ts
+@@ -4,7 +4,7 @@ import {
+ 	wardrobePromptChoices,
+ 	type CharacterWardrobeChoices
+ } from './characterWardrobeChoices';
+-import { MAX_SUGGESTED_SETS, setChoicePromptLines, type SetChoice } from './setSuggestionChoices';
++import { MAX_SUGGESTED_SETS, SET_UNIVERSES, setChoicePromptLines, type SetChoice } from './setSuggestionChoices';
+ import type { PrismaClient } from '@prisma/client';
+ import { z } from 'zod';
+ import { CONVERSATION_INSTRUCTION_QUALITY } from './conversationInstructionDesign';
+@@ -70,6 +70,7 @@ const generatedDetailsSchema = z
+ 		characterInstructions: z.string().trim().max(5000),
+ 		setName: z.string().trim().max(128),
+ 		setDescription: z.string().trim().max(800),
++		setUniverse: z.string().optional(),
+ 		suggestedSetRefs: z.array(z.number().int()).max(MAX_SUGGESTED_SETS).default([]),
+ 		startingMessage: z.string().trim().max(500),
+ 		systemInstructions: z.string().trim().max(5000)
+@@ -96,6 +97,7 @@ const RESPONSE_SCHEMA = {
+ 		'characterInstructions',
+ 		'setName',
+ 		'setDescription',
++		'setUniverse',
+ 		'suggestedSetRefs',
+ 		'startingMessage',
+ 		'systemInstructions'
+@@ -120,6 +122,7 @@ const RESPONSE_SCHEMA = {
+ 		characterInstructions: { type: 'string', maxLength: 5000 },
+ 		setName: { type: 'string', maxLength: 128 },
+ 		setDescription: { type: 'string', maxLength: 800 },
++		setUniverse: { type: 'string', enum: [...SET_UNIVERSES] },
+ 		suggestedSetRefs: { type: 'array', items: { type: 'integer' }, maxItems: MAX_SUGGESTED_SETS },
+ 		startingMessage: { type: 'string', maxLength: 500 },
+ 		systemInstructions: { type: 'string', maxLength: 5000 }
+@@ -130,7 +133,7 @@ export const EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT = `You design a coherent Lif
+ Liforma Experiences are browser-based conversations between one human participant and one animated talking character.
+ 
+ Return ONLY valid JSON with exactly these fields:
+-{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","suggestedClothesIds":["...","..."],"characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","suggestedSetRefs":[17,4],"startingMessage":"...","systemInstructions":"..."}
++{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","suggestedClothesIds":["...","..."],"characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","setUniverse":"contemporary","suggestedSetRefs":[17,4],"startingMessage":"...","systemInstructions":"..."}
+ 
+ Field rules:
+ - title: a clear, appealing title, 1–128 characters.
+@@ -147,7 +150,8 @@ Field rules:
+ - characterInstructions: instructions the model reads while playing this character. Write in second person ("you", "your"). Cover reusable identity, background, expertise, persistent relationships, rules, and boundaries that should follow this character between experiences. Example: "You have worked at your family's restaurant for years and know the menu by heart. You are proud of your heritage and the food you serve. Stay professional yet warm. Share a short anecdote about the restaurant or the neighborhood only when asked. Avoid over-familiarity, and treat regular customers like old friends." Do not narrate in the third person. Do not include facts, goals, events, or constraints that apply only to this experience or set.
+ - setName: a concise, reusable name for the visual setting where the conversation happens. Name the place, not the activity.
+ - setDescription: a reusable visual description of that setting for backdrop generation. Describe what the place looks like, the time of day, and the weather. Do not include the participant's task, the plot, or character instructions. At most 800 characters.
+-- suggestedSetRefs: up to three numbers from the supplied publicSets list (each line is "number: set name (collection)") for the listed sets that best fit setName, setDescription, and the brief, best first. Suggest only sets from the brief's own world or period (modern, historical, fantasy, science fiction) that show the same kind of place as the brief; when the list has no such set, return an empty array. Copy numbers exactly. Do not invent numbers.
++- setUniverse: the world the brief takes place in, exactly one of ${SET_UNIVERSES.map((universe) => `"${universe}"`).join(', ')}. Use "contemporary" for the present day and "historical" for any past period.
++- suggestedSetRefs: up to three numbers from the supplied publicSets list (each line is "number: set name (universe; collection)") for the listed sets that best fit setName, setDescription, and the brief, best first. Suggest only sets whose universe is setUniverse and that show the same kind of place as the brief; when the list has no such set, return an empty array. Copy numbers exactly. Do not invent numbers.
+ - startingMessage: the exact first words spoken by the character. This is especially important. Write a natural opening in the character's voice that immediately establishes the situation and gives the participant something meaningful to respond to. Prefer one or two short sentences. Do not use stage directions, narration, quotation marks, labels, placeholders, or a generic "How can I help?" unless that truly fits the scenario. Do not speak for the participant or reveal information meant to remain hidden.
+ - systemInstructions: additional situation-specific instructions the model reads while playing this character. This is especially important. Write in second person ("you", "your") and refer to the human as "the participant". In clear present-tense prose, establish the immediate context, the participant's role, your objective, relevant facts, constraints, desired progression, and how you should respond to likely choices. Preserve participant agency and any deliberate mystery. Include concrete scenario facts needed for a consistent conversation, but do not repeat generic character identity or personality. Do not write in the third person, script the participant, mention prompts or models, or include implementation commentary. Write a detailed runnable brief with compact sections, normally 2,800–4,500 characters. Use the author brief as fixed direction and flesh out unspecified interaction design creatively, without fabricating real-world facts or unsupported capabilities.
+ 
+@@ -260,6 +264,8 @@ export function normalizeGeneratedExperienceSetupDetails(value: unknown): unknow
+ 	row.characterGender = characterGenderFromUnknown(row.characterGender);
+ 	row.characterAge = characterAgeFromUnknown(row.characterAge);
+ 	row.characterEthnicity = characterEthnicityFromUnknown(row.characterEthnicity);
++	const universe = typeof row.setUniverse === 'string' ? row.setUniverse.trim().toLowerCase() : '';
++	row.setUniverse = SET_UNIVERSES.includes(universe) ? universe : undefined;
+ 	row.suggestedSetRefs = Array.isArray(row.suggestedSetRefs)
+ 		? row.suggestedSetRefs
+ 				.map((ref) => (typeof ref === 'string' ? Number(ref.trim()) : ref))
+diff --git a/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts b/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
+index 14e3d17..5bc6962 100644
+--- a/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
++++ b/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
+@@ -14,6 +14,7 @@ const publicSet = (setId: string, name: string) => ({
+ 	setting: 'interior',
+ 	space: 'reception',
+ 	userPosition: 'front',
++	universe: 'contemporary',
+ 	availableStyles: [],
+ 	variantCounts: { daytime: 1, evening: 0, night: 0, rainy: 0 },
+ 	backdropId: `backdrop_${setId}`
+@@ -68,6 +69,7 @@ const generatedDetails = {
+ 	characterPersonality: 'Calm and observant.',
+ 	characterInstructions: 'Maya protects guest privacy.',
+ 	setName: 'Hotel front desk',
++	setUniverse: 'contemporary',
+ 	suggestedSetRefs: [2],
+ 	startingMessage: 'May I see your booking confirmation?',
+ 	systemInstructions: 'Help the participant resolve a missing reservation.'
+diff --git a/src/lib/server/platform/setSuggestionChoices.test.ts b/src/lib/server/platform/setSuggestionChoices.test.ts
+index f1f6fcb..ae22d99 100644
+--- a/src/lib/server/platform/setSuggestionChoices.test.ts
++++ b/src/lib/server/platform/setSuggestionChoices.test.ts
+@@ -1,8 +1,13 @@
++import type { PrismaClient } from '@prisma/client';
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+ import type { CatalogueSetListItem } from '$lib/server/places/listCatalogueSets';
+ 
++const listCatalogueSets = vi.hoisted(() => vi.fn());
++vi.mock('$lib/server/places/listCatalogueSets', () => ({ listCatalogueSets }));
++
+ import {
++	loadPublicSetChoices,
+ 	MAX_SUGGESTED_SETS,
+ 	setChoicePromptLines,
+ 	setupDetailsResponse,
+@@ -10,7 +15,12 @@ import {
+ 	type SetChoice
+ } from './setSuggestionChoices';
+ 
+-function set(setId: string, name: string, collection = 'modern'): CatalogueSetListItem {
++function set(
++	setId: string,
++	name: string,
++	collection = 'modern',
++	universe: string | null = 'contemporary'
++): CatalogueSetListItem {
+ 	return {
+ 		setId,
+ 		name,
+@@ -23,6 +33,7 @@ function set(setId: string, name: string, collection = 'modern'): CatalogueSetLi
+ 		setting: 'interior',
+ 		space: 'main',
+ 		userPosition: 'front',
++		...(universe ? { universe } : {}),
+ 		availableStyles: [],
+ 		variantCounts: { daytime: 1, evening: 0, night: 0, rainy: 0 },
+ 		backdropId: `backdrop_${setId}`
+@@ -32,38 +43,82 @@ function set(setId: string, name: string, collection = 'modern'): CatalogueSetLi
+ const choices: SetChoice[] = [
+ 	{ ref: 1, set: set('set_a', 'Boutique Hotel · Reception · Looking At Desk') },
+ 	{ ref: 2, set: set('set_b', 'Park · Picnic Area · Sitting At Table') },
+-	{ ref: 3, set: set('set_c', 'Colliseum · Colliseum Entrance', 'ancient_rome') },
+-	{ ref: 4, set: set('set_d', 'Station · Platform') }
++	{ ref: 3, set: set('set_c', 'Colliseum · Colliseum Entrance', 'ancient_rome', 'historical') },
++	{ ref: 4, set: set('set_d', 'Station · Platform') },
++	{ ref: 5, set: set('set_e', 'Library · Reading Room') }
+ ];
+ 
+ afterEach(() => vi.restoreAllMocks());
+ 
+ describe('public set suggestions', () => {
+-	it('numbers each set with its collection for the model', () => {
++	it('offers only sets with a universe label, numbered, and logs the rest', async () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		listCatalogueSets.mockResolvedValue({
++			sets: [set('set_a', 'Hotel'), set('set_x', 'Unlabelled Hall', 'new_collection', null), set('set_b', 'Park')]
++		});
++		const offered = await loadPublicSetChoices({} as PrismaClient);
++		expect(offered.map(({ ref, set }) => [ref, set.setId])).toEqual([
++			[1, 'set_a'],
++			[2, 'set_b']
++		]);
++		expect(warn).toHaveBeenCalledWith(expect.stringContaining('no universe label'), {
++			count: 1,
++			examples: ['Unlabelled Hall']
++		});
++	});
++
++	it('numbers each set with its universe and collection for the model', () => {
+ 		expect(setChoicePromptLines(choices.slice(2, 3))).toEqual([
+-			'3: Colliseum · Colliseum Entrance (ancient rome)'
++			'3: Colliseum · Colliseum Entrance (historical; ancient rome)'
+ 		]);
+ 	});
+ 
+ 	it('turns the model numbers into sets, best first, without repeats', () => {
+-		expect(suggestedSetsFromRefs([2, 1, 2], choices).map((row) => row.setId)).toEqual(['set_b', 'set_a']);
++		expect(suggestedSetsFromRefs([2, 1, 2], choices, 'contemporary').map((row) => row.setId)).toEqual([
++			'set_b',
++			'set_a'
++		]);
+ 	});
+ 
+ 	it('drops numbers that are not in the list and says so', () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+-		expect(suggestedSetsFromRefs([99, 1], choices).map((row) => row.setId)).toEqual(['set_a']);
++		expect(suggestedSetsFromRefs([99, 1], choices, 'contemporary').map((row) => row.setId)).toEqual(['set_a']);
+ 		expect(warn).toHaveBeenCalledWith(expect.stringContaining('not in the list'), {
+ 			unknown: [99],
+-			offered: 4
++			offered: 5
++		});
++	});
++
++	it('drops sets outside the brief universe and says so', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(suggestedSetsFromRefs([3, 1], choices, 'contemporary').map((row) => row.setId)).toEqual(['set_a']);
++		expect(warn).toHaveBeenCalledWith(expect.stringContaining('outside the brief universe'), {
++			universe: 'contemporary',
++			dropped: [{ ref: 3, name: 'Colliseum · Colliseum Entrance', universe: 'historical' }]
++		});
++	});
++
++	it('drops every set when the model named no universe, and says so', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(suggestedSetsFromRefs([1, 2], choices, undefined)).toEqual([]);
++		expect(warn).toHaveBeenCalledWith(expect.stringContaining('outside the brief universe'), {
++			universe: null,
++			dropped: [
++				{ ref: 1, name: 'Boutique Hotel · Reception · Looking At Desk', universe: 'contemporary' },
++				{ ref: 2, name: 'Park · Picnic Area · Sitting At Table', universe: 'contemporary' }
++			]
+ 		});
+ 	});
+ 
+ 	it('keeps at most three suggestions', () => {
+-		expect(suggestedSetsFromRefs([1, 2, 3, 4], choices)).toHaveLength(MAX_SUGGESTED_SETS);
++		expect(suggestedSetsFromRefs([1, 2, 4, 5], choices, 'contemporary')).toHaveLength(MAX_SUGGESTED_SETS);
+ 	});
+ 
+-	it('replaces the numbers with the sets in the reply to the Studio', () => {
+-		const reply = setupDetailsResponse({ title: 'Check-in', suggestedSetRefs: [1] }, choices);
++	it('replaces the numbers and the universe with the sets in the reply to the Studio', () => {
++		const reply = setupDetailsResponse(
++			{ title: 'Check-in', setUniverse: 'contemporary', suggestedSetRefs: [1] },
++			choices
++		);
+ 		expect(reply).toEqual({
+ 			title: 'Check-in',
+ 			suggestedSets: [
+@@ -81,5 +136,6 @@ describe('public set suggestions', () => {
+ 			]
+ 		});
+ 		expect(reply).not.toHaveProperty('suggestedSetRefs');
++		expect(reply).not.toHaveProperty('setUniverse');
+ 	});
+ });
+diff --git a/src/lib/server/platform/setSuggestionChoices.ts b/src/lib/server/platform/setSuggestionChoices.ts
+index 49492c1..d95c2ea 100644
+--- a/src/lib/server/platform/setSuggestionChoices.ts
++++ b/src/lib/server/platform/setSuggestionChoices.ts
+@@ -5,9 +5,13 @@
+ import type { PrismaClient } from '@prisma/client';
+ 
+ import { listCatalogueSets, type CatalogueSetListItem } from '$lib/server/places/listCatalogueSets';
++import { platformTaxonomyValues } from '$lib/server/taxonomy/platformTaxonomyRegistry';
+ 
+ export const MAX_SUGGESTED_SETS = 3;
+ 
++/** The worlds a set can belong to (the platform `universe` labels): contemporary, historical, fantasy, ... */
++export const SET_UNIVERSES: readonly string[] = platformTaxonomyValues('universe').map((value) => value.slug);
++
+ /** One public set, numbered for the model. */
+ export type SetChoice = { readonly ref: number; readonly set: CatalogueSetListItem };
+ 
+@@ -25,30 +29,49 @@ export type SuggestedSet = Pick<
+ 	| 'setting'
+ >;
+ 
++/** Public sets with a universe label. A set without one cannot be checked against the brief's world, so it is left out and logged. */
+ export async function loadPublicSetChoices(prisma: PrismaClient): Promise<SetChoice[]> {
+ 	const { sets } = await listCatalogueSets(prisma, { library: 'public' });
+-	return sets.map((set, index) => ({ ref: index + 1, set }));
++	const unlabelled = sets.filter((set) => !set.universe);
++	if (unlabelled.length > 0) {
++		console.warn('[experience.setup.details] public sets with no universe label are not offered', {
++			count: unlabelled.length,
++			examples: unlabelled.slice(0, 5).map((set) => set.name)
++		});
++	}
++	return sets.filter((set) => set.universe).map((set, index) => ({ ref: index + 1, set }));
+ }
+ 
+-/** Lines the model reads, e.g. `17: Boutique Hotel · Reception · Looking At Desk (modern)`. */
++/** Lines the model reads, e.g. `17: Boutique Hotel · Reception · Looking At Desk (contemporary; modern)`. */
+ export function setChoicePromptLines(choices: readonly SetChoice[]): string[] {
+-	return choices.map(({ ref, set }) => `${ref}: ${set.name} (${set.collection.replace(/_/g, ' ')})`);
++	return choices.map(
++		({ ref, set }) => `${ref}: ${set.name} (${set.universe}; ${set.collection.replace(/_/g, ' ')})`
++	);
+ }
+ 
+-/** The model's numbers as sets, best first. Unknown and repeated numbers are dropped and logged. */
++/**
++ * The model's numbers as sets, best first. Unknown and repeated numbers are dropped, and so is any set
++ * outside the brief's universe (all of them when the model named no valid universe); drops are logged.
++ */
+ export function suggestedSetsFromRefs(
+ 	refs: readonly number[],
+-	choices: readonly SetChoice[]
++	choices: readonly SetChoice[],
++	universe: string | undefined
+ ): SuggestedSet[] {
+ 	const byRef = new Map(choices.map((choice) => [choice.ref, choice.set]));
+ 	const suggested: SuggestedSet[] = [];
+ 	const unknown: number[] = [];
++	const otherUniverse: Array<{ ref: number; name: string; universe: string | null }> = [];
+ 	for (const ref of refs) {
+ 		const set = byRef.get(ref);
+ 		if (!set) {
+ 			unknown.push(ref);
+ 			continue;
+ 		}
++		if (!universe || set.universe !== universe) {
++			otherUniverse.push({ ref, name: set.name, universe: set.universe ?? null });
++			continue;
++		}
+ 		if (suggested.some((row) => row.setId === set.setId)) continue;
+ 		suggested.push({
+ 			setId: set.setId,
+@@ -69,14 +92,22 @@ export function suggestedSetsFromRefs(
+ 			offered: choices.length
+ 		});
+ 	}
++	if (otherUniverse.length > 0) {
++		console.warn('[experience.setup.details] suggested sets outside the brief universe were dropped', {
++			universe: universe ?? null,
++			dropped: otherUniverse
++		});
++	}
+ 	return suggested;
+ }
+ 
+-/** The generator's details as the Studio receives them: the set numbers swapped for the sets. */
+-export function setupDetailsResponse<T extends { readonly suggestedSetRefs: readonly number[] }>(
++/** The generator's details as the Studio receives them: the set numbers swapped for the sets of the brief's universe. */
++export function setupDetailsResponse<
++	T extends { readonly suggestedSetRefs: readonly number[]; readonly setUniverse?: string }
++>(
+ 	details: T,
+ 	choices: readonly SetChoice[]
+-): Omit<T, 'suggestedSetRefs'> & { readonly suggestedSets: SuggestedSet[] } {
+-	const { suggestedSetRefs, ...rest } = details;
+-	return { ...rest, suggestedSets: suggestedSetsFromRefs(suggestedSetRefs, choices) };
++): Omit<T, 'suggestedSetRefs' | 'setUniverse'> & { readonly suggestedSets: SuggestedSet[] } {
++	const { suggestedSetRefs, setUniverse, ...rest } = details;
++	return { ...rest, suggestedSets: suggestedSetsFromRefs(suggestedSetRefs, choices, setUniverse) };
+ }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,215 @@
+From 196bc69c3c86f1bb29aa17ce96f69047e05c7e12 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:46:07 +0000
+Subject: [PATCH] Keep the African jaw corners when a face is joined onto an
+ outfit.
+
+The join shaved the face to the outfit's outline just above the neck. The African face is wider than that outline, so a wedge was cut from each jaw corner. Where the outfit is empty or only a soft edge there, the face now keeps its own pixel. The endpoint face stamp goes up so stored European and African renders are written again.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../ethnicityPlateMaker.jawCorner.test.ts     | 77 +++++++++++++++++++
+ src/lib/server/catalog/ethnicityPlateMaker.ts | 27 +++++--
+ .../composite/endpointClothesFace.test.ts     |  4 +-
+ .../server/composite/endpointClothesFace.ts   |  2 +-
+ .../composite/writeCompositePair.test.ts      |  2 +-
+ 5 files changed, 102 insertions(+), 10 deletions(-)
+ create mode 100644 src/lib/server/catalog/ethnicityPlateMaker.jawCorner.test.ts
+
+diff --git a/src/lib/server/catalog/ethnicityPlateMaker.jawCorner.test.ts b/src/lib/server/catalog/ethnicityPlateMaker.jawCorner.test.ts
+new file mode 100644
+index 0000000..3004eb1
+--- /dev/null
++++ b/src/lib/server/catalog/ethnicityPlateMaker.jawCorner.test.ts
+@@ -0,0 +1,77 @@
++import { describe, expect, it } from "vitest";
++import {
++  makeRacePlate,
++  PLATE_SIZE,
++  prepareFace,
++  type FaceOutline,
++} from "./ethnicityPlateMaker";
++
++const N = PLATE_SIZE * PLATE_SIZE;
++
++function plate(
++  paint: (x: number, y: number) => readonly [number, number, number, number],
++): Uint8Array {
++  const rgba = new Uint8Array(N * 4);
++  for (let y = 0; y < PLATE_SIZE; y++) {
++    for (let x = 0; x < PLATE_SIZE; x++)
++      rgba.set(paint(x, y), (y * PLATE_SIZE + x) * 4);
++  }
++  return rgba;
++}
++
++/** Chin line at row 352, across the neck. */
++function outline(): FaceOutline {
++  const dots478 = Array.from({ length: 478 }, (_, i) => [
++    300 + (i % 43) * 10,
++    352,
++  ]);
++  return { width: PLATE_SIZE, dots478 };
++}
++
++// The outfit's head and neck are 118 px across (cols 453-570), as Anna's are at the jaw. The face is 132 px
++// across (cols 446-577) down to row 360, as the African face is, and has the outfit's neck below.
++const inOutfit = (x: number) => x >= 453 && x <= 570;
++const inFace = (x: number, y: number) =>
++  y <= 360 ? x >= 446 && x <= 577 : inOutfit(x);
++
++describe("ethnicity plate jaw corners", () => {
++  it(
++    "keeps a face wider than the outfit outline where the outfit is empty",
++    { timeout: 60_000 },
++    () => {
++      // the outfit's outermost columns are a half see-through edge
++      const edge = (x: number) => (x === 453 || x === 570 ? 128 : 255);
++      const light = plate((x) =>
++        inOutfit(x) ? [210, 170, 140, edge(x)] : [0, 0, 0, 0],
++      );
++      const dark = plate((x) =>
++        inOutfit(x) ? [90, 50, 30, edge(x)] : [0, 0, 0, 0],
++      );
++      const face = prepareFace(
++        plate((x, y) => (inFace(x, y) ? [120, 70, 40, 255] : [0, 0, 0, 0])),
++        [outline(), outline(), outline()],
++      );
++      const { rgba, report } = makeRacePlate(light, dark, light, face, {
++        values: [1, 1, 1],
++      });
++      const at = (x: number, y: number) =>
++        Array.from(
++          rgba.subarray((y * PLATE_SIZE + x) * 4, (y * PLATE_SIZE + x) * 4 + 4),
++        );
++
++      // the jaw corners, in the rows where the face used to be trimmed to the outfit
++      for (const y of [350, 354, 358, 360]) {
++        expect(at(448, y), `left corner row ${y}`).toEqual([120, 70, 40, 255]);
++        expect(at(575, y), `right corner row ${y}`).toEqual([120, 70, 40, 255]);
++        expect(at(453, y), `outfit edge row ${y}`).toEqual([120, 70, 40, 255]);
++      }
++      // from the outline switch down, the outfit's outline is untouched
++      for (const y of [361, 365, 369, 400]) {
++        expect(at(448, y)[3], `outside the neck row ${y}`).toBe(0);
++        expect(at(500, y)[3], `neck row ${y}`).toBe(255);
++        if (y >= 369) expect(at(453, y)[3], `outfit edge row ${y}`).toBe(128);
++      }
++      expect(report).toMatchObject({ ok: true, widerThanAnnaFrom354: 0 });
++    },
++  );
++});
+diff --git a/src/lib/server/catalog/ethnicityPlateMaker.ts b/src/lib/server/catalog/ethnicityPlateMaker.ts
+index a7f2f11..05269d9 100644
+--- a/src/lib/server/catalog/ethnicityPlateMaker.ts
++++ b/src/lib/server/catalog/ethnicityPlateMaker.ts
+@@ -8,7 +8,7 @@
+ //            px lower, so per column the cut sits CUT_PX below the lowest of the three chin lines; below it everything is
+ //            the body, colour-matched to the face along the cut (skin only). Collars stay the body's. The outline is the
+ //            face's above ALPHA_FADE and the body's below, with the face plate's neck shaved to the body's outline from
+-//            SHAVE_FROM down. The base plates are never changed.
++//            SHAVE_FROM down, except where the body is empty beside a wider face. The base plates are never changed.
+ //   garments garments the bald face plate does not cover (the astronaut's collar ring, a scarf beside the neck, a high
+ //            collar) would be cut off by the face's see-through shape. A garment pixel is solid on the light endpoint's
+ //            outfit plate, differs from the light endpoint's white-tee base plate, is not skin by the normaliser's
+@@ -68,7 +68,7 @@ export type RacePlateReport = {
+ 	readonly faceExactAbove340: number;
+ 	/** see-through values below row 369 that are not the body's */
+ 	readonly outlineIsAnnaBelow369: number;
+-	/** pixels from row 354 down that are more solid than the body */
++	/** pixels from row 354 down that are more solid than the body, the face's own jaw beside an empty body apart */
+ 	readonly widerThanAnnaFrom354: number;
+ 	/** pixels from row 430 down that are not the plain mix */
+ 	readonly bodyIsMixBelow430: number;
+@@ -596,6 +596,11 @@ function garmentMask(A: Rgba, B: Rgba, Abase: Rgba): Uint8Array {
+ 
+ // ---------------------------------------------------------------- the chin cut
+ 
++/** Above the outline switch: the face is drawn where the body's picture is empty background or only its soft edge. */
++function faceBesideBody(y: number, bodyAlpha: number, faceAlpha: number): boolean {
++	return y < ALPHA_FADE[0] && bodyAlpha < 250 / 255 && faceAlpha > bodyAlpha;
++}
++
+ /**
+  * Face above the chin cut, body below, matched along the cut.
+  * `wholeCostume`: transparent face pixels above the alpha blend show the costume plate
+@@ -661,13 +666,17 @@ function faceJoin(
+ 		for (let x = 0; x < W; x++) {
+ 			const i = y * W + x;
+ 			const fw = (1 - ss(d[i], CUT_PX, CUT_PX + MATCH_FADE)) * clamp(sw[i], 0, 1);
++			const aA = A[i * 4 + 3] / 255;
++			// A face wider than the body at the jaw (the African one): where the body is empty or soft-edged there, the face
++			// keeps its own pixel. Shaving it to the body's outline cut a notch out of each jaw corner.
++			const keepFace = faceBesideBody(y, aA, aF[i]);
++			const wFace = keepFace ? 1 : w[i];
+ 			for (let c = 0; c < 3; c++) {
+ 				const Bc = L[i * 4 + c] + smooth[c][x] * fw;
+-				const rgb = Bc * (1 - w[i]) + face.rgb[i * 3 + c] * w[i];
++				const rgb = Bc * (1 - wFace) + face.rgb[i * 3 + c] * wFace;
+ 				out[i * 4 + c] = rint(clamp(rgb, 0, 255));
+ 			}
+-			const aA = A[i * 4 + 3] / 255;
+-			const aFs = aF[i] * (1 - wsh) + Math.min(aF[i], aA) * wsh;
++			const aFs = keepFace ? aF[i] : aF[i] * (1 - wsh) + Math.min(aF[i], aA) * wsh;
+ 			let al = clamp(aFs * (1 - wa) + aL[i] * wa, 0, 1);
+ 			if (cloth[i]) al = aL[i];
+ 			out[i * 4 + 3] = rint(al * 255);
+@@ -716,7 +725,13 @@ function checks(out: Uint8ClampedArray, A: Rgba, face: PreparedFace, L: Uint8Arr
+ 				}
+ 			}
+ 			if (y >= ALPHA_FADE[1] && out[i * 4 + 3] !== A[i * 4 + 3]) outline++;
+-			if (y >= SHAVE_FROM && out[i * 4 + 3] > A[i * 4 + 3] + 1) wider++;
++			if (
++				y >= SHAVE_FROM &&
++				out[i * 4 + 3] > A[i * 4 + 3] + 1 &&
++				!faceBesideBody(y, A[i * 4 + 3] / 255, face.alpha[i] / 255)
++			) {
++				wider++;
++			}
+ 			if (y >= CHECK_BODY_ROW && !garment[i]) {
+ 				for (let c = 0; c < 4; c++) {
+ 					if (out[i * 4 + c] !== L[i * 4 + c]) {
+diff --git a/src/lib/server/composite/endpointClothesFace.test.ts b/src/lib/server/composite/endpointClothesFace.test.ts
+index 5aef9f7..de6267a 100644
+--- a/src/lib/server/composite/endpointClothesFace.test.ts
++++ b/src/lib/server/composite/endpointClothesFace.test.ts
+@@ -79,8 +79,8 @@ describe('endpointFaceEthnicity', () => {
+ describe('stampEndpointFaceIdentity', () => {
+ 	it('changes the clothes identity so an earless render is rewritten', () => {
+ 		expect(stampEndpointFaceIdentity({ etag: 'clothes', revision: 'rev' })).toEqual({
+-			etag: 'clothes:endpoint-face-1',
+-			revision: 'rev:endpoint-face-1'
++			etag: 'clothes:endpoint-face-2',
++			revision: 'rev:endpoint-face-2'
+ 		});
+ 	});
+ });
+diff --git a/src/lib/server/composite/endpointClothesFace.ts b/src/lib/server/composite/endpointClothesFace.ts
+index 3d7976a..a9f449d 100644
+--- a/src/lib/server/composite/endpointClothesFace.ts
++++ b/src/lib/server/composite/endpointClothesFace.ts
+@@ -21,7 +21,7 @@ import type { SourceIdentity } from './compositeObjects';
+ import type { CompositePair } from './compositePairs';
+ 
+ /** Bump when the endpoint face paste changes so stored renders are rewritten. */
+-export const ENDPOINT_FACE_STAMP = 'endpoint-face-1';
++export const ENDPOINT_FACE_STAMP = 'endpoint-face-2';
+ 
+ type FaceSet = Pick<
+ 	AvatarSetPayload,
+diff --git a/src/lib/server/composite/writeCompositePair.test.ts b/src/lib/server/composite/writeCompositePair.test.ts
+index f0dbdeb..e78ef76 100644
+--- a/src/lib/server/composite/writeCompositePair.test.ts
++++ b/src/lib/server/composite/writeCompositePair.test.ts
+@@ -123,7 +123,7 @@ describe('repairCompositeWebps endpoint face', () => {
+ 			}
+ 		});
+ 		const rendered = seed.get(renderedCompositeKey(pair, 1024, 'webp'));
+-		expect(rendered?.metadata['liforma-clothes-etag']).toBe('clothes:endpoint-face-1');
++		expect(rendered?.metadata['liforma-clothes-etag']).toBe('clothes:endpoint-face-2');
+ 		const { data } = await sharp(rendered!.body).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+ 		expect(data[0]).toBeGreaterThan(180);
+ 		expect(data[1]).toBeLessThan(40);
+-- 
+2.50.1 (Apple Git-155)
+

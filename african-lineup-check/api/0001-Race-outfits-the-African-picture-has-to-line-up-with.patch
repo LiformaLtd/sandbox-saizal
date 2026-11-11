@@ -1,0 +1,1030 @@
+From 15b755ada267e41d897912fcf617dbceb027a24c Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:46:24 +0000
+Subject: [PATCH 1/5] Race outfits: the African picture has to line up with the
+ European one below the neck
+
+The 14 Oct line-up check (outfit_lineup/build.py) now runs in the api on every
+African try, after the size, cut-out and head checks. It fails when clothes or
+skin moved more than 10 px. The same model then draws it again. When no try is
+left, the try that moved least becomes the picture and the log says the check
+failed (clothes.lineup kept closest). The European step and Studio costumes are
+unchanged.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../clothesGeneration/plateLineUp.test.ts     | 120 ++++++++
+ .../server/clothesGeneration/plateLineUp.ts   | 267 ++++++++++++++++++
+ .../raceOutfitHuggingFace.ts                  |  44 ++-
+ .../clothesGeneration/raceOutfitSteps.test.ts | 130 +++++++++
+ .../clothesGeneration/raceOutfitSteps.ts      |  91 +++++-
+ .../studioClothesImageEdit.test.ts            |  43 +++
+ .../imageProviders/studioClothesImageEdit.ts  |  43 ++-
+ 7 files changed, 722 insertions(+), 16 deletions(-)
+ create mode 100644 src/lib/server/clothesGeneration/plateLineUp.test.ts
+ create mode 100644 src/lib/server/clothesGeneration/plateLineUp.ts
+
+diff --git a/src/lib/server/clothesGeneration/plateLineUp.test.ts b/src/lib/server/clothesGeneration/plateLineUp.test.ts
+new file mode 100644
+index 0000000..3a8fa13
+--- /dev/null
++++ b/src/lib/server/clothesGeneration/plateLineUp.test.ts
+@@ -0,0 +1,120 @@
++import sharp from 'sharp';
++import { describe, expect, it } from 'vitest';
++
++import { checkPlateLineUp, lineUpPixels } from './plateLineUp';
++
++const SIZE = 1024;
++const SHIRT = [120, 120, 120];
++const BLACK_TOP = [15, 15, 15];
++const LIGHT_SKIN = [220, 170, 140];
++const DARK_SKIN = [90, 60, 45];
++
++type Box = readonly [left: number, top: number, right: number, bottom: number];
++
++/** A see-through 1024 picture with solid boxes painted in order (right and bottom are not included). */
++function picture(...boxes: readonly (readonly [Box, readonly number[] | null])[]): Buffer {
++	const rgba = Buffer.alloc(SIZE * SIZE * 4);
++	for (const [[left, top, right, bottom], colour] of boxes) {
++		for (let y = top; y < bottom; y += 1) {
++			for (let x = left; x < right; x += 1) rgba.set(colour ? [...colour, 255] : [0, 0, 0, 0], (y * SIZE + x) * 4);
++		}
++	}
++	return rgba;
++}
++
++const BODY: Box = [300, 300, 700, SIZE];
++const HAND: Box = [320, 700, 380, 760];
++const HAND_LOWER: Box = [320, 730, 380, 790];
++
++describe('plate line-up check', () => {
++	it('passes the same picture twice', () => {
++		const plate = picture([BODY, SHIRT], [HAND, LIGHT_SKIN]);
++		expect(checkPlateLineUp(plate, plate, 'female')).toEqual({
++			movedPx: 0,
++			movedAt: null,
++			uncoveredPx: 0,
++			uncoveredAt: null,
++			widerPx: 0,
++			widerAt: null,
++			pass: true
++		});
++	});
++
++	it('passes darker skin, and dark shading, where the European picture has skin', () => {
++		const european = picture([BODY, SHIRT], [HAND, LIGHT_SKIN]);
++		expect(checkPlateLineUp(european, picture([BODY, SHIRT], [HAND, DARK_SKIN]), 'female').movedPx).toBe(0);
++		expect(checkPlateLineUp(european, picture([BODY, SHIRT], [HAND, [30, 25, 22]]), 'female').movedPx).toBe(0);
++	});
++
++	it('fails a hand that moved 30 px over the clothes, and says where', () => {
++		const report = checkPlateLineUp(
++			picture([BODY, SHIRT], [HAND, LIGHT_SKIN]),
++			picture([BODY, SHIRT], [HAND_LOWER, DARK_SKIN]),
++			'female'
++		);
++		expect(report).toMatchObject({ movedPx: 30, pass: false });
++		expect(report.movedAt).toEqual([320, 700, 379, 729]);
++	});
++
++	it('still catches a hand that moved over a black top', () => {
++		const report = checkPlateLineUp(
++			picture([BODY, BLACK_TOP], [HAND, LIGHT_SKIN]),
++			picture([BODY, BLACK_TOP], [HAND_LOWER, DARK_SKIN]),
++			'female'
++		);
++		// Where the hand left, the black top reads as shade and is excused; where it arrived, it is caught.
++		expect(report).toMatchObject({ movedPx: 30, movedAt: [320, 760, 379, 789], pass: false });
++	});
++
++	it('passes a move of 10 px', () => {
++		const report = checkPlateLineUp(
++			picture([BODY, SHIRT], [HAND, LIGHT_SKIN]),
++			picture([BODY, SHIRT], [[320, 710, 380, 770], DARK_SKIN]),
++			'female'
++		);
++		expect(report).toMatchObject({ movedPx: 10, pass: true });
++	});
++
++	it('only reports a body that came out narrower or wider', () => {
++		const european = picture([BODY, SHIRT]);
++		expect(checkPlateLineUp(european, picture([[320, 300, 700, SIZE], SHIRT]), 'female')).toMatchObject({
++			movedPx: 0,
++			uncoveredPx: 20,
++			widerPx: 0,
++			pass: true
++		});
++		expect(checkPlateLineUp(european, picture([[280, 300, 700, SIZE], SHIRT]), 'female')).toMatchObject({
++			movedPx: 0,
++			uncoveredPx: 0,
++			widerPx: 20,
++			pass: true
++		});
++	});
++
++	it('ignores specks and pinholes', () => {
++		const european = picture([BODY, SHIRT]);
++		const african = picture([BODY, SHIRT], [[400, 600, 410, 610], null], [[100, 600, 110, 610], SHIRT]);
++		expect(checkPlateLineUp(european, african, 'female')).toMatchObject({ uncoveredPx: 0, widerPx: 0, pass: true });
++	});
++
++	it('does not look above the base of the neck: row 434 for women, 414 for men', () => {
++		const european = picture([BODY, SHIRT]);
++		const african = picture([BODY, SHIRT], [[400, 414, 460, 434], DARK_SKIN]);
++		expect(checkPlateLineUp(european, african, 'female').movedPx).toBe(0);
++		expect(checkPlateLineUp(european, african, 'male').movedPx).toBe(20);
++	});
++
++	it('reads a picture and its cut-out as they are, and refuses another size', async () => {
++		const rgb = await sharp({ create: { width: SIZE, height: SIZE, channels: 4, background: { r: 9, g: 8, b: 7, alpha: 0 } } })
++			.png()
++			.toBuffer();
++		const alpha = await sharp({ create: { width: SIZE, height: SIZE, channels: 3, background: { r: 200, g: 200, b: 200 } } })
++			.png()
++			.toBuffer();
++		const pixels = await lineUpPixels(rgb, alpha);
++		expect(pixels).toHaveLength(SIZE * SIZE * 4);
++		expect([...pixels.subarray(0, 4)]).toEqual([9, 8, 7, 200]);
++		const small = await sharp(alpha).resize(512, 512).png().toBuffer();
++		await expect(lineUpPixels(small, small)).rejects.toThrow('The line-up check needs 1024x1024 pictures, got 512x512.');
++	});
++});
+diff --git a/src/lib/server/clothesGeneration/plateLineUp.ts b/src/lib/server/clothesGeneration/plateLineUp.ts
+new file mode 100644
+index 0000000..0164546
+--- /dev/null
++++ b/src/lib/server/clothesGeneration/plateLineUp.ts
+@@ -0,0 +1,267 @@
++/**
++ * The line-up check for a race outfit's African picture: below the neck it has to sit where the European picture
++ * sits, or the Studio's blend between the two shows ghost edges. The same rules and numbers as the 14 Oct 2026
++ * check (outfit_lineup/build.py `check()`), which was set on 102 older pairs.
++ *
++ * Below the base of the neck only (above it is a different person by design):
++ *   moved      pixels solid in both pictures that are neither the same clothing (every channel within CLOTH_TOL) nor
++ *              skin in both (warm in the European; warm or a near-black shade in the African). The thickest piece,
++ *              in px. Fails above MOVED_LIMIT_PX.
++ *   uncovered  European body the African picture does not cover; wider is the reverse. Reported only: the Studio
++ *              draws every ethnicity on the European outline.
++ */
++import sharp from 'sharp';
++
++import type { RaceOutfitSet } from './raceOutfitPrompts';
++
++const SIZE = 1024;
++/** A little below where the neck meets the shoulders. */
++const CHECK_FROM: Readonly<Record<RaceOutfitSet, number>> = { female: 434, male: 414 };
++const CLOTH_TOL = 40;
++const SHADOW_MAX = 40;
++const SPECK_PX = 200;
++const MIN_PIECE_PX = 40;
++export const LINE_UP_MOVED_LIMIT_PX = 10;
++
++/** A piece's box: left, top, right, bottom (px, inclusive). */
++type Box = readonly [number, number, number, number];
++
++export type PlateLineUp = {
++	readonly movedPx: number;
++	readonly movedAt: Box | null;
++	readonly uncoveredPx: number;
++	readonly uncoveredAt: Box | null;
++	readonly widerPx: number;
++	readonly widerAt: Box | null;
++	readonly pass: boolean;
++};
++
++/** A picture and its cut-out as 1024 x 1024 RGBA pixels. Another size is an error: it is never resized. */
++export async function lineUpPixels(rgb: Buffer, alpha: Buffer): Promise<Buffer> {
++	const [colour, matte] = await Promise.all([
++		sharp(rgb).removeAlpha().toColourspace('srgb').raw().toBuffer({ resolveWithObject: true }),
++		sharp(alpha).greyscale().raw().toBuffer({ resolveWithObject: true })
++	]);
++	for (const { info } of [colour, matte]) {
++		if (info.width !== SIZE || info.height !== SIZE) {
++			throw new Error(`The line-up check needs ${SIZE}x${SIZE} pictures, got ${info.width}x${info.height}.`);
++		}
++	}
++	const out = Buffer.alloc(SIZE * SIZE * 4);
++	for (let i = 0, p = 0; i < SIZE * SIZE; i += 1, p += 4) {
++		out[p] = colour.data[i * 3]!;
++		out[p + 1] = colour.data[i * 3 + 1]!;
++		out[p + 2] = colour.data[i * 3 + 2]!;
++		out[p + 3] = matte.data[i * matte.info.channels]!;
++	}
++	return out;
++}
++
++/** Both pictures as 1024 x 1024 RGBA pixels (`lineUpPixels`). */
++export function checkPlateLineUp(european: Uint8Array, african: Uint8Array, set: RaceOutfitSet): PlateLineUp {
++	const pixels = SIZE * SIZE;
++	if (european.length !== pixels * 4 || african.length !== pixels * 4) {
++		throw new Error(`The line-up check needs ${SIZE}x${SIZE} RGBA pixels.`);
++	}
++	const top = CHECK_FROM[set];
++	const bodyE = figure(european, top);
++	const bodyA = figure(african, top);
++	const moved = new Uint8Array(pixels);
++	const uncovered = new Uint8Array(pixels);
++	const wider = new Uint8Array(pixels);
++	for (let i = top * SIZE, p = i * 4; i < pixels; i += 1, p += 4) {
++		if (bodyE[i] && !bodyA[i]) uncovered[i] = 1;
++		if (bodyA[i] && !bodyE[i]) wider[i] = 1;
++		if (european[p + 3]! < 250 || african[p + 3]! < 250) continue;
++		const cloth =
++			Math.abs(european[p]! - african[p]!) <= CLOTH_TOL &&
++			Math.abs(european[p + 1]! - african[p + 1]!) <= CLOTH_TOL &&
++			Math.abs(european[p + 2]! - african[p + 2]!) <= CLOTH_TOL;
++		if (cloth) continue;
++		const shade = Math.max(african[p]!, african[p + 1]!, african[p + 2]!) <= SHADOW_MAX;
++		if (warm(european, p) && (warm(african, p) || shade)) continue;
++		moved[i] = 1;
++	}
++	const movedPiece = thickest(moved);
++	const uncoveredPiece = thickest(uncovered);
++	const widerPiece = thickest(wider);
++	return {
++		movedPx: movedPiece.px,
++		movedAt: movedPiece.at,
++		uncoveredPx: uncoveredPiece.px,
++		uncoveredAt: uncoveredPiece.at,
++		widerPx: widerPiece.px,
++		widerAt: widerPiece.at,
++		pass: movedPiece.px <= LINE_UP_MOVED_LIMIT_PX
++	};
++}
++
++/** Skin-like: red leads, blue trails. */
++function warm(rgba: Uint8Array, p: number): boolean {
++	const r = rgba[p]!;
++	const g = rgba[p + 1]!;
++	const b = rgba[p + 2]!;
++	return r >= g && g >= b - 4 && r - b > 0.1 * Math.max(r, 1) && r > 20;
++}
++
++/** The body below `top`: specks under SPECK_PX dropped, pinholes under SPECK_PX filled. */
++function figure(rgba: Uint8Array, top: number): Uint8Array {
++	const mask = new Uint8Array(SIZE * SIZE);
++	for (let i = top * SIZE; i < mask.length; i += 1) mask[i] = rgba[i * 4 + 3]! > 127 ? 1 : 0;
++	const pieces = label(mask);
++	if (pieces.sizes.length > 2) {
++		for (let i = 0; i < mask.length; i += 1) {
++			if (mask[i] && pieces.sizes[pieces.labels[i]!]! < SPECK_PX) mask[i] = 0;
++		}
++	}
++	// A hole is background that does not reach the picture's edge.
++	const background = new Uint8Array(mask.length);
++	for (let i = 0; i < mask.length; i += 1) background[i] = mask[i] ? 0 : 1;
++	const gaps = label(background);
++	const open = new Uint8Array(gaps.sizes.length);
++	for (let k = 0; k < SIZE; k += 1) {
++		open[gaps.labels[k]!] = 1;
++		open[gaps.labels[(SIZE - 1) * SIZE + k]!] = 1;
++		open[gaps.labels[k * SIZE]!] = 1;
++		open[gaps.labels[k * SIZE + SIZE - 1]!] = 1;
++	}
++	for (let i = 0; i < mask.length; i += 1) {
++		const gap = gaps.labels[i]!;
++		if (gap && !open[gap] && gaps.sizes[gap]! < SPECK_PX) mask[i] = 1;
++	}
++	return mask;
++}
++
++/** Pieces joined edge to edge (not corner to corner), numbered from 1 in reading order; `sizes[0]` is unused. */
++function label(mask: Uint8Array): { labels: Int32Array; sizes: number[] } {
++	const labels = new Int32Array(mask.length);
++	const sizes = [0];
++	const stack = new Int32Array(mask.length);
++	for (let start = 0; start < mask.length; start += 1) {
++		if (!mask[start] || labels[start]) continue;
++		const id = sizes.length;
++		let size = 0;
++		let n = 0;
++		stack[n++] = start;
++		labels[start] = id;
++		while (n) {
++			const i = stack[--n]!;
++			size += 1;
++			const x = i % SIZE;
++			if (x > 0 && mask[i - 1] && !labels[i - 1]) {
++				labels[i - 1] = id;
++				stack[n++] = i - 1;
++			}
++			if (x < SIZE - 1 && mask[i + 1] && !labels[i + 1]) {
++				labels[i + 1] = id;
++				stack[n++] = i + 1;
++			}
++			if (i >= SIZE && mask[i - SIZE] && !labels[i - SIZE]) {
++				labels[i - SIZE] = id;
++				stack[n++] = i - SIZE;
++			}
++			if (i + SIZE < mask.length && mask[i + SIZE] && !labels[i + SIZE]) {
++				labels[i + SIZE] = id;
++				stack[n++] = i + SIZE;
++			}
++		}
++		sizes.push(size);
++	}
++	return { labels, sizes };
++}
++
++/**
++ * The thickest piece (2 x its deepest inside distance, to 0.1 px) and its box, after dropping 1 px slivers (whatever
++ * no 2 x 2 block fits in) and pieces under MIN_PIECE_PX.
++ */
++function thickest(mask: Uint8Array): { px: number; at: Box | null } {
++	const opened = new Uint8Array(mask.length);
++	for (let y = 0; y < SIZE - 1; y += 1) {
++		for (let x = 0; x < SIZE - 1; x += 1) {
++			const i = y * SIZE + x;
++			if (mask[i] && mask[i + 1] && mask[i + SIZE] && mask[i + SIZE + 1]) {
++				opened[i] = opened[i + 1] = opened[i + SIZE] = opened[i + SIZE + 1] = 1;
++			}
++		}
++	}
++	const pieces = label(opened);
++	if (pieces.sizes.length === 1) return { px: 0, at: null };
++	const inside = squaredDistanceToOutside(opened);
++	const deepest = new Float64Array(pieces.sizes.length);
++	for (let i = 0; i < opened.length; i += 1) {
++		const id = pieces.labels[i]!;
++		if (id && inside[i]! > deepest[id]!) deepest[id] = inside[i]!;
++	}
++	let best = 0;
++	for (let id = 1; id < pieces.sizes.length; id += 1) {
++		if (pieces.sizes[id]! >= MIN_PIECE_PX && (!best || deepest[id]! > deepest[best]!)) best = id;
++	}
++	if (!best) return { px: 0, at: null };
++	let left = SIZE;
++	let topRow = SIZE;
++	let right = -1;
++	let bottom = -1;
++	for (let i = 0; i < opened.length; i += 1) {
++		if (pieces.labels[i] !== best) continue;
++		const x = i % SIZE;
++		const y = (i - x) / SIZE;
++		if (x < left) left = x;
++		if (x > right) right = x;
++		if (y < topRow) topRow = y;
++		if (y > bottom) bottom = y;
++	}
++	return { px: Math.round(2 * Math.sqrt(deepest[best]!) * 10) / 10, at: [left, topRow, right, bottom] };
++}
++
++/** For every pixel of the mask, the squared distance to the nearest pixel outside it (exact; 0 outside). */
++function squaredDistanceToOutside(mask: Uint8Array): Float64Array {
++	const FAR = 1e12;
++	const out = new Float64Array(mask.length);
++	// Down each column: the squared distance to the nearest outside pixel in that column.
++	for (let x = 0; x < SIZE; x += 1) {
++		let d = FAR;
++		for (let y = 0; y < SIZE; y += 1) {
++			d = mask[y * SIZE + x] ? d + 1 : 0;
++			out[y * SIZE + x] = d;
++		}
++		d = FAR;
++		for (let y = SIZE - 1; y >= 0; y -= 1) {
++			d = mask[y * SIZE + x] ? d + 1 : 0;
++			const i = y * SIZE + x;
++			const nearest = Math.min(out[i]!, d);
++			out[i] = nearest >= FAR ? FAR : nearest * nearest;
++		}
++	}
++	// Along each row: the lowest of the parabolas standing on those column distances.
++	const f = new Float64Array(SIZE);
++	const v = new Int32Array(SIZE);
++	const z = new Float64Array(SIZE + 1);
++	for (let y = 0; y < SIZE; y += 1) {
++		const row = y * SIZE;
++		for (let x = 0; x < SIZE; x += 1) f[x] = out[row + x]!;
++		let k = 0;
++		v[0] = 0;
++		z[0] = -Infinity;
++		z[1] = Infinity;
++		for (let q = 1; q < SIZE; q += 1) {
++			let s: number;
++			for (;;) {
++				const p = v[k]!;
++				s = (f[q]! + q * q - (f[p]! + p * p)) / (2 * q - 2 * p);
++				if (s > z[k]!) break;
++				k -= 1;
++			}
++			k += 1;
++			v[k] = q;
++			z[k] = s;
++			z[k + 1] = Infinity;
++		}
++		k = 0;
++		for (let x = 0; x < SIZE; x += 1) {
++			while (z[k + 1]! < x) k += 1;
++			const p = v[k]!;
++			out[row + x] = (x - p) * (x - p) + f[p]!;
++		}
++	}
++	return out;
++}
+diff --git a/src/lib/server/clothesGeneration/raceOutfitHuggingFace.ts b/src/lib/server/clothesGeneration/raceOutfitHuggingFace.ts
+index e7c4720..7806534 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitHuggingFace.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitHuggingFace.ts
+@@ -22,8 +22,12 @@ export type RaceOutfitTry = {
+ 	readonly modelId: string | null;
+ 	readonly billing: NonNullable<RaceOutfitTicket['accounting']> | null;
+ 	readonly down?: readonly string[];
++	/** Tries the line-up check alone refused, kept with their cut-outs (`keepRaceOutfitLineUpTry`). */
++	readonly lineUp?: readonly RaceOutfitLineUpTry[];
+ } & Pick<StudioClothesTry, 'hops' | 'busy' | 'notBeforeMs' | 'busySinceMs' | 'original'>;
+ 
++export type RaceOutfitLineUpTry = { readonly tryNo: number; readonly movedPx: number };
++
+ const FIRST_TRY: RaceOutfitTry = { tryNo: 1, modelId: null, billing: null };
+ 
+ export type RaceOutfitEditMeta = {
+@@ -41,7 +45,10 @@ export type RaceOutfitEditClaim =
+ 	| { readonly state: 'busy' }
+ 	| { readonly state: 'run'; readonly token: string; readonly attempt: RaceOutfitTry };
+ 
+-function editKey(invocationId: string, name: 'meta.json' | 'rgb.png' | 'alpha.png' | `refused-${number}.png`): string {
++function editKey(
++	invocationId: string,
++	name: 'meta.json' | 'rgb.png' | 'alpha.png' | `refused-${number}.png` | `lineup-${number}-${'rgb' | 'alpha'}.png`
++): string {
+ 	if (!/^[A-Za-z0-9_-]{1,80}$/.test(invocationId)) {
+ 		throw new AuthoringError(500, 'RACE_OUTFIT_EDIT_INVALID', 'Outfit edit id is not valid.');
+ 	}
+@@ -67,7 +74,8 @@ function readTry(value: unknown): RaceOutfitTry | null {
+ 				? (t.down as string[])
+ 				: null;
+ 	if (tryNo === null || modelId === undefined || down === null) return null;
+-	const extras = storedTryExtras(t);
++	const lineUp = readLineUpTries(t.lineUp);
++	const extras = { ...storedTryExtras(t), ...(lineUp.length ? { lineUp } : {}) };
+ 	if (t.billing === null) return { tryNo, modelId, billing: null, down, ...extras };
+ 	const b = t.billing && typeof t.billing === 'object' ? (t.billing as Record<string, unknown>) : {};
+ 	if (
+@@ -87,6 +95,17 @@ function readTry(value: unknown): RaceOutfitTry | null {
+ 	};
+ }
+ 
++/** The stored line-up tries; an entry of the wrong shape is left out, so it can never be the picture kept. */
++function readLineUpTries(value: unknown): RaceOutfitLineUpTry[] {
++	if (!Array.isArray(value)) return [];
++	return value.flatMap((entry) => {
++		const { tryNo, movedPx } = (entry && typeof entry === 'object' ? entry : {}) as Record<string, unknown>;
++		return Number.isSafeInteger(tryNo) && typeof movedPx === 'number' && Number.isFinite(movedPx)
++			? [{ tryNo: tryNo as number, movedPx }]
++			: [];
++	});
++}
++
+ function isMissing(error: unknown): boolean {
+ 	const name = error && typeof error === 'object' && 'name' in error ? String((error as { name: unknown }).name) : '';
+ 	if (name === 'NoSuchKey' || name === 'NotFound') return true;
+@@ -197,6 +216,27 @@ export async function finishRaceOutfitEdit(
+ 	});
+ }
+ 
++/** Keep a try the line-up check alone refused, with its cut-out, so the closest one can still become the picture. */
++export async function keepRaceOutfitLineUpTry(invocationId: string, tryNo: number, rgb: Buffer, alpha: Buffer): Promise<void> {
++	const bucket = privateAuthoringBucket();
++	await Promise.all([
++		putR2Object(bucket, editKey(invocationId, `lineup-${tryNo}-rgb.png`), rgb, { contentType: 'image/png' }),
++		putR2Object(bucket, editKey(invocationId, `lineup-${tryNo}-alpha.png`), alpha, { contentType: 'image/png' })
++	]);
++}
++
++export async function loadRaceOutfitLineUpTry(
++	invocationId: string,
++	tryNo: number
++): Promise<{ readonly rgb: Buffer; readonly alpha: Buffer }> {
++	const bucket = privateAuthoringBucket();
++	const [rgb, alpha] = await Promise.all([
++		getR2ObjectBuffer(bucket, editKey(invocationId, `lineup-${tryNo}-rgb.png`)),
++		getR2ObjectBuffer(bucket, editKey(invocationId, `lineup-${tryNo}-alpha.png`))
++	]);
++	return { rgb, alpha };
++}
++
+ export async function failRaceOutfitEdit(invocationId: string, token: string, error: string): Promise<void> {
+ 	const current = await readRaceOutfitEdit(invocationId);
+ 	if (current?.token !== token) return;
+diff --git a/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts b/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
+index 6dd3e07..d81eebc 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
+@@ -779,6 +779,136 @@ describe('automatic re-tries', () => {
+ 		expect(studioEdit.edit).toHaveBeenCalledTimes(3);
+ 	});
+ 
++	/** An approved first picture and its started African step. */
++	async function startAfricanCoat() {
++		const { startRaceOutfitStep, pollRaceOutfitStep, raceOutfitTicketKey } = await import('./raceOutfitSteps');
++		const { readRaceOutfitTicket } = await import('./raceOutfitTicket');
++		const coat = { ...PROJECT, avatarSetId: 'xp8qtdvc', set: 'male', description: 'a coat' } as const;
++		const first = await startRaceOutfitStep(prisma, { ...coat, step: 'european' });
++		await pollRaceOutfitStep(prisma, 'proj_1', first.ticket);
++		const second = await startRaceOutfitStep(prisma, { ...coat, step: 'african', europeanTicket: first.ticket });
++		const ticket = readRaceOutfitTicket(second.ticket, raceOutfitTicketKey())!;
++		studioEdit.edit.mockClear();
++		billing.finalize.mockClear();
++		return { token: second.ticket, invocationId: ticket.invocationId };
++	}
++
++	/** A paid answer the line-up check alone refused; `shade` tells the pictures of different tries apart. */
++	async function notLinedUp(movedPx: number, shade: number) {
++		const { AuthoringError } = await import('$lib/server/authoring/authoringHttp');
++		const rgb = await solid(8, 3, [shade, shade, shade]);
++		const lineUp = { movedPx, movedAt: [1, 2, 3, 4], uncoveredPx: 0, uncoveredAt: null, widerPx: 0, widerAt: null, pass: false };
++		const error = new AuthoringError(502, 'IMAGE_EDIT_NOT_LINED_UP', `something below the neck moved ${movedPx} px.`);
++		return Object.assign(error, {
++			paidPicture: { png: rgb, usage: { outcome: 'completed', usageJson: { images: 1 } } },
++			notLinedUp: { lineUp, rgb, alpha: png.alpha }
++		});
++	}
++
++	it('checks the African picture against the European one, and not the European picture against anything', async () => {
++		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
++		const european = await startCoat();
++		await pollRaceOutfitStep(prisma, 'proj_1', european.token);
++		expect(studioEdit.edit).toHaveBeenLastCalledWith(expect.not.objectContaining({ lineUpWith: expect.anything() }));
++
++		const step = await startAfricanCoat();
++		const lineUp = { movedPx: 4.5, movedAt: [1, 2, 3, 4], uncoveredPx: 0, uncoveredAt: null, widerPx: 0, widerAt: null, pass: true };
++		studioEdit.edit.mockImplementationOnce(async () => ({
++			rgb: png.rgb,
++			alpha: png.alpha,
++			faceLandmarks: { status: 'no_face', faces_detected: 0, landmarks: [] },
++			usage: { outcome: 'completed', usageJson: { images: 1 } },
++			lineUp
++		}));
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
++		const [edited] = studioEdit.edit.mock.calls[0] as [{ lineUpWith: { pixels: Buffer; set: string } }];
++		expect(edited.lineUpWith.set).toBe('male');
++		// the approved first picture with its cut-out: 1024 x 1024 RGBA
++		expect(edited.lineUpWith.pixels).toHaveLength(1024 * 1024 * 4);
++		expect([...edited.lineUpWith.pixels.subarray(0, 4)]).toEqual([200, 40, 40, 0]);
++		expect(console.info).toHaveBeenCalledWith('clothes.lineup', {
++			invocationId: step.invocationId,
++			model: AZURE,
++			tryNo: 1,
++			...lineUp
++		});
++	});
++
++	it('keeps the try that moved least when three tries did not line up, and logs that the check failed', async () => {
++		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
++		const step = await startAfricanCoat();
++		const closest = await notLinedUp(14, 20);
++		studioEdit.edit
++			.mockRejectedValueOnce(await notLinedUp(30, 10))
++			.mockRejectedValueOnce(closest)
++			.mockRejectedValueOnce(await notLinedUp(22, 30));
++		billing.admit
++			.mockResolvedValueOnce({ operationId: 'op_1', attemptId: 'att_2', attemptNo: 2 })
++			.mockResolvedValueOnce({ operationId: 'op_1', attemptId: 'att_3', attemptNo: 3 });
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ message: 'Trying again (2 of 3)' });
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ message: 'Trying again (3 of 3)' });
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready', error: null });
++
++		expect(studioEdit.edit).toHaveBeenCalledTimes(3);
++		expect(r2.stored.get(`race-outfit-edits/${step.invocationId}/rgb.png`)?.equals(closest.notLinedUp.rgb)).toBe(true);
++		const tries = [
++			{ tryNo: 1, movedPx: 30 },
++			{ tryNo: 2, movedPx: 14 },
++			{ tryNo: 3, movedPx: 22 }
++		];
++		expect(console.error).toHaveBeenCalledWith('clothes.lineup kept closest', {
++			invocationId: step.invocationId,
++			tryNo: 2,
++			movedPx: 14,
++			tries
++		});
++		expect(console.info).toHaveBeenCalledWith(
++			'clothes.lineup',
++			expect.objectContaining({ invocationId: step.invocationId, tryNo: 3, movedPx: 22, pass: false })
++		);
++		// every try is booked once, as a picture that was paid for
++		expect(billing.finalize.mock.calls.map(([attempt]) => (attempt as { attemptId: string }).attemptId)).toEqual([
++			'att_1',
++			'att_2',
++			'att_3'
++		]);
++		for (const [, , usage] of billing.finalize.mock.calls) expect(usage).toMatchObject({ outcome: 'completed' });
++		// each refused answer is still kept as it came
++		for (const tryNo of [1, 2, 3]) {
++			expect(r2.stored.has(`race-outfit-edits/${step.invocationId}/refused-${tryNo}.png`)).toBe(true);
++		}
++		// a later poll reads the kept picture without another try
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
++		expect(studioEdit.edit).toHaveBeenCalledTimes(3);
++	});
++
++	it('never keeps a try another check refused', async () => {
++		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
++		const step = await startAfricanCoat();
++		const linedUpLeast = await notLinedUp(14, 20);
++		studioEdit.edit
++			.mockRejectedValueOnce(await zoomedOut())
++			.mockRejectedValueOnce(linedUpLeast)
++			.mockRejectedValueOnce(await zoomedOut());
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ jobStatus: 'retrying' });
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ jobStatus: 'retrying' });
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
++		expect(r2.stored.get(`race-outfit-edits/${step.invocationId}/rgb.png`)?.equals(linedUpLeast.notLinedUp.rgb)).toBe(true);
++		expect(r2.stored.has(`race-outfit-edits/${step.invocationId}/lineup-1-rgb.png`)).toBe(false);
++		expect(r2.stored.has(`race-outfit-edits/${step.invocationId}/lineup-3-rgb.png`)).toBe(false);
++	});
++
++	it('fails the African step as before when no try got as far as the line-up check', async () => {
++		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
++		const step = await startAfricanCoat();
++		const refused = await zoomedOut();
++		studioEdit.edit.mockRejectedValue(refused);
++		await pollRaceOutfitStep(prisma, 'proj_1', step.token);
++		await pollRaceOutfitStep(prisma, 'proj_1', step.token);
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'failed', error: refused.message });
++		expect(console.error).not.toHaveBeenCalledWith('clothes.lineup kept closest', expect.anything());
++	});
++
+ 	it('does not try again after a safety refusal', async () => {
+ 		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
+ 		const { GptImageError } = await import('$lib/server/imageProviders/gptImageClient');
+diff --git a/src/lib/server/clothesGeneration/raceOutfitSteps.ts b/src/lib/server/clothesGeneration/raceOutfitSteps.ts
+index f8b4288..12d9a4a 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitSteps.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitSteps.ts
+@@ -49,11 +49,14 @@ import {
+ 	FIRST_STUDIO_CLOTHES_TRY,
+ 	measureOriginalFace,
+ 	nextStudioClothesTry,
++	notLinedUpPicture,
+ 	refusedPaidPicture,
+ 	SAME_REQUEST_HOP_MS,
+ 	STUDIO_CLOTHES_KREA_MODEL_ID,
++	STUDIO_CLOTHES_MAX_TRIES,
+ 	studioClothesEditAttribution,
+ 	studioClothesNextMessage,
++	type LineUpWith,
+ 	type StudioClothesNext,
+ 	type StudioClothesTry
+ } from '$lib/server/imageProviders/studioClothesImageEdit';
+@@ -64,13 +67,17 @@ import {
+ 	beginRaceOutfitEdit,
+ 	failRaceOutfitEdit,
+ 	finishRaceOutfitEdit,
++	keepRaceOutfitLineUpTry,
+ 	loadRaceOutfitEditImages,
++	loadRaceOutfitLineUpTry,
+ 	readRaceOutfitEdit,
+ 	refusedRaceOutfitPictureKey,
+ 	retryRaceOutfitEdit,
+ 	saveRaceOutfitTry,
++	type RaceOutfitLineUpTry,
+ 	type RaceOutfitTry
+ } from './raceOutfitHuggingFace';
++import { lineUpPixels, type PlateLineUp } from './plateLineUp';
+ import { keepRefusedPicture } from './refusedPictures';
+ import { forgetPlateDigests, plateSourceTag, savedPlateDigest, savePlateDigest, type OrchestratorPlate } from './orchestratorPlateDigest';
+ import {
+@@ -431,8 +438,12 @@ function approvedEuropeanTicket(input: StartRaceOutfitStepInput, key: Buffer): R
+ 	return first;
+ }
+ 
+-async function raceOutfitSourceImages(ticket: RaceOutfitTicket): Promise<Buffer[]> {
+-	if (ticket.step === 'european') return [await lightBaseOnGreen(ticket.avatarSetId)];
++/**
++ * The pictures a step sends. For the African step of a Studio edit, also the European picture its answer has to line
++ * up with below the neck.
++ */
++async function raceOutfitSourceImages(ticket: RaceOutfitTicket): Promise<{ images: Buffer[]; lineUpWith?: LineUpWith }> {
++	if (ticket.step === 'european') return { images: [await lightBaseOnGreen(ticket.avatarSetId)] };
+ 	if (!ticket.sceneInvocationId) {
+ 		throw new AuthoringError(409, 'GENERATION_NOT_READY', 'That picture is not ready yet.');
+ 	}
+@@ -440,18 +451,21 @@ async function raceOutfitSourceImages(ticket: RaceOutfitTicket): Promise<Buffer[
+ 	const cutout = await compositeRgbAndAlpha({ rgb: first.rgb, alpha: first.alpha });
+ 	const scene = await sharp(cutout.png).flatten({ background: SCENE_GREEN }).png().toBuffer();
+ 	const person = await readAuthoringInput(avatarSetGenerationInputKey(ticket.avatarSetId, 'dark-ref'));
+-	return [scene, person];
++	if (ticket.provider !== 'studio') return { images: [scene, person] };
++	return { images: [scene, person], lineUpWith: { pixels: await lineUpPixels(first.rgb, first.alpha), set: ticket.set } };
+ }
+ 
+ async function editRaceOutfitPlate(
+ 	ticket: RaceOutfitTicket,
+ 	images: readonly Buffer[],
+-	attempt: Pick<RaceOutfitTry, 'modelId' | 'tryNo' | 'original'>
++	attempt: Pick<RaceOutfitTry, 'modelId' | 'tryNo' | 'original'>,
++	lineUpWith?: LineUpWith
+ ): Promise<{
+ 	readonly rgb: Buffer;
+ 	readonly alpha: Buffer;
+ 	readonly gpuSeconds: number | null;
+ 	readonly usage: ProviderUsageFacts | null;
++	readonly lineUp?: PlateLineUp;
+ }> {
+ 	const instruction = ticket.instruction ?? '';
+ 	if (ticket.provider === 'studio') {
+@@ -463,6 +477,7 @@ async function editRaceOutfitPlate(
+ 			height: source.height,
+ 			// The Studio pastes each avatar's own face over these plates: only the head's place and size are checked.
+ 			headLimits: PASTED_FACE_HEAD_LIMITS,
++			...(lineUpWith ? { lineUpWith } : {}),
+ 			...(attempt.modelId ? { modelId: attempt.modelId } : {}),
+ 			...(attempt.original ? { original: attempt.original } : {}),
+ 			// Only the Krea 2 backup uses these. The seed moves on with each try: a repeated seed draws the same
+@@ -473,7 +488,7 @@ async function editRaceOutfitPlate(
+ 				...(ticket.step === 'african' ? { refBoostA: RACE_OUTFIT_PAIRS[ticket.set].refBoostA } : {})
+ 			}
+ 		});
+-		return { rgb: edited.rgb, alpha: edited.alpha, gpuSeconds: null, usage: edited.usage };
++		return { rgb: edited.rgb, alpha: edited.alpha, gpuSeconds: null, usage: edited.usage, lineUp: edited.lineUp };
+ 	}
+ 	const edited = await editIdentityOnHuggingFace({
+ 		sourcePng: images[0]!,
+@@ -524,7 +539,7 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 	// The ticket carries the first attempt's billing; every later attempt opens its own (openTryBilling).
+ 	let billing: BillingAttempt | null = attempt.billing ?? (isFirstAttempt(attempt) ? (ticket.accounting ?? null) : null);
+ 	// Loaded once for every attempt of this poll. The original face is measured once for the whole edit and kept.
+-	let images: Buffer[] | null = null;
++	let source: Awaited<ReturnType<typeof raceOutfitSourceImages>> | null = null;
+ 	for (;;) {
+ 		try {
+ 			if (!isFirstAttempt(attempt) && !attempt.billing) {
+@@ -534,11 +549,12 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 				attempt = { ...attempt, billing };
+ 				await saveRaceOutfitTry(ticket.invocationId, claim.token, attempt);
+ 			}
+-			images ??= await raceOutfitSourceImages(ticket);
++			source ??= await raceOutfitSourceImages(ticket);
+ 			if (ticket.provider === 'studio' && !attempt.original) {
+-				attempt = { ...attempt, original: await measureOriginalFace(images[0]!) };
++				attempt = { ...attempt, original: await measureOriginalFace(source.images[0]!) };
+ 			}
+-			const edited = await editRaceOutfitPlate(ticket, images, attempt);
++			const edited = await editRaceOutfitPlate(ticket, source.images, attempt, source.lineUpWith);
++			if (edited.lineUp) logLineUp(ticket, attempt, edited.lineUp);
+ 			// Which model drew each finished picture (it passed every check), so a run can be read picture by picture.
+ 			console.info('clothes.edit drawn', {
+ 				invocationId: ticket.invocationId,
+@@ -574,6 +590,7 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 			// A picture a check refused was still paid for: book the provider's answer, not nothing.
+ 			const usage = paid?.usage ?? { outcome: 'failed', errorCode: code, errorMessage: message, usageJson: { images: 0 } };
+ 			const failed: StudioClothesTry = { ...attempt, modelId: attempt.modelId ?? FIRST_STUDIO_CLOTHES_TRY.modelId };
++			const lineUpTries = await withLineUpTry(ticket, attempt, error);
+ 			const decision: StudioClothesNext =
+ 				ticket.provider === 'studio' ? nextStudioClothesTry(failed, error) : { kind: 'stop' };
+ 			if (decision.kind !== 'stop') {
+@@ -593,7 +610,11 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 					down: decision.next.down,
+ 					hops: decision.next.hops
+ 				});
+-				const next: RaceOutfitTry = { ...decision.next, billing: null };
++				const next: RaceOutfitTry = {
++					...decision.next,
++					billing: null,
++					...(lineUpTries.length ? { lineUp: lineUpTries } : {})
++				};
+ 				if (decision.kind === 'hop' && Date.now() - startedMs < SAME_REQUEST_HOP_MS) {
+ 					attempt = next;
+ 					continue;
+@@ -601,6 +622,21 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 				await retryRaceOutfitEdit(ticket.invocationId, claim.token, next);
+ 				return stepView(ticket, { status: 'running', jobStatus: RETRYING, message: studioClothesNextMessage(decision) });
+ 			}
++			// No try is left and at least one was refused by the line-up check alone: the one that moved least becomes the
++			// step's picture (the user's 10 Nov choice). Logged as an error, because the check did fail.
++			if (attempt.tryNo >= STUDIO_CLOTHES_MAX_TRIES && lineUpTries.length) {
++				const closest = lineUpTries.reduce((best, entry) => (entry.movedPx < best.movedPx ? entry : best));
++				const kept = await loadRaceOutfitLineUpTry(ticket.invocationId, closest.tryNo);
++				console.error('clothes.lineup kept closest', {
++					invocationId: ticket.invocationId,
++					tryNo: closest.tryNo,
++					movedPx: closest.movedPx,
++					tries: lineUpTries
++				});
++				await finishRaceOutfitEdit(ticket.invocationId, claim.token, kept.rgb, kept.alpha, null);
++				await closeBilling(prisma, ticket, billing, usage, attempt.modelId);
++				return stepView(ticket, { status: 'ready', jobStatus: 'succeeded', message: 'Ready' });
++			}
+ 			if (attempt.tryNo > 1 || (attempt.hops ?? 0) > 0) {
+ 				console.error('clothes.edit failed after re-tries', {
+ 					invocationId: ticket.invocationId,
+@@ -618,6 +654,41 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 	}
+ }
+ 
++function logLineUp(ticket: RaceOutfitTicket, attempt: RaceOutfitTry, lineUp: PlateLineUp): void {
++	console.info('clothes.lineup', {
++		invocationId: ticket.invocationId,
++		model: attempt.modelId ?? FIRST_STUDIO_CLOTHES_TRY.modelId,
++		tryNo: attempt.tryNo,
++		...lineUp
++	});
++}
++
++/**
++ * The job's tries that the line-up check alone refused, with this failed one added when it is one of them. Its
++ * picture and cut-out are kept first: a try whose pictures could not be kept is left out, so it is never chosen.
++ */
++async function withLineUpTry(
++	ticket: RaceOutfitTicket,
++	attempt: RaceOutfitTry,
++	error: unknown
++): Promise<readonly RaceOutfitLineUpTry[]> {
++	const before = attempt.lineUp ?? [];
++	const off = notLinedUpPicture(error);
++	if (!off) return before;
++	logLineUp(ticket, attempt, off.lineUp);
++	try {
++		await keepRaceOutfitLineUpTry(ticket.invocationId, attempt.tryNo, off.rgb, off.alpha);
++	} catch (keepError) {
++		console.error('clothes.lineup try not kept', {
++			invocationId: ticket.invocationId,
++			tryNo: attempt.tryNo,
++			message: keepError instanceof Error ? keepError.message : String(keepError)
++		});
++		return before;
++	}
++	return [...before, { tryNo: attempt.tryNo, movedPx: off.lineUp.movedPx }];
++}
++
+ /** The first attempt of a step, billed on its ticket. Every later one (a new try, or a hop) opens its own billing. */
+ function isFirstAttempt(attempt: RaceOutfitTry): boolean {
+ 	return attempt.tryNo === 1 && !attempt.hops;
+diff --git a/src/lib/server/imageProviders/studioClothesImageEdit.test.ts b/src/lib/server/imageProviders/studioClothesImageEdit.test.ts
+index 5e606cc..37ecb2d 100644
+--- a/src/lib/server/imageProviders/studioClothesImageEdit.test.ts
++++ b/src/lib/server/imageProviders/studioClothesImageEdit.test.ts
+@@ -8,6 +8,7 @@ import { STUDIO_CLOTHES_I2I_MODEL } from './gptImageRegistry';
+ import {
+ 	editStudioClothesImage,
+ 	nextStudioClothesTry,
++	notLinedUpPicture,
+ 	refusedPaidPicture,
+ 	storedTryExtras,
+ 	studioClothesEditAttribution,
+@@ -178,6 +179,48 @@ describe('studio clothes image edit', () => {
+ 		expect(calls).toEqual(['fit', 'azure', 'fit']);
+ 	});
+ 
++	it('reports the line-up numbers of an answer that sits where the European picture sits', async () => {
++		const answer = await answerCutout();
++		const { fetchImpl } = fakeServers(answer, [facePoints(), facePoints()]);
++		const edit = await editStudioClothesImage(
++			{
++				prompt: 'african',
++				images: [answer, answer],
++				width: 1024,
++				height: 1024,
++				lineUpWith: { pixels: await sharp(answer).raw().toBuffer(), set: 'male' }
++			},
++			{ env: ENV, fetchImpl }
++		);
++		expect(edit.lineUp).toMatchObject({ movedPx: 0, pass: true });
++	});
++
++	it('refuses an answer that does not line up, and hands back the paid picture with its cut-out', async () => {
++		const answer = await answerCutout();
++		// The European picture has clothes where the answer has skin.
++		const european = await sharp(answer).raw().toBuffer();
++		for (let p = 0; p < european.length; p += 4) european.set([120, 120, 120], p);
++		const { fetchImpl } = fakeServers(answer, [facePoints(), facePoints()]);
++		const error = await editStudioClothesImage(
++			{ prompt: 'african', images: [answer, answer], width: 1024, height: 1024, lineUpWith: { pixels: european, set: 'male' } },
++			{ env: ENV, fetchImpl }
++		).catch((caught: unknown) => caught);
++		expect(error).toMatchObject({
++			code: 'IMAGE_EDIT_NOT_LINED_UP',
++			message: 'The African picture did not line up with the European one: something below the neck moved 512 px.'
++		});
++		expect(refusedPaidPicture(error)?.png.equals(answer)).toBe(true);
++		const kept = notLinedUpPicture(error);
++		expect(kept?.lineUp).toMatchObject({ movedPx: 512, pass: false });
++		expect((await sharp(kept!.alpha).metadata()).width).toBe(1024);
++		// the same model draws it again, as a new try
++		expect(nextStudioClothesTry({ tryNo: 1, modelId: AZURE }, error)).toMatchObject({
++			kind: 'try',
++			reason: 'picture_refused',
++			next: { tryNo: 2, modelId: AZURE }
++		});
++	});
++
+ 	it('refuses a picture whose head came out bigger, and hands back the paid picture', async () => {
+ 		const answer = await answerCutout();
+ 		const { fetchImpl } = fakeServers(answer, [facePoints(), facePoints(1.1)]);
+diff --git a/src/lib/server/imageProviders/studioClothesImageEdit.ts b/src/lib/server/imageProviders/studioClothesImageEdit.ts
+index 83663be..de09556 100644
+--- a/src/lib/server/imageProviders/studioClothesImageEdit.ts
++++ b/src/lib/server/imageProviders/studioClothesImageEdit.ts
+@@ -19,6 +19,8 @@ import {
+ 	type HuggingFaceIdentityEdit
+ } from '../clothesGeneration/huggingfaceIdentityEdit';
+ import { randomClothesI2iSeed } from '../clothesGeneration/orchestratorClient';
++import { checkPlateLineUp, lineUpPixels, type PlateLineUp } from '../clothesGeneration/plateLineUp';
++import type { RaceOutfitSet } from '../clothesGeneration/raceOutfitPrompts';
+ import { priceBookUsageFacts } from '../providerAccounting/priceBook';
+ import type { AccountingAttribution, ProviderUsageFacts } from '../providerAccounting/types';
+ import { callGptImage25, GptImageError, gptImageSize, type GptImageResult } from './gptImageClient';
+@@ -43,8 +45,16 @@ export type StudioClothesImageEdit = {
+ 	readonly alpha: Buffer;
+ 	readonly faceLandmarks: FaceLandmarksResult;
+ 	readonly usage: ProviderUsageFacts;
++	/** The line-up check's numbers, when the edit was given a picture to line up with. */
++	readonly lineUp?: PlateLineUp;
+ };
+ 
++/** The picture an answer has to line up with below the neck (`lineUpPixels`), and whose check rows to use. */
++export type LineUpWith = { readonly pixels: Buffer; readonly set: RaceOutfitSet };
++
++/** An answer that passed every other check but did not line up: kept with its cut-out, in case no try does better. */
++export type NotLinedUpPicture = { readonly lineUp: PlateLineUp; readonly rgb: Buffer; readonly alpha: Buffer };
++
+ /**
+  * A picture the image model was paid for that a later check refused (size, cut-out, face or head). The caller
+  * keeps it privately and books what it cost: the outfit failed, but the provider was still paid.
+@@ -74,6 +84,12 @@ export function refusedPaidPicture(error: unknown): RefusedPaidPicture | null {
+ 	return paid && typeof paid === 'object' ? (paid as RefusedPaidPicture) : null;
+ }
+ 
++/** The answer behind a failed edit, when the line-up check was the only one that refused it. */
++export function notLinedUpPicture(error: unknown): NotLinedUpPicture | null {
++	const kept = error && typeof error === 'object' ? (error as { notLinedUp?: unknown }).notLinedUp : undefined;
++	return kept && typeof kept === 'object' ? (kept as NotLinedUpPicture) : null;
++}
++
+ /** Tries per outfit picture, the first one included (the user's 6 Nov 2026 choice for the African re-make). */
+ export const STUDIO_CLOTHES_MAX_TRIES = 3;
+ 
+@@ -152,8 +168,8 @@ const STOP: StudioClothesNext = { kind: 'stop' };
+  *   try Krea 2 gets its turn once three GPT Image models have failed for real, even with one left, so three timeouts
+  *   still end on Krea (the user's 10 Nov choice).
+  * - Krea 2 failed: nothing is left after it.
+- * - A check refused the picture the model drew (zoomed, head moved, cut-out, size, no face): the same model again, as
+- *   a new try.
++ * - A check refused the picture the model drew (zoomed, head moved, cut-out, size, no face, not lined up): the same
++ *   model again, as a new try.
+  * - Anything else (a safety refusal, a rejected request, our own face service or settings) would fail the same way.
+  */
+ export function nextStudioClothesTry(failed: StudioClothesTry, error: unknown, nowMs = Date.now()): StudioClothesNext {
+@@ -334,6 +350,8 @@ export async function editStudioClothesImage(
+ 		readonly original?: FaceGeometryMetrics;
+ 		/** How far the answer's head may differ from picture 1: `HEAD_LIMITS` when not given. */
+ 		readonly headLimits?: HeadLimits;
++		/** The African step of a race outfit: the European picture the answer has to line up with below the neck. */
++		readonly lineUpWith?: LineUpWith;
+ 		/** Krea 2 only: its seed (random when not given) and, with a second picture, how closely it keeps picture 1. */
+ 		readonly krea?: { readonly seed?: number; readonly refBoostA?: number };
+ 	},
+@@ -365,7 +383,8 @@ export async function editStudioClothesImage(
+ 		await checkAnswerSize(edited.png, asked);
+ 		const plate = await plateFromGptImage(edited.png, warmup ? { ...deps, warmup } : deps);
+ 		checkHead(plate.faceLandmarks, original, input.headLimits);
+-		return { ...plate, usage };
++		const lineUp = input.lineUpWith && (await checkLineUp(plate.rgb, plate.alpha, input.lineUpWith));
++		return { ...plate, usage, ...(lineUp ? { lineUp } : {}) };
+ 	} catch (error) {
+ 		// The provider was paid for this picture: hand it back with the error to be kept and booked.
+ 		if (error instanceof Error) Object.assign(error, { paidPicture: { png: edited.png, usage } });
+@@ -394,6 +413,20 @@ async function checkAnswerSize(png: Buffer, asked: string): Promise<void> {
+ 	}
+ }
+ 
++/** Runs after every other check, so an answer it refuses is otherwise usable. */
++async function checkLineUp(rgb: Buffer, alpha: Buffer, against: LineUpWith): Promise<PlateLineUp> {
++	const lineUp = checkPlateLineUp(against.pixels, await lineUpPixels(rgb, alpha), against.set);
++	if (lineUp.pass) return lineUp;
++	throw Object.assign(
++		new AuthoringError(
++			502,
++			'IMAGE_EDIT_NOT_LINED_UP',
++			`The African picture did not line up with the European one: something below the neck moved ${lineUp.movedPx} px.`
++		),
++		{ notLinedUp: { lineUp, rgb, alpha } satisfies NotLinedUpPicture }
++	);
++}
++
+ function checkHead(faceLandmarks: FaceLandmarksResult, original: FaceGeometryMetrics, limits?: HeadLimits): void {
+ 	const head = verifyFaceAlignment(faceLandmarks, original, limits);
+ 	if (!head.ok) {
+@@ -416,6 +449,7 @@ async function editOnKrea(
+ 		readonly prompt: string;
+ 		readonly images: readonly Buffer[];
+ 		readonly headLimits?: HeadLimits;
++		readonly lineUpWith?: LineUpWith;
+ 		readonly krea?: { readonly seed?: number; readonly refBoostA?: number };
+ 	},
+ 	asked: string,
+@@ -467,7 +501,8 @@ async function editOnKrea(
+ 		await checkCutout(edited.alpha, 'krea-space');
+ 		const faceLandmarks = await faceLandmarksOfPicture(rgb, deps);
+ 		checkHead(faceLandmarks, original, input.headLimits);
+-		return { rgb, alpha: edited.alpha, faceLandmarks, usage };
++		const lineUp = input.lineUpWith && (await checkLineUp(rgb, edited.alpha, input.lineUpWith));
++		return { rgb, alpha: edited.alpha, faceLandmarks, usage, ...(lineUp ? { lineUp } : {}) };
+ 	} catch (error) {
+ 		// The Space's GPU time was spent on this picture: hand it back with the error to be kept and booked.
+ 		if (error instanceof Error) Object.assign(error, { paidPicture: { png: rgb, usage } });
+-- 
+2.50.1 (Apple Git-155)
+

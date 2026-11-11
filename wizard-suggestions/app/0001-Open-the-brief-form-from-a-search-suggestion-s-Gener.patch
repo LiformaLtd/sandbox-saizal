@@ -1,0 +1,631 @@
+From 056632dcd89afb35885deefabac768919e10cae9 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:19:45 +0000
+Subject: [PATCH 1/4] Open the brief form from a search suggestion's Generate
+ button
+
+Generate on a search suggestion card only showed "coming soon". It now
+hands the card (title, the author's edited description and the four
+sections) to the experiences page, which opens the New Experience brief
+form filled in; the normal creation job and wizard follow from there.
+
+- public-experience-chooser: an onGenerate host callback (the package
+  cannot import app code, like Remix); without it the cards have no
+  Generate button and say "Here are three ideas." The stub dialog is gone.
+- composeSuggestionBrief puts the title and description first so the
+  setup generator keeps them.
+- Studio search page: Generate only for people who can author in the
+  active project; it navigates to /studio/experiences?newBrief=...
+- Experiences page: ?newBrief opens the brief form filled in (clamped to
+  the 2000-character brief limit at a sentence end) and is removed from
+  the address; a viewer gets no form and a console warning.
+
+Checked on a local copy of the database: editor sees Generate and lands
+on the filled form; viewer sees no Generate and the address is cleaned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ packages/experience-studio/src/index.ts       |   1 +
+ .../src/lib/promptLimits.test.ts              |  24 ++-
+ .../experience-studio/src/lib/promptLimits.ts |  14 ++
+ .../src/ExperienceSearchGrid.svelte           |   9 +-
+ .../src/ExperienceSearchSuggestions.svelte    | 160 ++++--------------
+ .../src/ExperienceSearchSuggestions.test.ts   |  78 +++++++++
+ .../src/suggestionPrompt.test.ts              |  18 ++
+ .../src/suggestionPrompt.ts                   |  18 ++
+ .../(portal)/studio/experiences/+page.svelte  |  27 +++
+ .../(portal)/studio/search/+page.svelte       |  13 ++
+ 10 files changed, 228 insertions(+), 134 deletions(-)
+ create mode 100644 packages/public-experience-chooser/src/ExperienceSearchSuggestions.test.ts
+
+diff --git a/packages/experience-studio/src/index.ts b/packages/experience-studio/src/index.ts
+index 2ac7b3a..4437c5a 100644
+--- a/packages/experience-studio/src/index.ts
++++ b/packages/experience-studio/src/index.ts
+@@ -207,6 +207,7 @@ export { default as StudioHelpPopover } from './components/fields/StudioHelpPopo
+ export { default as StudioPromptField } from './components/fields/StudioPromptField.svelte';
+ export {
+ 	PROMPT_LIMITS,
++	clampToPromptLimit,
+ 	SET_CHARACTER_INSTRUCTIONS_LABEL,
+ 	SET_CHARACTER_INSTRUCTIONS_PLACEHOLDER,
+ 	maxlengthForAuthoringPath
+diff --git a/packages/experience-studio/src/lib/promptLimits.test.ts b/packages/experience-studio/src/lib/promptLimits.test.ts
+index 83f6e21..7656e9b 100644
+--- a/packages/experience-studio/src/lib/promptLimits.test.ts
++++ b/packages/experience-studio/src/lib/promptLimits.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, it } from 'vitest';
+ 
+-import { maxlengthForAuthoringPath, PROMPT_LIMITS } from './promptLimits.js';
++import { clampToPromptLimit, maxlengthForAuthoringPath, PROMPT_LIMITS } from './promptLimits.js';
+ 
+ describe('PROMPT_LIMITS', () => {
+ 	it('matches the authored prompt caps', () => {
+@@ -24,3 +24,25 @@ describe('PROMPT_LIMITS', () => {
+ 		expect(maxlengthForAuthoringPath('scenarioGoal')).toBeUndefined();
+ 	});
+ });
++
++describe('clampToPromptLimit', () => {
++	it('keeps text that fits, trimmed', () => {
++		expect(clampToPromptLimit('  Short brief.  ', 20)).toBe('Short brief.');
++	});
++
++	it('cuts at the last sentence end before the limit', () => {
++		const text = 'First sentence here. Second sentence is long. Third one runs past the limit.';
++		expect(clampToPromptLimit(text, 50)).toBe('First sentence here. Second sentence is long.');
++	});
++
++	it('cuts at a space when no sentence ends late enough', () => {
++		expect(clampToPromptLimit('one two three four five six', 15)).toBe('one two three');
++	});
++
++	it('never returns more than the limit', () => {
++		const text = 'word '.repeat(1000);
++		expect(clampToPromptLimit(text, PROMPT_LIMITS.experienceBrief).length).toBeLessThanOrEqual(
++			PROMPT_LIMITS.experienceBrief
++		);
++	});
++});
+diff --git a/packages/experience-studio/src/lib/promptLimits.ts b/packages/experience-studio/src/lib/promptLimits.ts
+index 2fc6166..1b55f27 100644
+--- a/packages/experience-studio/src/lib/promptLimits.ts
++++ b/packages/experience-studio/src/lib/promptLimits.ts
+@@ -32,3 +32,17 @@ export function maxlengthForAuthoringPath(path: string): number | undefined {
+ 	}
+ 	return undefined;
+ }
++
++/**
++ * Fit text handed in from elsewhere (for example a search suggestion card) into a prompt limit:
++ * cut at the last sentence end before the limit, or at the last space when no sentence ends late enough.
++ */
++export function clampToPromptLimit(text: string, limit: number): string {
++	const trimmed = text.trim();
++	if (trimmed.length <= limit) return trimmed;
++	const head = trimmed.slice(0, limit);
++	const sentenceEnd = Math.max(head.lastIndexOf('. '), head.lastIndexOf('.\n'));
++	if (sentenceEnd >= limit * 0.6) return head.slice(0, sentenceEnd + 1);
++	const space = head.lastIndexOf(' ');
++	return (space > 0 ? head.slice(0, space) : head).trimEnd();
++}
+diff --git a/packages/public-experience-chooser/src/ExperienceSearchGrid.svelte b/packages/public-experience-chooser/src/ExperienceSearchGrid.svelte
+index 9303b67..5c47f52 100644
+--- a/packages/public-experience-chooser/src/ExperienceSearchGrid.svelte
++++ b/packages/public-experience-chooser/src/ExperienceSearchGrid.svelte
+@@ -39,6 +39,8 @@
+ 			query: string;
+ 			cursor?: string | null;
+ 		}) => Promise<ExperienceSuggestionsResponse | null>;
++		/** Start an experience from a suggestion card's brief; leave unset to hide Generate. */
++		onGenerateSuggestion?: (brief: string) => void;
+ 	};
+ 
+ 	let {
+@@ -57,7 +59,8 @@
+ 		onLoadMore,
+ 		loadingMore = false,
+ 		apiBaseUrl = '',
+-		loadSuggestions
++		loadSuggestions,
++		onGenerateSuggestion
+ 	}: Props = $props();
+ 
+ 	let columnCount = $state(1);
+@@ -175,7 +178,7 @@
+ 		</div>
+ 		{#if yoursCards.length === 0}
+ 			{#if showSuggestions && loadSuggestions}
+-				<ExperienceSearchSuggestions {query} {loadSuggestions} />
++				<ExperienceSearchSuggestions {query} {loadSuggestions} onGenerate={onGenerateSuggestion} />
+ 			{:else}
+ 				<p class="empty">No matching experiences</p>
+ 			{/if}
+@@ -205,7 +208,7 @@
+ 
+ 	{#if mode !== 'yours' && experiences.length === 0 && !showWorkspace}
+ 		{#if showSuggestions && loadSuggestions}
+-			<ExperienceSearchSuggestions {query} {loadSuggestions} />
++			<ExperienceSearchSuggestions {query} {loadSuggestions} onGenerate={onGenerateSuggestion} />
+ 		{:else}
+ 			<p class="empty">No matching experiences</p>
+ 		{/if}
+diff --git a/packages/public-experience-chooser/src/ExperienceSearchSuggestions.svelte b/packages/public-experience-chooser/src/ExperienceSearchSuggestions.svelte
+index 6ce2ac5..b183c8e 100644
+--- a/packages/public-experience-chooser/src/ExperienceSearchSuggestions.svelte
++++ b/packages/public-experience-chooser/src/ExperienceSearchSuggestions.svelte
+@@ -7,6 +7,7 @@
+ 		type ExperienceSuggestionsResponse
+ 	} from './suggestionTypes';
+ 	import {
++		composeSuggestionBrief,
+ 		sectionsFromSuggestionBrief,
+ 		SUGGESTION_PROMPT_SECTIONS,
+ 		type SuggestionPromptSections
+@@ -19,9 +20,14 @@
+ 			query: string;
+ 			cursor?: string | null;
+ 		}) => Promise<ExperienceSuggestionsResponse | null>;
++		/**
++		 * Host-provided: start an experience from the card's (edited) brief. Without it the cards
++		 * have no Generate button (for example a viewer who cannot create experiences).
++		 */
++		onGenerate?: (brief: string) => void;
+ 	};
+ 
+-	let { query, loadSuggestions }: Props = $props();
++	let { query, loadSuggestions, onGenerate }: Props = $props();
+ 
+ 	type EditableCard = {
+ 		readonly id: string;
+@@ -76,8 +82,6 @@
+ 	let rateLimited = $state(false);
+ 	let hidden = $state(false);
+ 	let loadToken = 0;
+-	let generateDialog = $state<HTMLDialogElement | undefined>();
+-
+ 	let loaderElapsedMs = $state(0);
+ 	let loaderFrame = 0;
+ 	let loaderInterval: ReturnType<typeof setInterval> | 0 = 0;
+@@ -188,16 +192,14 @@
+ 		};
+ 	});
+ 
+-	function openGenerateSoon() {
+-		generateDialog?.showModal();
+-	}
+-
+-	function closeGenerateSoon() {
+-		generateDialog?.close();
+-	}
+-
+-	function onGenerateDialogClick(event: MouseEvent) {
+-		if (event.target === generateDialog) closeGenerateSoon();
++	function generateFrom(card: EditableCard) {
++		onGenerate?.(
++			composeSuggestionBrief({
++				title: card.brief.title,
++				description: card.description,
++				sections: card.sections
++			})
++		);
+ 	}
+ 
+ 	async function loadInitial(q: string) {
+@@ -302,7 +304,11 @@
+ 			<p class="intro">
+ 				No experiences matched your search. Why don't you create one yourself?
+ 			</p>
+-			<p class="intro">Here are three ideas — edit one to refine it then click Generate.</p>
++			<p class="intro">
++				{onGenerate
++					? 'Here are three ideas — edit one to refine it then click Generate.'
++					: 'Here are three ideas.'}
++			</p>
+ 			<ul class="cards">
+ 				{#each cards as card, index (card.id)}
+ 					<li class="card">
+@@ -364,14 +370,16 @@
+ 								</div>
+ 							</details>
+ 						</div>
+-						<button
+-							type="button"
+-							class="generate"
+-							aria-label="Generate {card.brief.title}"
+-							onclick={openGenerateSoon}
+-						>
+-							Generate
+-						</button>
++						{#if onGenerate}
++							<button
++								type="button"
++								class="generate"
++								aria-label="Generate {card.brief.title}"
++								onclick={() => generateFrom(card)}
++							>
++								Generate
++							</button>
++						{/if}
+ 					</li>
+ 				{/each}
+ 			</ul>
+@@ -393,23 +401,6 @@
+ 	</section>
+ {/if}
+ 
+-<dialog
+-	bind:this={generateDialog}
+-	class="generate-dialog"
+-	aria-labelledby="generate-soon-title"
+-	onclick={onGenerateDialogClick}
+->
+-	<div class="dialog-panel">
+-		<header>
+-			<h2 id="generate-soon-title">Generate</h2>
+-			<button type="button" aria-label="Close" onclick={closeGenerateSoon}>×</button>
+-		</header>
+-		<p>Generating an experience from a suggestion is coming soon!</p>
+-		<footer>
+-			<button type="button" class="primary" onclick={closeGenerateSoon}>OK</button>
+-		</footer>
+-	</div>
+-</dialog>
+ 
+ <style>
+ 	.suggestions {
+@@ -760,95 +751,4 @@
+ 		opacity: 0.55;
+ 		cursor: wait;
+ 	}
+-
+-	.generate-dialog {
+-		width: min(28rem, calc(100vw - 2rem));
+-		padding: 0;
+-		border: none;
+-		border-radius: 12px;
+-		background: transparent;
+-		color: inherit;
+-		font-family: inherit;
+-	}
+-
+-	.generate-dialog::backdrop {
+-		background: rgb(15 23 42 / 0.45);
+-	}
+-
+-	.dialog-panel {
+-		display: flex;
+-		flex-direction: column;
+-		gap: 1rem;
+-		padding: 1.25rem;
+-		border: 1px solid var(--border, color-mix(in srgb, var(--page-fg, #f6f2ea) 10%, transparent));
+-		border-radius: var(--radius-md, 0.5rem);
+-		background: var(--bg-elevated, rgba(var(--page-bg-rgb, 7, 8, 7), 0.96));
+-		color: rgba(var(--page-fg-rgb, 246, 242, 234), 0.92);
+-		box-shadow: 0 12px 32px rgb(15 23 42 / 0.28);
+-	}
+-
+-	.dialog-panel header {
+-		display: flex;
+-		align-items: flex-start;
+-		justify-content: space-between;
+-		gap: 0.75rem;
+-	}
+-
+-	.dialog-panel h2 {
+-		margin: 0;
+-		font-size: 1.125rem;
+-		font-weight: 650;
+-	}
+-
+-	.dialog-panel header button {
+-		width: 2rem;
+-		height: 2rem;
+-		margin: 0;
+-		padding: 0;
+-		border: none;
+-		border-radius: 6px;
+-		background: transparent;
+-		color: rgba(var(--page-fg-rgb, 246, 242, 234), 0.62);
+-		font-size: 1.35rem;
+-		line-height: 1;
+-		cursor: pointer;
+-	}
+-
+-	.dialog-panel header button:hover,
+-	.dialog-panel header button:focus-visible {
+-		background: rgba(var(--page-fg-rgb, 246, 242, 234), 0.08);
+-		color: rgba(var(--page-fg-rgb, 246, 242, 234), 0.92);
+-		outline: none;
+-	}
+-
+-	.dialog-panel p {
+-		margin: 0;
+-		color: rgba(var(--page-fg-rgb, 246, 242, 234), 0.72);
+-		font-size: 0.9375rem;
+-		line-height: 1.45;
+-	}
+-
+-	.dialog-panel footer {
+-		display: flex;
+-		justify-content: flex-end;
+-	}
+-
+-	.dialog-panel footer .primary {
+-		margin: 0;
+-		padding: 0.5rem 0.95rem;
+-		border: 1px solid rgba(var(--page-fg-rgb, 246, 242, 234), 0.38);
+-		border-radius: 8px;
+-		background: rgba(var(--page-fg-rgb, 246, 242, 234), 0.16);
+-		color: inherit;
+-		font: inherit;
+-		font-size: 0.9rem;
+-		font-weight: 650;
+-		cursor: pointer;
+-	}
+-
+-	.dialog-panel footer .primary:hover,
+-	.dialog-panel footer .primary:focus-visible {
+-		background: rgba(var(--page-fg-rgb, 246, 242, 234), 0.24);
+-		outline: none;
+-	}
+ </style>
+diff --git a/packages/public-experience-chooser/src/ExperienceSearchSuggestions.test.ts b/packages/public-experience-chooser/src/ExperienceSearchSuggestions.test.ts
+new file mode 100644
+index 0000000..aae2e51
+--- /dev/null
++++ b/packages/public-experience-chooser/src/ExperienceSearchSuggestions.test.ts
+@@ -0,0 +1,78 @@
++/** @vitest-environment happy-dom */
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { flushSync, mount, unmount } from 'svelte';
++
++import ExperienceSearchSuggestions from './ExperienceSearchSuggestions.svelte';
++import { composeSuggestionBrief } from './suggestionPrompt';
++import type { ExperienceSuggestionBrief } from './suggestionTypes';
++
++const brief: ExperienceSuggestionBrief = {
++	title: 'Calm a client',
++	useCaseRoot: 'training',
++	character: 'You are Maya, a hotel manager.',
++	playerRole: 'The user is a new receptionist.',
++	set: 'You are in a hotel lobby.',
++	situation: 'Maya is upset about a lost booking.',
++	generationPrompt: '',
++	description: 'You calm Maya down.'
++};
++
++const mounted: { component: ReturnType<typeof mount>; target: HTMLElement }[] = [];
++
++afterEach(async () => {
++	for (const { component, target } of mounted.splice(0)) {
++		await unmount(component);
++		target.remove();
++	}
++});
++
++async function renderCards(onGenerate?: (brief: string) => void) {
++	const target = document.createElement('div');
++	document.body.append(target);
++	const loadSuggestions = vi.fn(async () => ({ suggestions: [brief], nextCursor: null }));
++	const component = mount(ExperienceSearchSuggestions, {
++		target,
++		props: { query: 'calm a client', loadSuggestions, ...(onGenerate ? { onGenerate } : {}) }
++	});
++	mounted.push({ component, target });
++	await vi.waitFor(() => expect(target.querySelector('.card')).not.toBeNull());
++	flushSync();
++	const generate = () =>
++		Array.from(target.querySelectorAll('button')).find((button) => button.textContent?.trim() === 'Generate');
++	return { target, generate };
++}
++
++describe('search suggestion cards', () => {
++	it('hands the card brief, with the author edits, to the host on Generate', async () => {
++		const onGenerate = vi.fn();
++		const { target, generate } = await renderCards(onGenerate);
++
++		const description = target.querySelector<HTMLTextAreaElement>('textarea')!;
++		description.value = 'You calm Maya down before check-out.';
++		description.dispatchEvent(new Event('input', { bubbles: true }));
++		flushSync();
++		generate()!.click();
++
++		expect(onGenerate).toHaveBeenCalledTimes(1);
++		expect(onGenerate).toHaveBeenCalledWith(
++			composeSuggestionBrief({
++				title: 'Calm a client',
++				description: 'You calm Maya down before check-out.',
++				sections: {
++					character: brief.character,
++					playerRole: brief.playerRole,
++					set: brief.set,
++					situation: brief.situation
++				}
++			})
++		);
++		expect(target.textContent).not.toContain('coming soon');
++	});
++
++	it('shows no Generate button when the host cannot create experiences', async () => {
++		const { target, generate } = await renderCards();
++		expect(generate()).toBeUndefined();
++		expect(target.textContent).toContain('Here are three ideas.');
++		expect(target.textContent).not.toContain('click Generate');
++	});
++});
+diff --git a/packages/public-experience-chooser/src/suggestionPrompt.test.ts b/packages/public-experience-chooser/src/suggestionPrompt.test.ts
+index e536f9d..39b2598 100644
+--- a/packages/public-experience-chooser/src/suggestionPrompt.test.ts
++++ b/packages/public-experience-chooser/src/suggestionPrompt.test.ts
+@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
+ 
+ import {
+ 	composeGenerationPrompt,
++	composeSuggestionBrief,
+ 	parseGenerationPrompt,
+ 	sectionsFromSuggestionBrief
+ } from './suggestionPrompt';
+@@ -57,4 +58,21 @@ describe('suggestionPrompt', () => {
+ 			'Bram Veldhoven'
+ 		);
+ 	});
++
++	it('puts the title and description first in a suggestion brief', () => {
++		const sections = {
++			character: 'You are Maya.',
++			playerRole: 'The user is a trainee.',
++			set: 'You are in an office.',
++			situation: 'Help the user practise.'
++		};
++		expect(
++			composeSuggestionBrief({ title: ' Calm a client ', description: ' You help Maya. ', sections })
++		).toBe(
++			'Title:\nCalm a client\n\nDescription:\nYou help Maya.\n\n' + composeGenerationPrompt(sections)
++		);
++		expect(composeSuggestionBrief({ title: 'Calm a client', description: '  ', sections })).toBe(
++			'Title:\nCalm a client\n\n' + composeGenerationPrompt(sections)
++		);
++	});
+ });
+diff --git a/packages/public-experience-chooser/src/suggestionPrompt.ts b/packages/public-experience-chooser/src/suggestionPrompt.ts
+index 0ed0f5a..6d460e9 100644
+--- a/packages/public-experience-chooser/src/suggestionPrompt.ts
++++ b/packages/public-experience-chooser/src/suggestionPrompt.ts
+@@ -78,3 +78,21 @@ export function sectionsFromSuggestionBrief(brief: {
+ 	}
+ 	return parseGenerationPrompt(brief.generationPrompt ?? '');
+ }
++
++/**
++ * Experience brief for one (possibly edited) suggestion card: title and description first, so the
++ * setup generator keeps them, then the four sections.
++ */
++export function composeSuggestionBrief(input: {
++	readonly title: string;
++	readonly description: string;
++	readonly sections: SuggestionPromptSections;
++}): string {
++	return [
++		`Title:\n${input.title.trim()}`,
++		input.description.trim() ? `Description:\n${input.description.trim()}` : '',
++		composeGenerationPrompt(input.sections)
++	]
++		.filter(Boolean)
++		.join('\n\n');
++}
+diff --git a/src/routes/(portal)/studio/experiences/+page.svelte b/src/routes/(portal)/studio/experiences/+page.svelte
+index 90cb543..3dff5cf 100644
+--- a/src/routes/(portal)/studio/experiences/+page.svelte
++++ b/src/routes/(portal)/studio/experiences/+page.svelte
+@@ -3,9 +3,11 @@
+ 	import { resolve } from '$app/paths';
+ 	import { page } from '$app/state';
+ 	import {
++		clampToPromptLimit,
+ 		ExperienceCreationBriefDialog,
+ 		ExperienceCreationBriefForm,
+ 		ExperienceSetupProgressDialog,
++		PROMPT_LIMITS,
+ 		StudioOverflowMenu
+ 	} from '@liforma/experience-studio';
+ 	import {
+@@ -155,6 +157,8 @@
+ 	let confirmOpen = $state(false);
+ 	let actionBusy = $state(false);
+ 	let creationPromptOpen = $state(false);
++	/** Brief handed over by Generate on a search suggestion card (`?newBrief=`). */
++	let handedBrief = $state('');
+ 	let creationJobToken = $state<string | null>(null);
+ 	let creationNavigationStarted = false;
+ 	let deletedOpen = $state(false);
+@@ -417,9 +421,30 @@
+ 
+ 	function openCreationPrompt() {
+ 		if (!project || !canAuthor || pageBusy || creationJobToken) return;
++		handedBrief = '';
+ 		creationPromptOpen = true;
+ 	}
+ 
++	// Generate on a search suggestion: open the brief form filled in, then drop the brief from the address.
++	$effect(() => {
++		const brief = page.url.searchParams.get('newBrief');
++		if (brief === null) return;
++		untrack(() => {
++			if (project && canAuthor && !creationJobToken) {
++				handedBrief = clampToPromptLimit(brief, PROMPT_LIMITS.experienceBrief);
++				creationPromptOpen = true;
++			} else {
++				console.warn('Search suggestion brief not opened: no project, no author access, or a creation is running.', {
++					projectId: project?.id ?? null,
++					role: project?.role ?? null
++				});
++			}
++			const url = new URL(page.url.href);
++			url.searchParams.delete('newBrief');
++			void goto(resolve((`${url.pathname}${url.search}${url.hash}`).replace(/^\//, '') as "studio/experiences"), { shallow: true, replace: true });
++		});
++	});
++
+ 	function startCreation(mode: 'blank' | 'generate', prompt?: string) {
+ 		if (!project || !canAuthor || creationJobToken) return;
+ 		creationNavigationStarted = false;
+@@ -1151,10 +1176,12 @@
+ {#if creationPromptOpen}
+ 	<ExperienceCreationBriefDialog
+ 		bind:open={creationPromptOpen}
++		initialBrief={handedBrief}
+ 		onskip={() => startCreation('blank')}
+ 		ongenerate={(prompt) => startCreation('generate', prompt)}
+ 		ondismiss={() => {
+ 			creationPromptOpen = false;
++			handedBrief = '';
+ 		}}
+ 	/>
+ {/if}
+diff --git a/src/routes/(portal)/studio/search/+page.svelte b/src/routes/(portal)/studio/search/+page.svelte
+index 9b1315d..35f39b4 100644
+--- a/src/routes/(portal)/studio/search/+page.svelte
++++ b/src/routes/(portal)/studio/search/+page.svelte
+@@ -10,10 +10,13 @@
+ 	} from '@liforma/public-experience-chooser';
+ 	import { logStudioRequestFailure } from '#lib/client/studioRequestFailure.js';
+ 	import { apiBaseUrl } from '#lib/config.js';
++	import { canAuthorExperiences, withProjectQuery } from '#lib/portal.js';
+ 	import { studioUrl } from '#lib/studio/studioUrl.js';
+ 
+ 	let { data } = $props();
+ 
++	const canAuthor = $derived(canAuthorExperiences(data.activeProject ?? null));
++
+ 	let clientExperiences = $state<GalleryExperience[] | null>(null);
+ 	let clientWorkspace = $state<WorkspaceSearchCard[] | null>(null);
+ 	let clientCursor = $state<string | null>(null);
+@@ -114,6 +117,15 @@
+ 		);
+ 	}
+ 
++	/** Generate on a suggestion card: the experiences page opens its brief form filled with this brief. */
++	function handleGenerateSuggestion(brief: string) {
++		const href = withProjectQuery(
++			`/studio/experiences?newBrief=${encodeURIComponent(brief)}`,
++			data.activeProject ?? null
++		);
++		void goto(resolve(href.replace(/^\//, '') as 'studio/experiences'));
++	}
++
+ 	function workspacePlayHref(card: WorkspaceSearchCard): string {
+ 		return formatPlayHref({ slug: card.slug, title: card.title, expId: card.expId });
+ 	}
+@@ -238,6 +250,7 @@
+ 			loadingMore={loadingMore}
+ 			onLoadMore={loadMore}
+ 			loadSuggestions={loadSuggestions}
++			onGenerateSuggestion={canAuthor ? handleGenerateSuggestion : undefined}
+ 		/>
+ 	{/if}
+ </div>
+-- 
+2.50.1 (Apple Git-155)
+

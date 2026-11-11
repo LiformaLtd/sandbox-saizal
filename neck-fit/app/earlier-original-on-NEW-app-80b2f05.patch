@@ -1,0 +1,271 @@
+diff --git a/src/lib/avatarSetClothes/ethnicityPlate.worker.ts b/src/lib/avatarSetClothes/ethnicityPlate.worker.ts
+index c747b23..7fe8c09 100644
+--- a/src/lib/avatarSetClothes/ethnicityPlate.worker.ts
++++ b/src/lib/avatarSetClothes/ethnicityPlate.worker.ts
+@@ -4,9 +4,12 @@
+ // endpoint pictures with the job (customOutfitStore.ts). The image route has already removed the green fringe.
+ // Inputs are read and resized exactly as the Python maker does (pngCodec.ts, plateResize.ts), so the plates match
+ // it byte for byte. European answers Anna's plate and African Precious's plate, in the 1024 frame.
++// LOCAL ONLY (2026-10-28): a catalogue outfit's plate for a mixed ethnicity is not made here at all - it is fetched as
++// made on the server with the neck fit (fittedPlateUrl, the same bake a character save runs), so this browser does no
++// blending and the preview is the saved picture. The maker below still makes "+ New clothes" plates kept in this browser.
+ import { decodePng, encodePng } from './pngCodec';
+ import { publicSeedClothesUrl, type AvatarSetClothesFormat } from './avatarSetClothesUrl';
+-import { legacyOutfitInputUrl, type RaceSet } from './legacyOutfitInputUrl';
++import { fittedPlateUrl, legacyOutfitInputUrl, type RaceSet } from './legacyOutfitInputUrl';
+ import { toPlateFrame } from './plateResize';
+ import { bodyBelowNeck, NECK_BASE_ROW } from './bodyPreview';
+ import {
+@@ -219,15 +222,17 @@ async function makePlate(
+ 	// the white tee and jeans is the ethnicity's own base picture: read it in the plate frame, nothing to make
+ 	if (outfit === BASE_OUTFIT)
+ 		return { rgba: await pixels(legacyOutfitInputUrl('base', race, avatarSetId), size), report: null, size };
+-	const [all, anna, precious, lightBase, raceFace] = await Promise.all([
++	const [all, anna, precious] = await Promise.all([
+ 		mixes(avatarSetId),
+ 		plate('anna', outfit, set, avatarSetId, size, custom, cdnBaseUrl, seedFormat),
+-		plate('precious', outfit, set, avatarSetId, size, custom, cdnBaseUrl, seedFormat),
+-		plate('anna', BASE_OUTFIT, set, avatarSetId, size, undefined, cdnBaseUrl, seedFormat), // the garment test compares the outfit with the same man in the white tee
+-		face(race, set, avatarSetId, size)
++		plate('precious', outfit, set, avatarSetId, size, custom, cdnBaseUrl, seedFormat)
+ 	]);
+ 	const mix = all[race];
+ 	if (!mix) throw new Error(`no mix values for ${race}`);
++	const [lightBase, raceFace] = await Promise.all([
++		plate('anna', BASE_OUTFIT, set, avatarSetId, size, undefined, cdnBaseUrl, seedFormat), // the garment test compares the outfit with the same man in the white tee
++		face(race, set, avatarSetId, size)
++	]);
+ 	const made = makeRacePlate(anna, precious, lightBase, raceFace, mix, { report });
+ 	return { ...made, size };
+ }
+@@ -281,6 +286,12 @@ scope.onmessage = async (event) => {
+ 			});
+ 			return;
+ 		}
++		if (!custom && race !== 'european' && race !== 'african' && outfit !== BASE_OUTFIT) {
++			// a catalogue outfit on a mixed ethnicity: made on the server (the neck fit), passed on as it comes
++			const res = await fetchOk(fittedPlateUrl(outfit, race, avatarSetId, size, format));
++			scope.postMessage({ id, blob: await res.blob(), report: null });
++			return;
++		}
+ 		const { rgba, report, size: madeSize } = await makePlate(
+ 			race,
+ 			outfit,
+diff --git a/src/lib/avatarSetClothes/legacyEthnicityPlates.svelte.ts b/src/lib/avatarSetClothes/legacyEthnicityPlates.svelte.ts
+index ffc3314..2c832e4 100644
+--- a/src/lib/avatarSetClothes/legacyEthnicityPlates.svelte.ts
++++ b/src/lib/avatarSetClothes/legacyEthnicityPlates.svelte.ts
+@@ -147,13 +147,16 @@ function smallerReady(
+ 
+ const warmedInputs = new SvelteSet<string>();
+ 
+-/** Fetch the maker inputs for an outfit so a later face join reads them from the browser cache. */
++/**
++ * Fetch the inputs for a "+ New clothes" outfit so a later plate reads them from the browser cache: the maker's faces
++ * and chin outlines. A catalogue outfit's plates are made on the server (fittedPlateUrl): nothing to fetch ahead.
++ */
+ export function warmEthnicityMakerInputs(
+ 	avatarSetId: string,
+ 	outfit: string,
+ 	races: readonly string[]
+ ): void {
+-	if (!avatarSetId || !outfit) return;
++	if (!avatarSetId || !outfit || !isCustomOutfitId(outfit)) return;
+ 	// Seed clothes plates come from the public CDN at preview size. Do not prefetch the
+ 	// 1254 authoring PNGs — on staging each one is a serverless download and they fill
+ 	// the browser's connection pool ahead of the face the joiner actually needs.
+diff --git a/src/lib/avatarSetClothes/legacyOutfitInputUrl.test.ts b/src/lib/avatarSetClothes/legacyOutfitInputUrl.test.ts
+index a7847dc..3ec7aba 100644
+--- a/src/lib/avatarSetClothes/legacyOutfitInputUrl.test.ts
++++ b/src/lib/avatarSetClothes/legacyOutfitInputUrl.test.ts
+@@ -1,14 +1,32 @@
+ import { describe, expect, it } from 'vitest';
+ 
+-import { isMakerInputName, legacyOutfitInputUrl } from './legacyOutfitInputUrl';
++import { fittedPlateUrl, isMakerInputName, legacyOutfitInputUrl } from './legacyOutfitInputUrl';
+ 
+ describe('legacyOutfitInputUrl', () => {
+ 	it('asks the Studio proxy for an avatar-set maker input', () => {
+ 		expect(legacyOutfitInputUrl('base', 'european', 'xp8qtdvc')).toBe(
+-			'/api/studio/avatar-set-clothes/input?v=avatar-set-maker-1&avatarSetId=xp8qtdvc&kind=base&race=european'
++			'/api/studio/avatar-set-clothes/input?v=avatar-set-maker-4&avatarSetId=xp8qtdvc&kind=base&race=european'
+ 		);
+ 		expect(legacyOutfitInputUrl('values', '', '09hmxcmk')).toBe(
+-			'/api/studio/avatar-set-clothes/input?v=avatar-set-maker-1&avatarSetId=09hmxcmk&kind=values'
++			'/api/studio/avatar-set-clothes/input?v=avatar-set-maker-4&avatarSetId=09hmxcmk&kind=values'
++		);
++	});
++
++	it('names the head+neck picture by ethnicity and the collar line by outfit', () => {
++		expect(legacyOutfitInputUrl('headneck', 'south-asian', '09hmxcmk')).toBe(
++			'/api/studio/avatar-set-clothes/input?v=avatar-set-maker-4&avatarSetId=09hmxcmk&kind=headneck&race=south-asian'
++		);
++		expect(legacyOutfitInputUrl('collar', 'barista', '09hmxcmk')).toBe(
++			'/api/studio/avatar-set-clothes/input?v=avatar-set-maker-4&avatarSetId=09hmxcmk&kind=collar&outfit=barista'
++		);
++		expect(legacyOutfitInputUrl('headshape', '', 'xp8qtdvc')).toBe(
++			'/api/studio/avatar-set-clothes/input?v=avatar-set-maker-4&avatarSetId=xp8qtdvc&kind=headshape'
++		);
++	});
++
++	it('asks the Studio proxy for a catalogue plate made on the server', () => {
++		expect(fittedPlateUrl('sports_wear.2', 'south-asian', '09hmxcmk', 512, 'image/webp')).toBe(
++			'/api/studio/avatar-set-clothes/fitted?v=avatar-set-maker-4&avatarSetId=09hmxcmk&outfit=sports_wear.2&race=south-asian&size=512&format=webp'
+ 		);
+ 	});
+ 
+diff --git a/src/lib/avatarSetClothes/legacyOutfitInputUrl.ts b/src/lib/avatarSetClothes/legacyOutfitInputUrl.ts
+index 7616b26..a54bcb9 100644
+--- a/src/lib/avatarSetClothes/legacyOutfitInputUrl.ts
++++ b/src/lib/avatarSetClothes/legacyOutfitInputUrl.ts
+@@ -2,7 +2,33 @@
+ // authoring avatar-sets/{id}/… (never public race-outfits). The version is part of the address so a
+ // browser never reuses an answer saved before the inputs changed; plates made from them are cached under it too.
+ const INPUT = '/api/studio/avatar-set-clothes/input';
+-export const RACE_INPUT_VERSION = 'avatar-set-maker-1';
++/**
++ * 2: plates stacked from head+neck pictures where they exist (headNeckPlate.ts); 3: collar files with the clothing kept
++ * by the jaw (2026-10-26); 4: catalogue plates made on the server with the neck fit (2026-10-28, fittedPlateUrl). A new
++ * version keeps older cached plates from being reused.
++ */
++export const RACE_INPUT_VERSION = 'avatar-set-maker-4';
++
++/** LOCAL ONLY (2026-10-28): a catalogue outfit's ethnicity plate, made on the server (the same bake as a save). */
++const FITTED = '/api/studio/avatar-set-clothes/fitted';
++
++export function fittedPlateUrl(
++	outfit: string,
++	race: string,
++	avatarSetId: string,
++	size: number,
++	format: 'image/webp' | 'image/png'
++): string {
++	const query = new URLSearchParams({
++		v: RACE_INPUT_VERSION,
++		avatarSetId,
++		outfit,
++		race,
++		size: String(size),
++		format: format === 'image/png' ? 'png' : 'webp'
++	});
++	return `${FITTED}?${query}`;
++}
+ 
+ /**
+  * Outfit or ethnicity on a maker-input request. Empty is the mix-values request.
+@@ -30,12 +56,17 @@ export function raceSet(): RaceSet {
+ 	return currentSet;
+ }
+ 
++/** Inputs named by an ethnicity (`race=`); the rest are named by an outfit (`outfit=`) or by nothing. */
++export function isRaceNamedInput(kind: string): boolean {
++	return kind === 'face' || kind === 'base' || kind === 'outline' || kind === 'headneck';
++}
++
+ export function legacyOutfitInputUrl(
+-	kind: 'anna' | 'precious' | 'face' | 'base' | 'values' | 'outline',
++	kind: 'anna' | 'precious' | 'face' | 'base' | 'values' | 'outline' | 'headneck' | 'headshape' | 'collar',
+ 	name = '',
+ 	avatarSetId: string
+ ): string {
+-	const param = kind === 'face' || kind === 'base' || kind === 'outline' ? 'race' : 'outfit';
++	const param = isRaceNamedInput(kind) ? 'race' : 'outfit';
+ 	const query = `${INPUT}?v=${RACE_INPUT_VERSION}&avatarSetId=${encodeURIComponent(avatarSetId)}&kind=${kind}`;
+ 	return name ? `${query}&${param}=${encodeURIComponent(name)}` : query;
+ }
+diff --git a/src/routes/(portal)/api/studio/avatar-set-clothes/input/+server.ts b/src/routes/(portal)/api/studio/avatar-set-clothes/input/+server.ts
+index 2833e1d..dbfe791 100644
+--- a/src/routes/(portal)/api/studio/avatar-set-clothes/input/+server.ts
++++ b/src/routes/(portal)/api/studio/avatar-set-clothes/input/+server.ts
+@@ -1,14 +1,15 @@
+-// Custom "+ New clothes" plate-maker inputs (?kind=anna|precious|face|base|values|outline).
++// Custom "+ New clothes" plate-maker inputs (?kind=anna|precious|face|base|values|outline), and the pictures the API's
++// bake stacks from (?kind=headneck|headshape|collar). Catalogue preview plates come made from the API (../fitted).
+ // Catalogue browse/save does not use this route. Bytes come from the API, which reads private
+ // authoring avatar-sets/{id}/… so the worker can read pixels without a public maker CDN.
+ import { error } from '@sveltejs/kit';
+-import { isMakerInputName } from '$lib/avatarSetClothes/legacyOutfitInputUrl';
++import { isMakerInputName, isRaceNamedInput } from '$lib/avatarSetClothes/legacyOutfitInputUrl';
+ import { liformaApiFetch } from '$lib/server/liformaApi';
+ import { apiErrorResponse, requireStudioSession } from '$lib/server/studioBff';
+ 
+ import type { RequestHandler } from './$types';
+ 
+-const KINDS = ['anna', 'precious', 'face', 'base', 'values', 'outline'] as const;
++const KINDS = ['anna', 'precious', 'face', 'base', 'values', 'outline', 'headneck', 'headshape', 'collar'] as const;
+ const SET_ID = /^[0-9a-z]{8}$/;
+ 
+ export const GET: RequestHandler = async (event) => {
+@@ -18,12 +19,12 @@ export const GET: RequestHandler = async (event) => {
+ 	const outfit = url.searchParams.get('outfit') ?? '';
+ 	const race = url.searchParams.get('race') ?? '';
+ 	const avatarSetId = url.searchParams.get('avatarSetId') ?? '';
+-	const name = kind === 'face' || kind === 'base' || kind === 'outline' ? race : outfit;
++	const name = isRaceNamedInput(kind) ? race : outfit;
+ 	if (!(KINDS as readonly string[]).includes(kind) || !isMakerInputName(name) || !SET_ID.test(avatarSetId)) {
+ 		error(400, 'Bad input');
+ 	}
+ 	const query = new URLSearchParams({ kind });
+-	if (name) query.set(kind === 'face' || kind === 'base' || kind === 'outline' ? 'race' : 'outfit', name);
++	if (name) query.set(isRaceNamedInput(kind) ? 'race' : 'outfit', name);
+ 	try {
+ 		const upstream = await liformaApiFetch(
+ 			session.user.id,
+diff --git a/src/routes/(portal)/api/studio/avatar-set-clothes/fitted/+server.ts b/src/routes/(portal)/api/studio/avatar-set-clothes/fitted/+server.ts
+new file mode 100644
+index 0000000..e4de4b5
+--- /dev/null
++++ b/src/routes/(portal)/api/studio/avatar-set-clothes/fitted/+server.ts
+@@ -0,0 +1,52 @@
++// LOCAL ONLY (2026-10-28): a catalogue outfit's ethnicity plate, made on the API with the neck fit - the same bake a
++// character save runs - so the Studio preview shows the saved picture and the browser does no blending.
++// ?avatarSetId=&outfit=&race=&size=256|512|1024&format=webp|png
++import { error } from '@sveltejs/kit';
++import { isMakerInputName } from '$lib/avatarSetClothes/legacyOutfitInputUrl';
++import { liformaApiFetch } from '$lib/server/liformaApi';
++import { apiErrorResponse, requireStudioSession } from '$lib/server/studioBff';
++
++import type { RequestHandler } from './$types';
++
++const SET_ID = /^[0-9a-z]{8}$/;
++const SIZES = ['256', '512', '1024'];
++const FORMATS = ['webp', 'png'];
++
++export const GET: RequestHandler = async (event) => {
++	const session = await requireStudioSession(event);
++	const { url } = event;
++	const avatarSetId = url.searchParams.get('avatarSetId') ?? '';
++	const outfit = url.searchParams.get('outfit') ?? '';
++	const race = url.searchParams.get('race') ?? '';
++	const size = url.searchParams.get('size') ?? '1024';
++	const format = url.searchParams.get('format') ?? 'webp';
++	if (
++		!SET_ID.test(avatarSetId) ||
++		!outfit ||
++		!race ||
++		!isMakerInputName(outfit) ||
++		!isMakerInputName(race) ||
++		!SIZES.includes(size) ||
++		!FORMATS.includes(format)
++	) {
++		error(400, 'Bad plate request');
++	}
++	const query = new URLSearchParams({ outfit, race, size, format });
++	try {
++		const upstream = await liformaApiFetch(
++			session.user.id,
++			`/internal/avatar-sets/${avatarSetId}/fitted-plate?${query}`,
++			{ timeoutMs: 60_000 }
++		);
++		if (!upstream.ok) error(upstream.status === 404 ? 404 : 502, 'No such plate');
++		return new Response(await upstream.arrayBuffer(), {
++			headers: {
++				'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream',
++				'cache-control': 'private, max-age=86400'
++			}
++		});
++	} catch (caught) {
++		if (caught && typeof caught === 'object' && 'status' in caught) throw caught;
++		return apiErrorResponse(caught);
++	}
++};

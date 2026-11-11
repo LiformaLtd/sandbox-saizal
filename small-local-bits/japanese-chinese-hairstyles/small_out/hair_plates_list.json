@@ -1,0 +1,127 @@
+{
+ "version": 1,
+ "note": "Hairstyles made in the browser from one shade plate each: <group>/<style>.png (red/green = 16-bit shade, blue = opacity), coloured with colour_tables.json and fitted to an avatar with dots/<avatar>.json against the group's source avatar's dots.",
+ "colours": [
+  "black",
+  "darkbrown",
+  "chestnut",
+  "copper",
+  "honeyblonde",
+  "blue"
+ ],
+ "groups": {
+  "men": {
+   "source": "95b4bafb",
+   "colourJoin": "_",
+   "fit": {
+    "snapNeck": false
+   }
+  },
+  "women": {
+   "source": "dd80126a",
+   "colourJoin": "-",
+   "fit": {}
+  }
+ },
+ "avatars": {
+  "95b4bafb": {
+   "group": "men"
+  },
+  "af5b0001": {
+   "group": "men",
+   "stretch": 1.02
+  },
+  "ea5b0001": {
+   "group": "men",
+   "stretch": 1.002
+  },
+  "5e5b0001": {
+   "group": "men",
+   "stretch": 1.028
+  },
+  "ae5b0001": {
+   "group": "men",
+   "stretch": 1.004
+  },
+  "5a5b0001": {
+   "group": "men",
+   "stretch": 1.013
+  },
+  "ed5b0001": {
+   "group": "men",
+   "stretch": 1.015
+  },
+  "0a5b0001": {
+   "group": "men",
+   "stretch": 1.01
+  },
+  "1d5b0001": {
+   "group": "men",
+   "stretch": 1.04
+  },
+  "ac5b0001": {
+   "group": "men",
+   "stretch": 1.05
+  },
+  "dd80126a": {
+   "group": "women"
+  },
+  "5a5a0002": {
+   "group": "women"
+  },
+  "ed5a0001": {
+   "group": "women"
+  },
+  "1d5a0001": {
+   "group": "women"
+  },
+  "ae5a0002": {
+   "group": "women"
+  },
+  "0a5a0001": {
+   "group": "women"
+  },
+  "ea5a0002": {
+   "group": "women"
+  },
+  "ac5a0001": {
+   "group": "women"
+  },
+  "af5a0001": {
+   "group": "women"
+  },
+  "5e5a0001": {
+   "group": "women"
+  }
+ },
+ "plates": [
+  {
+   "style": "japanese-updo",
+   "group": "women"
+  },
+  {
+   "style": "chinese-hairpin-updo",
+   "group": "women"
+  },
+  {
+   "style": "double-buns",
+   "group": "women"
+  },
+  {
+   "style": "samurai_topknot",
+   "group": "men",
+   "stretch": true
+  },
+  {
+   "style": "chinese_topknot",
+   "group": "men",
+   "stretch": true
+  },
+  {
+   "style": "two_block_cut",
+   "group": "men",
+   "stretch": true
+  }
+ ],
+ "tileSize": 256
+}

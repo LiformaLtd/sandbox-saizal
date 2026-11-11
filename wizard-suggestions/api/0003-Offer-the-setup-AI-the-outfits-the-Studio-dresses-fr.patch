@@ -1,0 +1,191 @@
+From 6a55ca6f3ee67c16ed35fbe0ea099cb76c226178 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:49:13 +0000
+Subject: [PATCH 3/5] Offer the setup AI the outfits the Studio dresses from,
+ keyed by id
+
+Real AI runs (Gemini 3 Flash via OpenRouter, 10 Nov) showed two problems
+with the labelled outfit list:
+- The model once copied a whole "id: name (labels)" line as the outfit id,
+  so the pick was dropped (logged) and the character started in the white
+  T-shirt. Outfits are now an object keyed by id.
+- The list came from each avatar's own outfit ids (120 women's ids, 45 of
+  them race-baked copies or old custom ids the Studio never shows). It now
+  comes from the avatar set list the Studio dresses a character from (75
+  women's, 64 men's), else the avatar's own list.
+
+The set rule now asks only for sets from the brief's own world or period
+that show the same kind of place, and an empty list when none fits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/characterWardrobeChoices.test.ts | 32 ++++++++++++-----
+ .../platform/characterWardrobeChoices.ts      | 35 +++++++++++++------
+ .../generateExperienceSetupDetails.ts         |  6 ++--
+ 3 files changed, 51 insertions(+), 22 deletions(-)
+
+diff --git a/src/lib/server/platform/characterWardrobeChoices.test.ts b/src/lib/server/platform/characterWardrobeChoices.test.ts
+index bed5d94..f57f5d9 100644
+--- a/src/lib/server/platform/characterWardrobeChoices.test.ts
++++ b/src/lib/server/platform/characterWardrobeChoices.test.ts
+@@ -3,16 +3,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+ vi.mock('$lib/server/catalog/avatars', () => ({
+ 	listPublishedAvatars: async () => [
+-		{ id: 'anna', gender: 'female', supportsCostumes: true, clothesIds: ['barista', 'business_woman_in_suit.7'], hairIds: ['bob'] },
++		{ id: 'anna', gender: 'female', supportsCostumes: true, clothesIds: ['barista--european', 'old_custom_coat'], hairIds: ['bob'] },
+ 		{ id: 'caleb', gender: 'male', supportsCostumes: true, clothesIds: ['barista', 'chef'], hairIds: ['crew'] },
+ 		{ id: 'sofia', gender: 'female', supportsCostumes: false, clothesIds: ['ballgown'], hairIds: [] }
+ 	]
+ }));
+ 
++const loadAvatarSetByAvatarIdMap = vi.hoisted(() =>
++	vi.fn(async () => new Map([['anna', { clothesIds: ['barista', 'business_woman_in_suit.7'] }]]))
++);
++vi.mock('$lib/server/catalog/avatarSets', () => ({ loadAvatarSetByAvatarIdMap }));
++
+ import {
+ 	checkedClothesPicks,
+-	clothesChoiceLine,
+ 	loadCharacterWardrobeChoices,
++	wardrobePromptChoices,
+ 	type CharacterWardrobeChoices
+ } from './characterWardrobeChoices';
+ 
+@@ -23,14 +28,16 @@ afterEach(() => {
+ });
+ 
+ describe('loadCharacterWardrobeChoices', () => {
+-	it('describes each published outfit with its catalogue name and merged labels', async () => {
++	it('takes outfits from the avatar set the Studio dresses from, else the avatar list, with catalogue names and merged labels', async () => {
+ 		const findMany = vi.fn(async () => [
+ 			{ catalogueKey: 'barista', name: 'Barista Apron Outfit', taxonomyAssignments: [label('role', 'Barista'), label('outfit-type', 'Uniform')] },
+ 			{ catalogueKey: 'barista', name: 'Barista Apron Outfit', taxonomyAssignments: [label('outfit-type', 'Uniform'), label('formality', 'Casual')] },
+ 			{ catalogueKey: 'chef', name: 'Chef Whites', taxonomyAssignments: [] }
+ 		]);
+-		const choices = await loadCharacterWardrobeChoices({ clothes: { findMany } } as unknown as PrismaClient);
++		const prisma = { clothes: { findMany } } as unknown as PrismaClient;
++		const choices = await loadCharacterWardrobeChoices(prisma);
+ 
++		expect(loadAvatarSetByAvatarIdMap).toHaveBeenCalledWith(prisma, ['anna', 'caleb']);
+ 		expect(findMany).toHaveBeenCalledWith(
+ 			expect.objectContaining({
+ 				where: {
+@@ -48,10 +55,19 @@ describe('loadCharacterWardrobeChoices', () => {
+ 			],
+ 			hair: ['bob']
+ 		});
+-		expect(choices.male.clothes.map(clothesChoiceLine)).toEqual([
+-			'barista: Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)',
+-			'chef: Chef Whites'
+-		]);
++		expect(wardrobePromptChoices(choices)).toEqual({
++			female: {
++				clothes: {
++					barista: 'Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)',
++					'business_woman_in_suit.7': ''
++				},
++				hair: ['bob']
++			},
++			male: {
++				clothes: { barista: 'Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)', chef: 'Chef Whites' },
++				hair: ['crew']
++			}
++		});
+ 	});
+ });
+ 
+diff --git a/src/lib/server/platform/characterWardrobeChoices.ts b/src/lib/server/platform/characterWardrobeChoices.ts
+index 03868ff..8523cdb 100644
+--- a/src/lib/server/platform/characterWardrobeChoices.ts
++++ b/src/lib/server/platform/characterWardrobeChoices.ts
+@@ -1,5 +1,6 @@
+ import type { PrismaClient } from '@prisma/client';
+ 
++import { loadAvatarSetByAvatarIdMap } from '$lib/server/catalog/avatarSets';
+ import { listPublishedAvatars } from '$lib/server/catalog/avatars';
+ 
+ export const MAX_SUGGESTED_CLOTHES = 3;
+@@ -17,12 +18,20 @@ export type CharacterWardrobeChoices = Record<'female' | 'male', { clothes: Clot
+ const LABEL_DIMENSIONS = { role: 'role', 'outfit-type': 'outfitType', formality: 'formality' } as const;
+ type LabelField = (typeof LABEL_DIMENSIONS)[keyof typeof LABEL_DIMENSIONS];
+ 
+-/** Only published wardrobe ids are supplied to the initial experience generator. */
++/**
++ * Only published wardrobe ids are supplied to the initial experience generator. Outfits come from the
++ * list the Studio dresses a character from: the avatar set's list when the avatar is in a set (the race
++ * looks share one), else the avatar's own list.
++ */
+ export async function loadCharacterWardrobeChoices(prisma: PrismaClient): Promise<CharacterWardrobeChoices> {
+-	const avatars = await listPublishedAvatars();
++	const avatars = (await listPublishedAvatars()).filter(avatar => avatar.supportsCostumes);
++	const sets = await loadAvatarSetByAvatarIdMap(prisma, avatars.map(avatar => avatar.id));
+ 	const forGender = (gender: string) => {
+-		const rows = avatars.filter(avatar => avatar.gender === gender && avatar.supportsCostumes);
+-		return { clothes: [...new Set(rows.flatMap(row => row.clothesIds ?? []))], hair: [...new Set(rows.flatMap(row => row.hairIds ?? []))] };
++		const rows = avatars.filter(avatar => avatar.gender === gender);
++		return {
++			clothes: [...new Set(rows.flatMap(row => sets.get(row.id)?.clothesIds ?? row.clothesIds ?? []))],
++			hair: [...new Set(rows.flatMap(row => row.hairIds ?? []))]
++		};
+ 	};
+ 	const female = forGender('female');
+ 	const male = forGender('male');
+@@ -73,22 +82,26 @@ async function describeCatalogueClothes(
+ 	return byKey;
+ }
+ 
+-/** e.g. `barista: Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)`. */
+-export function clothesChoiceLine(choice: ClothesChoice): string {
++/** e.g. `Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)`; empty when the outfit has no catalogue row. */
++export function clothesChoiceDescription(choice: ClothesChoice): string {
+ 	const labels = [
+ 		choice.role.length > 0 ? `role: ${choice.role.join(', ')}` : '',
+ 		choice.outfitType.length > 0 ? `outfit: ${choice.outfitType.join(', ')}` : '',
+ 		choice.formality.length > 0 ? `formality: ${choice.formality.join(', ')}` : ''
+ 	].filter(Boolean);
+-	const name = choice.name.trim();
+-	return `${choice.id}${name ? `: ${name}` : ''}${labels.length > 0 ? ` (${labels.join('; ')})` : ''}`;
++	return [choice.name.trim(), labels.length > 0 ? `(${labels.join('; ')})` : ''].filter(Boolean).join(' ');
+ }
+ 
+-/** The wardrobe as the generator reads it: one line per outfit, bare hair ids. */
++/**
++ * The wardrobe as the generator reads it: outfits keyed by id (the model copies a key, not a whole line),
++ * bare hair ids.
++ */
+ export function wardrobePromptChoices(choices: CharacterWardrobeChoices) {
++	const clothes = (list: readonly ClothesChoice[]) =>
++		Object.fromEntries(list.map(choice => [choice.id, clothesChoiceDescription(choice)]));
+ 	return {
+-		female: { clothes: choices.female.clothes.map(clothesChoiceLine), hair: choices.female.hair },
+-		male: { clothes: choices.male.clothes.map(clothesChoiceLine), hair: choices.male.hair }
++		female: { clothes: clothes(choices.female.clothes), hair: choices.female.hair },
++		male: { clothes: clothes(choices.male.clothes), hair: choices.male.hair }
+ 	};
+ }
+ 
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.ts b/src/lib/server/platform/generateExperienceSetupDetails.ts
+index 62985c8..e77c102 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.ts
+@@ -141,13 +141,13 @@ Field rules:
+ - characterGender: choose the male or female visual avatar that best fits the brief. This selects an appearance, not a restriction on the character identity.
+ - characterAge: use 35 (adult). The currently available male and female avatar sets are adults.
+ - characterEthnicity: exactly one of "african", "east-asian", "european", "indigenous", "mediterranean", "middle-eastern", "north-african", "pacific-islander", "south-asian", "southeast-asian". Choose the closest facial appearance. Do not return "mixed".
+-- characterClothesId and characterHairId: choose suitable defaults from the supplied published wardrobe for the selected gender. Each clothes line is "id: name (role; outfit; formality)", with labels only where they are known; choose clothes that fit characterRole and the setting. Copy exact ids only (the part before the colon); use an empty string for the standard white T-shirt or default brown hair when no better option is appropriate. Do not invent ids. Appearance choices are editable suggestions for the author to confirm.
+-- suggestedClothesIds: up to three other clothes ids from the same gender's list that would also suit the character, best first. Do not repeat characterClothesId. Return an empty array when nothing else fits.
++- characterClothesId and characterHairId: choose suitable defaults from the supplied published wardrobe for the selected gender. Clothes are an object: each key is an outfit id and its value describes the outfit as "name (role; outfit; formality)", with labels only where they are known (some values are empty); choose clothes that fit characterRole and the setting. Return a key exactly as written, never its description; use an empty string for the standard white T-shirt or default brown hair when no better option is appropriate. Do not invent ids. Appearance choices are editable suggestions for the author to confirm.
++- suggestedClothesIds: up to three other keys from the same gender's clothes object that would also suit the character, best first. Do not repeat characterClothesId. Return an empty array when nothing else fits.
+ - characterPersonality: instructions the model reads while playing this character. Write in second person and start with "You are". Describe stable tone, traits, mannerisms, and speaking style that should follow this character between experiences. Example: "You are cheerful, attentive, and gently humorous. You speak with a soft, melodic tone and often use polite honorifics. You listen closely and make people feel welcome." Do not write a third-person biography, and do not use the character's name or she/he/they as the subject. Do not include the current scenario, participant task, set details, or situation-specific objectives.
+ - characterInstructions: instructions the model reads while playing this character. Write in second person ("you", "your"). Cover reusable identity, background, expertise, persistent relationships, rules, and boundaries that should follow this character between experiences. Example: "You have worked at your family's restaurant for years and know the menu by heart. You are proud of your heritage and the food you serve. Stay professional yet warm. Share a short anecdote about the restaurant or the neighborhood only when asked. Avoid over-familiarity, and treat regular customers like old friends." Do not narrate in the third person. Do not include facts, goals, events, or constraints that apply only to this experience or set.
+ - setName: a concise, reusable name for the visual setting where the conversation happens. Name the place, not the activity.
+ - setDescription: a reusable visual description of that setting for backdrop generation. Describe what the place looks like, the time of day, and the weather. Do not include the participant's task, the plot, or character instructions. At most 800 characters.
+-- suggestedSetRefs: up to three numbers from the supplied publicSets list (each line is "number: set name (collection)") for the listed sets that best fit setName, setDescription, and the brief, best first. Prefer the same kind of place and the same world or period (modern, historical, fantasy, science fiction). Copy numbers exactly; return an empty array when no listed set fits well. Do not invent numbers.
++- suggestedSetRefs: up to three numbers from the supplied publicSets list (each line is "number: set name (collection)") for the listed sets that best fit setName, setDescription, and the brief, best first. Suggest only sets from the brief's own world or period (modern, historical, fantasy, science fiction) that show the same kind of place as the brief; when the list has no such set, return an empty array. Copy numbers exactly. Do not invent numbers.
+ - startingMessage: the exact first words spoken by the character. This is especially important. Write a natural opening in the character's voice that immediately establishes the situation and gives the participant something meaningful to respond to. Prefer one or two short sentences. Do not use stage directions, narration, quotation marks, labels, placeholders, or a generic "How can I help?" unless that truly fits the scenario. Do not speak for the participant or reveal information meant to remain hidden.
+ - systemInstructions: additional situation-specific instructions the model reads while playing this character. This is especially important. Write in second person ("you", "your") and refer to the human as "the participant". In clear present-tense prose, establish the immediate context, the participant's role, your objective, relevant facts, constraints, desired progression, and how you should respond to likely choices. Preserve participant agency and any deliberate mystery. Include concrete scenario facts needed for a consistent conversation, but do not repeat generic character identity or personality. Do not write in the third person, script the participant, mention prompts or models, or include implementation commentary. Write a detailed runnable brief with compact sections, normally 2,800–4,500 characters. Use the author brief as fixed direction and flesh out unspecified interaction design creatively, without fabricating real-world facts or unsupported capabilities.
+ 
+-- 
+2.50.1 (Apple Git-155)
+

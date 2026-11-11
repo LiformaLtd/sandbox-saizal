@@ -1,0 +1,216 @@
+diff --git a/src/lib/server/catalog/ethnicityPlateMaker.ts b/src/lib/server/catalog/ethnicityPlateMaker.ts
+index a7f2f11..7e933c8 100644
+--- a/src/lib/server/catalog/ethnicityPlateMaker.ts
++++ b/src/lib/server/catalog/ethnicityPlateMaker.ts
+@@ -19,7 +19,10 @@
+ //   costume  a whole costume is the opposite of that punch-out. Above the alpha blend, a transparent face pixel
+ //            overwrites a clothes pixel so the clothes texture does not show through. On a whole costume the same
+ //            transparent pixel is painted over the costume plate, so the costume shows through. The ethnic face is
+-//            still painted where the face plate is opaque.
++//            still painted where the face plate is opaque, except over the costume's hair and headwear: the face
++//            plate is a bald head, and it would cover them. Hair and headwear are the garment pixels above (the
++//            costume differs there from the light endpoint's bald white-tee plate and is not skin), so there the
++//            costume stays on top, with a HAIR_EDGE px soft edge.
+ //
+ // Pure functions on 1024x1024 RGBA arrays, no DOM, so it runs in a worker and under vitest. Byte-identical to the Python
+ // maker (racePlateMaker.test.ts compares against plates it wrote).
+@@ -46,6 +49,7 @@ const GARMENT_RIM_DIFF = 12;
+ const GARMENT_MIN_PX = 2000;
+ const GARMENT_MAX_MISFIT = 30;
+ const GARMENT_HOLE_PX = 400;
++const HAIR_EDGE = 1; // blur of the hair and headwear shape a whole costume keeps on top of the face
+ const SKIN_IDENTITY: readonly [number, number] = [20, 35];
+ const SKIN_SEED_IDENTITY = 28;
+ const SKIN_SEED_SAT: readonly [number, number] = [0.15, 0.97];
+@@ -594,19 +598,29 @@ function garmentMask(A: Rgba, B: Rgba, Abase: Rgba): Uint8Array {
+ 	return out;
+ }
+ 
++/**
++ * A whole costume's hair and headwear: the garment pixels, with a soft edge. They stay on top of the bald face plate.
++ */
++function costumeHair(garment: Uint8Array): Float64Array {
++	const shape = new Float64Array(N);
++	for (let i = 0; i < N; i++) shape[i] = garment[i];
++	return gaussianBlur2d(shape, HAIR_EDGE);
++}
++
+ // ---------------------------------------------------------------- the chin cut
+ 
+ /**
+  * Face above the chin cut, body below, matched along the cut.
+- * `wholeCostume`: transparent face pixels above the alpha blend show the costume plate
+- * through. Clothes leave those pixels transparent so the clothes texture does not show.
++ * `hair` (a whole costume, from `costumeHair`): transparent face pixels above the alpha blend show the costume plate
++ * through, and so do the costume's hair and headwear. Clothes (`hair` null) leave those pixels transparent so the
++ * clothes texture does not show.
+  */
+ function faceJoin(
+ 	face: PreparedFace,
+ 	L: Uint8Array,
+ 	A: Rgba,
+ 	garment: Uint8Array,
+-	wholeCostume = false
++	hair: Float64Array | null
+ ): Uint8ClampedArray<ArrayBuffer> {
+ 	const d = face.below;
+ 	const aL = new Float64Array(N);
+@@ -671,17 +685,22 @@ function faceJoin(
+ 			let al = clamp(aFs * (1 - wa) + aL[i] * wa, 0, 1);
+ 			if (cloth[i]) al = aL[i];
+ 			out[i * 4 + 3] = rint(al * 255);
+-			// Whole costume: the face is painted over the costume plate. A clear face pixel
+-			// keeps the costume (colour and alpha) instead of punching it out. Clothes keep
++			// Whole costume: the face is painted over the costume plate. A clear face pixel, or
++			// one under the costume's hair or headwear, keeps the costume (colour and alpha). Clothes keep
+ 			// the punch-out above the blend. The chin cut and the blend down to the body stay.
+-			if (wholeCostume && !cloth[i] && wa < 1) {
+-				const cover = aFs * (1 - wa);
++			if (hair && !cloth[i] && wa < 1) {
++				// The outline fades to the costume's over the alpha blend rows; the colour does not. Where the face
++				// plate is solid the colour stays the join's (the face down to the chin cut), as on clothes: fading
++				// it too drew a band of the costume's own chin across a chin that ends below the blend.
++				const faceCover = aFs * (1 - clamp(hair[i], 0, 1));
++				const cover = faceCover * (1 - wa);
+ 				const costumeA = aL[i];
+ 				const outA = cover + costumeA * (1 - cover);
++				const colourA = faceCover + costumeA * (1 - faceCover);
+ 				for (let c = 0; c < 3; c++) {
+-					const faceC = face.rgb[i * 3 + c];
++					const joinC = out[i * 4 + c];
+ 					const costumeC = L[i * 4 + c] + smooth[c][x] * fw;
+-					const mixed = outA > 0 ? (faceC * cover + costumeC * costumeA * (1 - cover)) / outA : costumeC;
++					const mixed = colourA > 0 ? (joinC * faceCover + costumeC * costumeA * (1 - faceCover)) / colourA : costumeC;
+ 					out[i * 4 + c] = rint(clamp(mixed, 0, 255));
+ 				}
+ 				out[i * 4 + 3] = rint(clamp(outA, 0, 1) * 255);
+@@ -699,7 +718,14 @@ function faceJoin(
+ 
+ // ---------------------------------------------------------------- checks
+ 
+-function checks(out: Uint8ClampedArray, A: Rgba, face: PreparedFace, L: Uint8Array, garment: Uint8Array): RacePlateReport {
++function checks(
++	out: Uint8ClampedArray,
++	A: Rgba,
++	face: PreparedFace,
++	L: Uint8Array,
++	garment: Uint8Array,
++	hair: Float64Array | null
++): RacePlateReport {
+ 	let faceMiss = 0;
+ 	let outline = 0;
+ 	let wider = 0;
+@@ -707,7 +733,8 @@ function checks(out: Uint8ClampedArray, A: Rgba, face: PreparedFace, L: Uint8Arr
+ 	for (let y = 0; y < H; y++) {
+ 		for (let x = 0; x < W; x++) {
+ 			const i = y * W + x;
+-			if (y < CHECK_FACE_ROW && face.alpha[i] / 255 > 0.99 && !garment[i]) {
++			// a whole costume's hair and headwear are meant to cover the face plate
++			if (y < CHECK_FACE_ROW && face.alpha[i] / 255 > 0.99 && !garment[i] && !(hair && hair[i] > 0)) {
+ 				for (let c = 0; c < 3; c++) {
+ 					if (out[i * 4 + c] !== face.rgb[i * 3 + c]) {
+ 						faceMiss++;
+@@ -756,8 +783,9 @@ export function makeRacePlate(
+ 	}
+ 	const garment = garmentMask(anna, precious, lightBase);
+ 	const L = mixAnnaOutline(anna, precious, mix.values);
+-	const rgba = faceJoin(face, L, anna, garment, options?.wholeCostume === true);
+-	return { rgba, report: checks(rgba, anna, face, L, garment) };
++	const hair = options?.wholeCostume === true ? costumeHair(garment) : null;
++	const rgba = faceJoin(face, L, anna, garment, hair);
++	return { rgba, report: checks(rgba, anna, face, L, garment, hair) };
+ }
+ 
+ /** Public names for avatar-set server bake (no new `race*` call sites). */
+diff --git a/src/lib/server/catalog/ethnicityPlateMaker.test.ts b/src/lib/server/catalog/ethnicityPlateMaker.test.ts
+new file mode 100644
+index 0000000..74ff893
+--- /dev/null
++++ b/src/lib/server/catalog/ethnicityPlateMaker.test.ts
+@@ -0,0 +1,86 @@
++import { describe, expect, it } from 'vitest';
++import { makeRacePlate, PLATE_SIZE, type PreparedFace } from './ethnicityPlateMaker';
++
++const SIZE = PLATE_SIZE;
++const N = SIZE * SIZE;
++
++function solid(r: number, g: number, b: number, a = 255): Uint8Array {
++	const rgba = new Uint8Array(N * 4);
++	for (let i = 0; i < N; i++) {
++		rgba[i * 4] = r;
++		rgba[i * 4 + 1] = g;
++		rgba[i * 4 + 2] = b;
++		rgba[i * 4 + 3] = a;
++	}
++	return rgba;
++}
++
++/** A clear face above the chin, so the join is in the punch-out region, plus one opaque face pixel. */
++function clearFace(): PreparedFace {
++	const rgb = new Uint8Array(N * 3);
++	const alpha = new Uint8Array(N);
++	rgb[0] = 0;
++	rgb[1] = 255;
++	rgb[2] = 0;
++	const covered = 20 * SIZE + 20;
++	rgb[covered * 3] = 0;
++	rgb[covered * 3 + 1] = 0;
++	rgb[covered * 3 + 2] = 255;
++	alpha[covered] = 255;
++	return { rgb, alpha, below: new Float64Array(N).fill(-10) };
++}
++
++describe('whole costume face join', () => {
++	const costume = solid(200, 40, 40);
++	const face = clearFace();
++	const mix = { values: [0, 0, 0] as [number, number, number] };
++
++	it('punches a clear face pixel out of a clothes plate', () => {
++		const { rgba } = makeRacePlate(costume, costume, costume, face, mix, undefined);
++		expect(rgba[3]).toBe(0);
++	});
++
++	it('lets the costume plate show through a clear face pixel', () => {
++		const { rgba } = makeRacePlate(costume, costume, costume, face, mix, { wholeCostume: true });
++		expect([rgba[0], rgba[1], rgba[2], rgba[3]]).toEqual([200, 40, 40, 255]);
++	});
++
++	it('still paints an opaque face pixel onto a whole costume', () => {
++		const { rgba } = makeRacePlate(costume, costume, costume, face, mix, { wholeCostume: true });
++		const i = (20 * SIZE + 20) * 4;
++		expect([rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]).toEqual([0, 0, 255, 255]);
++	});
++
++	// The face plate is a bald head: it must not cover the hair or headwear the costume was drawn with.
++	describe('hair and headwear', () => {
++		const HAIR = [30, 20, 10] as const;
++		const bald = solid(220, 180, 150);
++		/** The bald plate with a block of hair, rows and columns 30-89. */
++		const withHair = solid(220, 180, 150);
++		for (let y = 30; y < 90; y++) {
++			for (let x = 30; x < 90; x++) withHair.set(HAIR, (y * SIZE + x) * 4);
++		}
++		/** An opaque blue head over rows and columns 20-99: the hair block and the skin round it. */
++		const head: PreparedFace = { rgb: new Uint8Array(N * 3), alpha: new Uint8Array(N), below: new Float64Array(N).fill(-10) };
++		for (let y = 20; y < 100; y++) {
++			for (let x = 20; x < 100; x++) {
++				head.rgb[(y * SIZE + x) * 3 + 2] = 255;
++				head.alpha[y * SIZE + x] = 255;
++			}
++		}
++		const made = makeRacePlate(withHair, withHair, bald, head, mix, { wholeCostume: true });
++		const at = (y: number, x: number) => Array.from(made.rgba.slice((y * SIZE + x) * 4, (y * SIZE + x) * 4 + 4));
++
++		it('keeps the costume hair on top of the face plate', () => {
++			expect(at(60, 60)).toEqual([...HAIR, 255]);
++		});
++
++		it('paints the face where the costume is bald', () => {
++			expect(at(25, 25)).toEqual([0, 0, 255, 255]);
++		});
++
++		it('does not count the hair as a wrong face pixel', () => {
++			expect(made.report.faceExactAbove340).toBe(0);
++		});
++	});
++});

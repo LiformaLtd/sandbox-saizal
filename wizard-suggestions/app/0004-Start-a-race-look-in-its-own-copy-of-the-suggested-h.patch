@@ -1,0 +1,92 @@
+From e2aa157931daa966d46b3494ba84cde44d938dea Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:49:43 +0000
+Subject: [PATCH 4/4] Start a race look in its own copy of the suggested hair
+
+The setup generator now names a hair style and colour once, not each race
+copy. A character of another ethnicity wears its own copy of that style and
+colour (long-black.1 -> long-black.1-black--south-asian). Before, a pick
+that was not in the ethnicity's own list fell back to the first brown hair
+without a word. A pick that still cannot be worn now logs a console warning,
+like outfits.
+
+Seen in the local Studio with a hand-made setup draft: a South Asian woman
+asked for long-black.1 started in a chestnut bob before, and in her own long
+black hair after.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../src/lib/characterCreationWizard.test.ts   | 19 +++++++++++++++++++
+ .../src/lib/characterCreationWizard.ts        | 17 +++++++++++++++--
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/packages/experience-studio/src/lib/characterCreationWizard.test.ts b/packages/experience-studio/src/lib/characterCreationWizard.test.ts
+index 4cd80ee..b5150b8 100644
+--- a/packages/experience-studio/src/lib/characterCreationWizard.test.ts
++++ b/packages/experience-studio/src/lib/characterCreationWizard.test.ts
+@@ -18,6 +18,25 @@ describe('character creation defaults', () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+ 		expect(characterCreationAppearance(avatars, avatars[0], 'nonexistent', 'nonexistent')).toEqual({ clothes: 'white_t_shirt_and_jeans', hair: 'bob-brown.1' });
+ 		expect(warn).toHaveBeenCalledWith('[character create] avatar e05a0001 has no "nonexistent" outfit, so it starts in the white T-shirt');
++		expect(warn).toHaveBeenCalledWith('[character create] avatar e05a0001 has no "nonexistent" hair, so it starts with its default hair');
++		warn.mockRestore();
++	});
++	it('starts a race look in its own copy of the suggested hair style and colour', () => {
++		const southAsian = { id: '5a5a0002', gender: 'female', ethnicity: 'south-asian', age: 35, clothesIds: ['white_t_shirt_and_jeans'], hairIds: [
++			'bob-brown.1', 'long-black.1', 'long-ginger.1',
++			'bob-brown.1--south-asian', 'bob-brown.1-chestnut--south-asian', 'long-black.1-black--south-asian', 'long-black.1-black--african'
++		] } as unknown as AvatarSummary;
++		const hairFor = (suggested: string) => characterCreationAppearance([southAsian], southAsian, '', suggested).hair;
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(hairFor('long-black.1')).toBe('long-black.1-black--south-asian');
++		expect(hairFor('bob-brown.1')).toBe('bob-brown.1--south-asian');
++		expect(hairFor('long-black.1-black--african')).toBe('long-black.1-black--south-asian');
++		// A style with no South Asian copy keeps its plain layer.
++		expect(hairFor('long-ginger.1')).toBe('long-ginger.1');
++		expect(warn).not.toHaveBeenCalled();
++		// A colour the South Asian copy was not made in: the first brown, and it says so.
++		expect(hairFor('long-black.1-copper')).toBe('bob-brown.1--south-asian');
++		expect(warn).toHaveBeenCalledWith('[character create] avatar 5a5a0002 has no "long-black.1-copper" hair, so it starts with its default hair');
+ 		warn.mockRestore();
+ 	});
+ 	it('puts the suggested outfits the avatar has first, captioned with the role', () => {
+diff --git a/packages/experience-studio/src/lib/characterCreationWizard.ts b/packages/experience-studio/src/lib/characterCreationWizard.ts
+index 58398f5..4a455ea 100644
+--- a/packages/experience-studio/src/lib/characterCreationWizard.ts
++++ b/packages/experience-studio/src/lib/characterCreationWizard.ts
+@@ -1,5 +1,5 @@
+ import { bareAvatarId, startingRaceLookId } from './avatarLooks.js';
+-import { hairColourOf, hairIdsForCharacter } from './hairStyles.js';
++import { hairColourOf, hairIdsForCharacter, parseHairColourId } from './hairStyles.js';
+ import { wardrobePlateAvatar } from './customisableCharacterCreate.js';
+ import type { AvatarSummary } from './types.js';
+ 
+@@ -21,11 +21,24 @@ export function characterCreationAppearance(avatars: readonly AvatarSummary[], a
+ 	if (suggestedClothes && !clothes.includes(suggestedClothes)) {
+ 		console.warn(`[character create] avatar ${avatar.id} has no "${suggestedClothes}" outfit, so it starts in the white T-shirt`);
+ 	}
++	const suggested = suggestedHair ? hairAsWorn(hair, suggestedHair) : undefined;
++	if (suggestedHair && !suggested) {
++		console.warn(`[character create] avatar ${avatar.id} has no "${suggestedHair}" hair, so it starts with its default hair`);
++	}
+ 	return {
+ 		clothes: clothes.includes(suggestedClothes) ? suggestedClothes : clothes.find(id => /^white[_ -]*t[_ -]*shirt(?:[_ -]|$)/i.test(id)) ?? '',
+-		hair: hair.includes(suggestedHair) ? suggestedHair : brown ?? hair[0] ?? ''
++		hair: suggested ?? brown ?? hair[0] ?? ''
+ 	};
+ }
++/** The offered hair id for a suggested one: itself, else the same style and colour as this ethnicity wears it (`<hair>--<race>`). */
++function hairAsWorn(offered: readonly string[], suggestedHair: string): string | undefined {
++	if (offered.includes(suggestedHair)) return suggestedHair;
++	const wanted = parseHairColourId(suggestedHair);
++	return offered.find(id => {
++		const hair = parseHairColourId(id);
++		return hair.style === wanted.style && hair.colour === wanted.colour;
++	});
++}
+ /** Puts the suggested outfits this avatar has first, captioned "Suggested for <role>"; the rest keep their order. */
+ export function suggestedClothesFirst<T extends { readonly id: string; readonly kind?: string }>(
+ 	options: readonly T[], suggestedIds: readonly string[], role: string
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,2063 @@
+diff --git a/image-lerp/README.md b/image-lerp/README.md
+index e14b751..05550f5 100644
+--- a/image-lerp/README.md
++++ b/image-lerp/README.md
+@@ -1,5 +1,13 @@
+ # Image lerp sandbox
+ 
++> **Not the production path any more.** Building an intermediate skin tone by mixing two
++> finished plates also mixes the garment, the shading, the specular and the two plates'
++> misregistration, and it changes the face. Production now interpolates the skin COLOUR
++> only and corrects the current plate's skin toward it, leaving everything else as
++> generated — see `liforma/tools/image-to-image/scripts/skin_target.py`. This sandbox
++> stays as the comparison arm and for eyeballing a raw mix; the same formula is ported
++> verbatim into `compare_skin_interpolation.py`.
++
+ Client-side SvelteKit tool that loads two images and builds a third by linearly interpolating their pixels.
+ 
+ ## Mix modes
+diff --git a/image-lerp/src/lib/SetStrip.svelte b/image-lerp/src/lib/SetStrip.svelte
+new file mode 100644
+index 0000000..aaf9a88
+--- /dev/null
++++ b/image-lerp/src/lib/SetStrip.svelte
+@@ -0,0 +1,267 @@
++<script lang="ts">
++	import type { LoadedImage } from '$lib/loadImage';
++
++	export type StripSet = {
++		id: string;
++		name: string;
++		a: LoadedImage | null;
++		b: LoadedImage | null;
++	};
++
++	let {
++		sets,
++		selectedId,
++		onSelect,
++		onRemove,
++		onRename,
++		onNew
++	}: {
++		sets: StripSet[];
++		selectedId: string | null;
++		onSelect: (id: string) => void;
++		onRemove: (id: string) => void;
++		onRename: (id: string, name: string) => void;
++		onNew: () => void;
++	} = $props();
++
++	let renamingId = $state<string | null>(null);
++	let draft = $state('');
++
++	function startRename(set: StripSet) {
++		renamingId = set.id;
++		draft = set.name;
++	}
++
++	function commitRename() {
++		if (renamingId) {
++			const name = draft.trim();
++			if (name) onRename(renamingId, name);
++		}
++		renamingId = null;
++	}
++</script>
++
++<section class="strip" aria-label="Image sets">
++	<div class="rail">
++		{#each sets as set (set.id)}
++			<div class="card" class:selected={set.id === selectedId}>
++				<!-- The rename field is a sibling of the picker, never inside it: a form
++				     control nested in a <button> is invalid and will not take focus. -->
++				<button
++					type="button"
++					class="pick"
++					aria-pressed={set.id === selectedId}
++					aria-label="Select {set.name}"
++					onclick={() => onSelect(set.id)}
++				>
++					<span class="thumbs">
++						{#if set.a}
++							<img src={set.a.objectUrl} alt="" />
++						{:else}
++							<span class="blank">A</span>
++						{/if}
++						{#if set.b}
++							<img src={set.b.objectUrl} alt="" />
++						{:else}
++							<span class="blank">B</span>
++						{/if}
++					</span>
++				</button>
++
++				{#if renamingId === set.id}
++					<input
++						class="rename"
++						bind:value={draft}
++						onblur={commitRename}
++						onkeydown={(event) => {
++							if (event.key === 'Enter') commitRename();
++							if (event.key === 'Escape') renamingId = null;
++						}}
++						{@attach (node) => {
++							node.focus();
++							node.select();
++						}}
++					/>
++				{:else}
++					<button
++						type="button"
++						class="name"
++						title={set.name}
++						onclick={() => onSelect(set.id)}
++						ondblclick={() => startRename(set)}
++					>
++						{set.name}
++					</button>
++				{/if}
++
++				<span class="state">{(set.a ? 1 : 0) + (set.b ? 1 : 0)}/2</span>
++
++				<span class="tools">
++					<button type="button" title="Rename" onclick={() => startRename(set)}>✎</button>
++					<button type="button" title="Remove set" onclick={() => onRemove(set.id)}>×</button>
++				</span>
++			</div>
++		{/each}
++
++		<button type="button" class="card add" onclick={onNew}>
++			<span class="plus">+</span>
++			<span class="name">New set</span>
++		</button>
++	</div>
++</section>
++
++<style>
++	.strip {
++		background: var(--panel);
++		border: 1px solid var(--border);
++		border-radius: 1rem;
++		padding: 0.75rem;
++		/* A grid item will not shrink below its content by default, so without this
++		   a long rail widens the whole page instead of scrolling inside itself. */
++		min-width: 0;
++	}
++
++	.rail {
++		display: flex;
++		gap: 0.6rem;
++		overflow-x: auto;
++		padding-bottom: 0.25rem;
++	}
++
++	.card {
++		position: relative;
++		flex: 0 0 auto;
++		width: 8.5rem;
++		border: 1px solid var(--border);
++		border-radius: 0.75rem;
++		background: rgba(0, 0, 0, 0.2);
++		padding: 0.4rem;
++	}
++
++	.card.selected {
++		border-color: var(--accent);
++		background: var(--accent-soft);
++	}
++
++	.card {
++		display: grid;
++		gap: 0.25rem;
++	}
++
++	.pick {
++		display: grid;
++		width: 100%;
++		border: 0;
++		background: none;
++		padding: 0;
++		color: inherit;
++		text-align: left;
++		cursor: pointer;
++	}
++
++	.thumbs {
++		display: grid;
++		grid-template-columns: 1fr 1fr;
++		gap: 0.2rem;
++	}
++
++	.thumbs img,
++	.blank {
++		width: 100%;
++		aspect-ratio: 1;
++		object-fit: contain;
++		border-radius: 0.4rem;
++		background: rgba(0, 0, 0, 0.35);
++	}
++
++	.blank {
++		display: grid;
++		place-items: center;
++		color: var(--muted);
++		font-size: 0.75rem;
++	}
++
++	.name {
++		font-size: 0.78rem;
++		overflow: hidden;
++		text-overflow: ellipsis;
++		white-space: nowrap;
++		display: block;
++		width: 100%;
++		border: 0;
++		background: none;
++		padding: 0;
++		color: inherit;
++		text-align: left;
++		cursor: pointer;
++	}
++
++	.state {
++		font-size: 0.7rem;
++		color: var(--muted);
++	}
++
++	.rename {
++		width: 100%;
++		font: inherit;
++		font-size: 0.78rem;
++		background: var(--bg);
++		color: var(--text);
++		border: 1px solid var(--accent);
++		border-radius: 0.35rem;
++		padding: 0.1rem 0.25rem;
++	}
++
++	.tools {
++		position: absolute;
++		top: 0.3rem;
++		right: 0.3rem;
++		display: flex;
++		gap: 0.15rem;
++		opacity: 0;
++		transition: opacity 0.12s;
++	}
++
++	.card:hover .tools,
++	.card.selected .tools {
++		opacity: 1;
++	}
++
++	.tools button {
++		border: 1px solid var(--border);
++		background: var(--panel);
++		color: var(--muted);
++		border-radius: 0.35rem;
++		width: 1.35rem;
++		height: 1.35rem;
++		padding: 0;
++		font-size: 0.8rem;
++		line-height: 1;
++		cursor: pointer;
++	}
++
++	.tools button:hover {
++		color: var(--text);
++		border-color: var(--accent);
++	}
++
++	.add {
++		display: grid;
++		place-items: center;
++		gap: 0.2rem;
++		align-content: center;
++		min-height: 7.5rem;
++		color: var(--muted);
++		cursor: pointer;
++	}
++
++	.add:hover {
++		border-color: var(--accent);
++		color: var(--text);
++	}
++
++	.plus {
++		font-size: 1.5rem;
++		line-height: 1;
++	}
++</style>
+diff --git a/image-lerp/src/lib/imageCache.ts b/image-lerp/src/lib/imageCache.ts
+index 984937f..4d4df4e 100644
+--- a/image-lerp/src/lib/imageCache.ts
++++ b/image-lerp/src/lib/imageCache.ts
+@@ -1,5 +1,23 @@
++import type { MixMode } from './lerpImages';
++
+ export type ImageSlot = 'a' | 'b';
+ 
++export type SetWeights = {
++	mode: MixMode;
++	a: number;
++	b: number;
++	c: number;
++};
++
++/** A set is one A/B pair plus the mix it was last left at. */
++export type StoredSet = {
++	id: string;
++	name: string;
++	a: File | null;
++	b: File | null;
++	weights: SetWeights;
++};
++
+ type CachedImage = {
+ 	name: string;
+ 	type: string;
+@@ -7,18 +25,36 @@ type CachedImage = {
+ 	blob: Blob;
+ };
+ 
++type SetRecord = {
++	id: string;
++	name: string;
++	weights: SetWeights;
++	a: CachedImage | null;
++	b: CachedImage | null;
++};
++
++type MetaRecord = {
++	order: string[];
++	selectedId: string | null;
++};
++
+ const DB_NAME = 'image-lerp';
+-const DB_VERSION = 1;
+-const STORE = 'images';
++const DB_VERSION = 2;
++const STORE = 'images'; // v1: single a/b pair. Kept so v1 data can be migrated.
++const SETS = 'sets';
++const META = 'meta';
++const META_KEY = 'state';
++
++export const DEFAULT_WEIGHTS: SetWeights = { mode: 'unified', a: 0.5, b: 0.5, c: 0.5 };
+ 
+ function openDb(): Promise<IDBDatabase> {
+ 	return new Promise((resolve, reject) => {
+ 		const request = indexedDB.open(DB_NAME, DB_VERSION);
+ 		request.onupgradeneeded = () => {
+ 			const db = request.result;
+-			if (!db.objectStoreNames.contains(STORE)) {
+-				db.createObjectStore(STORE);
+-			}
++			if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
++			if (!db.objectStoreNames.contains(SETS)) db.createObjectStore(SETS);
++			if (!db.objectStoreNames.contains(META)) db.createObjectStore(META);
+ 		};
+ 		request.onsuccess = () => resolve(request.result);
+ 		request.onerror = () => reject(request.error ?? new Error('Could not open IndexedDB.'));
+@@ -49,32 +85,118 @@ function asFile(value: unknown): File | null {
+ 	return null;
+ }
+ 
+-export async function putCachedImage(slot: ImageSlot, file: File): Promise<void> {
++function toCached(file: File | null): CachedImage | null {
++	if (!file) return null;
++	return {
++		name: file.name,
++		type: file.type || 'application/octet-stream',
++		lastModified: file.lastModified,
++		blob: file
++	};
++}
++
++function normaliseWeights(value: unknown): SetWeights {
++	const w = (value ?? {}) as Partial<SetWeights>;
++	const num = (n: unknown, fallback: number) => (typeof n === 'number' && Number.isFinite(n) ? n : fallback);
++	return {
++		mode: w.mode === 'per-channel' ? 'per-channel' : 'unified',
++		a: num(w.a, DEFAULT_WEIGHTS.a),
++		b: num(w.b, DEFAULT_WEIGHTS.b),
++		c: num(w.c, DEFAULT_WEIGHTS.c)
++	};
++}
++
++export async function saveSet(set: StoredSet): Promise<void> {
+ 	const db = await openDb();
+ 	try {
+-		const record: CachedImage = {
+-			name: file.name,
+-			type: file.type || 'application/octet-stream',
+-			lastModified: file.lastModified,
+-			blob: file
++		const record: SetRecord = {
++			id: set.id,
++			name: set.name,
++			weights: set.weights,
++			a: toCached(set.a),
++			b: toCached(set.b)
+ 		};
+-		await requestToPromise(db.transaction(STORE, 'readwrite').objectStore(STORE).put(record, slot));
++		await requestToPromise(db.transaction(SETS, 'readwrite').objectStore(SETS).put(record, set.id));
++	} finally {
++		db.close();
++	}
++}
++
++export async function deleteSet(id: string): Promise<void> {
++	const db = await openDb();
++	try {
++		await requestToPromise(db.transaction(SETS, 'readwrite').objectStore(SETS).delete(id));
++	} finally {
++		db.close();
++	}
++}
++
++export async function saveMeta(meta: MetaRecord): Promise<void> {
++	const db = await openDb();
++	try {
++		await requestToPromise(db.transaction(META, 'readwrite').objectStore(META).put(meta, META_KEY));
+ 	} finally {
+ 		db.close();
+ 	}
+ }
+ 
+-export async function getCachedImage(slot: ImageSlot): Promise<File | null> {
++/**
++ * Every stored set, in the order the user last left them. A v1 database holds a
++ * single unnamed a/b pair; it is migrated into one set rather than dropped.
++ */
++export async function loadSets(): Promise<{ sets: StoredSet[]; selectedId: string | null }> {
+ 	const db = await openDb();
+ 	try {
+-		const value = await requestToPromise(db.transaction(STORE, 'readonly').objectStore(STORE).get(slot));
+-		return asFile(value);
++		const records = (await requestToPromise(
++			db.transaction(SETS, 'readonly').objectStore(SETS).getAll()
++		)) as SetRecord[];
++
++		const meta = (await requestToPromise(
++			db.transaction(META, 'readonly').objectStore(META).get(META_KEY)
++		)) as MetaRecord | undefined;
++
++		let sets: StoredSet[] = records.map((r) => ({
++			id: r.id,
++			name: r.name || 'Untitled set',
++			a: asFile(r.a),
++			b: asFile(r.b),
++			weights: normaliseWeights(r.weights)
++		}));
++
++		if (sets.length === 0) {
++			const legacy = await migrateLegacyPair(db);
++			if (legacy) sets = [legacy];
++		}
++
++		const order = meta?.order ?? [];
++		if (order.length) {
++			const rank = new Map(order.map((id, i) => [id, i]));
++			sets.sort((x, y) => (rank.get(x.id) ?? 1e9) - (rank.get(y.id) ?? 1e9));
++		}
++
++		const selectedId =
++			meta?.selectedId && sets.some((s) => s.id === meta.selectedId)
++				? meta.selectedId
++				: (sets[0]?.id ?? null);
++
++		return { sets, selectedId };
+ 	} finally {
+ 		db.close();
+ 	}
+ }
+ 
+-export async function getCachedImages(): Promise<{ a: File | null; b: File | null }> {
+-	const [a, b] = await Promise.all([getCachedImage('a'), getCachedImage('b')]);
+-	return { a, b };
++async function migrateLegacyPair(db: IDBDatabase): Promise<StoredSet | null> {
++	if (!db.objectStoreNames.contains(STORE)) return null;
++	const store = db.transaction(STORE, 'readonly').objectStore(STORE);
++	const [a, b] = await Promise.all([
++		requestToPromise(store.get('a')).then(asFile).catch(() => null),
++		requestToPromise(store.get('b')).then(asFile).catch(() => null)
++	]);
++	if (!a && !b) return null;
++	return { id: newSetId(), name: 'Restored pair', a, b, weights: { ...DEFAULT_WEIGHTS } };
++}
++
++export function newSetId(): string {
++	if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID();
++	return `set-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+ }
+diff --git a/image-lerp/src/lib/index.ts b/image-lerp/src/lib/index.ts
+index e73945b..db8eb1a 100644
+--- a/image-lerp/src/lib/index.ts
++++ b/image-lerp/src/lib/index.ts
+@@ -1,6 +1,6 @@
+ export type { MixMode, MixWeights } from './lerpImages';
+ export { clampWeight, lerpImageData, lerpRgba, mixChannel, rasterize, weightsForMode, WEIGHT_MAX, WEIGHT_MIN } from './lerpImages';
+-export type { ImageSlot } from './imageCache';
+-export { getCachedImage, getCachedImages, putCachedImage } from './imageCache';
++export type { ImageSlot, SetWeights, StoredSet } from './imageCache';
++export { DEFAULT_WEIGHTS, deleteSet, loadSets, newSetId, saveMeta, saveSet } from './imageCache';
+ export type { LoadedImage } from './loadImage';
+ export { disposeImage, loadImage } from './loadImage';
+diff --git a/image-lerp/src/lib/lerpImages.ts b/image-lerp/src/lib/lerpImages.ts
+index 1e7ecf2..f2dd474 100644
+--- a/image-lerp/src/lib/lerpImages.ts
++++ b/image-lerp/src/lib/lerpImages.ts
+@@ -55,7 +55,65 @@ export function lerpRgba(
+ 	}
+ }
+ 
+-export function lerpImageData(srcA: ImageData, srcB: ImageData, dest: ImageData, weights: MixWeights): void {
++/**
++ * After the mix, follow image A's outline: the see-through channel is A's, not the average. Pixels that only B
++ * paints disappear (they came out half see-through); pixels that only A paints stay solid and take the colour of
++ * the nearest pixel both images paint, scaled the way the mix scaled that pixel. The search for that pixel runs
++ * outward in rings up to `reach` px; beyond that the pixel keeps the plain mix colour.
++ */
++export function followOutlineA(
++	srcA: Uint8ClampedArray,
++	srcB: Uint8ClampedArray,
++	dest: Uint8ClampedArray,
++	width: number,
++	height: number,
++	reach = 24
++): void {
++	const n = width * height;
++	const both = new Uint8Array(n);
++	for (let p = 0; p < n; p++) both[p] = srcA[p * 4 + 3] >= 250 && srcB[p * 4 + 3] >= 250 ? 1 : 0;
++	for (let p = 0; p < n; p++) {
++		const i = p * 4;
++		const aA = srcA[i + 3];
++		if (aA > 0 && srcB[i + 3] < 250) {
++			const x = p % width;
++			const y = (p - x) / width;
++			let q = -1;
++			search: for (let r = 1; r <= reach; r++) {
++				for (let dy = -r; dy <= r; dy++) {
++					const yy = y + dy;
++					if (yy < 0 || yy >= height) continue;
++					const step = Math.abs(dy) === r ? 1 : 2 * r;
++					for (let dx = -r; dx <= r; dx += step) {
++						const xx = x + dx;
++						if (xx < 0 || xx >= width) continue;
++						const pp = yy * width + xx;
++						if (both[pp]) {
++							q = pp;
++							break search;
++						}
++					}
++				}
++			}
++			if (q >= 0) {
++				const j = q * 4;
++				for (let c = 0; c < 3; c++) {
++					const ratio = Math.min(2, Math.max(0.2, (dest[j + c] + 1) / (srcA[j + c] + 1)));
++					dest[i + c] = srcA[i + c] * ratio;
++				}
++			}
++		}
++		dest[i + 3] = aA;
++	}
++}
++
++export function lerpImageData(
++	srcA: ImageData,
++	srcB: ImageData,
++	dest: ImageData,
++	weights: MixWeights,
++	outlineA = false
++): void {
+ 	if (srcA.width !== srcB.width || srcA.height !== srcB.height) {
+ 		throw new Error('Images must be rasterized to the same dimensions.');
+ 	}
+@@ -63,6 +121,9 @@ export function lerpImageData(srcA: ImageData, srcB: ImageData, dest: ImageData,
+ 		throw new Error('Destination ImageData size does not match sources.');
+ 	}
+ 	lerpRgba(srcA.data, srcB.data, dest.data, weights);
++	// The outline rule is for the mixes in between. At t = 1 the result is image B exactly, outline and all.
++	const pureB = weights.r >= 1 && weights.g >= 1 && weights.b >= 1;
++	if (outlineA && !pureB) followOutlineA(srcA.data, srcB.data, dest.data, srcA.width, srcA.height);
+ }
+ 
+ export function rasterize(source: CanvasImageSource, width: number, height: number): ImageData {
+diff --git a/image-lerp/src/lib/loadImage.ts b/image-lerp/src/lib/loadImage.ts
+index f859c06..967543a 100644
+--- a/image-lerp/src/lib/loadImage.ts
++++ b/image-lerp/src/lib/loadImage.ts
+@@ -1,10 +1,15 @@
++/**
++ * A plate holds only what the UI needs to show it and decode it again later: the
++ * file, a URL for the thumbnail, and its size. Deliberately no ImageBitmap — with
++ * dozens of sets loaded that would pin hundreds of megabytes of decoded pixels.
++ * Bitmaps are made on demand by `decode` and closed as soon as they are read.
++ */
+ export type LoadedImage = {
+ 	name: string;
+ 	file: File;
+ 	objectUrl: string;
+ 	width: number;
+ 	height: number;
+-	bitmap: ImageBitmap;
+ };
+ 
+ export async function loadImage(file: File): Promise<LoadedImage> {
+@@ -13,24 +18,24 @@ export async function loadImage(file: File): Promise<LoadedImage> {
+ 	}
+ 
+ 	const objectUrl = URL.createObjectURL(file);
++	let bitmap: ImageBitmap | undefined;
+ 	try {
+-		const bitmap = await createImageBitmap(file);
+-		return {
+-			name: file.name,
+-			file,
+-			objectUrl,
+-			width: bitmap.width,
+-			height: bitmap.height,
+-			bitmap
+-		};
++		bitmap = await createImageBitmap(file);
++		return { name: file.name, file, objectUrl, width: bitmap.width, height: bitmap.height };
+ 	} catch (error) {
+ 		URL.revokeObjectURL(objectUrl);
+ 		throw error instanceof Error ? error : new Error('Could not decode that image.');
++	} finally {
++		bitmap?.close();
+ 	}
+ }
+ 
++/** Decode a plate for pixel work. The caller closes what it gets back. */
++export function decode(image: LoadedImage): Promise<ImageBitmap> {
++	return createImageBitmap(image.file);
++}
++
+ export function disposeImage(image: LoadedImage | null): void {
+ 	if (!image) return;
+ 	URL.revokeObjectURL(image.objectUrl);
+-	image.bitmap.close();
+ }
+diff --git a/image-lerp/src/lib/server/finished.ts b/image-lerp/src/lib/server/finished.ts
+new file mode 100644
+index 0000000..d0771e3
+--- /dev/null
++++ b/image-lerp/src/lib/server/finished.ts
+@@ -0,0 +1,52 @@
++// The finished race plates (face pasted by the sandbox maker) live in local folders, never in static/: they are
++// hundreds of megabytes and change whenever the maker is rerun. One folder per endpoint pair; the env vars override.
++import { promises as fs } from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++const DESKTOP = path.join(os.homedir(), 'Desktop');
++export const FINISHED_DIRS: Readonly<Record<string, string>> = {
++	female: process.env.FINISHED_PLATES_DIR ?? path.join(DESKTOP, 'outfit_plates_female', 'female_race_plates_mix'),
++	male: process.env.FINISHED_PLATES_DIR_MALE ?? path.join(DESKTOP, 'outfit_plates_male', 'male_race_plates_mix')
++};
++
++const SAFE = /^[a-z0-9][a-z0-9_-]*$/;
++
++export function safeName(value: string | undefined): string | null {
++	return value && SAFE.test(value) ? value : null;
++}
++
++/** `{ race: [outfit, ...] }` for every race folder of one pair that holds png plates. */
++async function listSet(dir: string): Promise<Record<string, string[]>> {
++	const out: Record<string, string[]> = {};
++	let races: string[];
++	try {
++		races = (await fs.readdir(dir, { withFileTypes: true }))
++			.filter((d) => d.isDirectory() && SAFE.test(d.name))
++			.map((d) => d.name)
++			.sort();
++	} catch {
++		return out;
++	}
++	for (const race of races) {
++		const files = await fs.readdir(path.join(dir, race));
++		const outfits = files
++			.filter((f) => f.endsWith('.png') && SAFE.test(f.slice(0, -4)))
++			.map((f) => f.slice(0, -4))
++			.sort();
++		if (outfits.length) out[race] = outfits;
++	}
++	return out;
++}
++
++/** `{ set: { race: [outfit, ...] } }` for both pairs. */
++export async function listFinished(): Promise<Record<string, Record<string, string[]>>> {
++	const out: Record<string, Record<string, string[]>> = {};
++	for (const [set, dir] of Object.entries(FINISHED_DIRS)) out[set] = await listSet(dir);
++	return out;
++}
++
++export function finishedPath(set: string, race: string, outfit: string): string | null {
++	const dir = FINISHED_DIRS[set];
++	return dir ? path.join(dir, race, `${outfit}.png`) : null;
++}
+diff --git a/image-lerp/src/routes/+page.svelte b/image-lerp/src/routes/+page.svelte
+index 38c2b09..7385d52 100644
+--- a/image-lerp/src/routes/+page.svelte
++++ b/image-lerp/src/routes/+page.svelte
+@@ -1,139 +1,450 @@
+ <script lang="ts">
+ 	import { onDestroy, onMount } from 'svelte';
+-	import ImageDrop from '$lib/ImageDrop.svelte';
+-	import { getCachedImages, putCachedImage } from '$lib/imageCache';
+-	import { lerpImageData, rasterize, weightsForMode, WEIGHT_MAX, WEIGHT_MIN, type MixMode } from '$lib/lerpImages';
+-	import { disposeImage, loadImage, type LoadedImage } from '$lib/loadImage';
++	import SetStrip from '$lib/SetStrip.svelte';
++	import {
++		DEFAULT_WEIGHTS,
++		deleteSet,
++		loadSets,
++		newSetId,
++		saveMeta,
++		saveSet,
++		type SetWeights
++	} from '$lib/imageCache';
++	import {
++		lerpImageData,
++		rasterize,
++		weightsForMode,
++		WEIGHT_MAX,
++		WEIGHT_MIN,
++		type MixMode
++	} from '$lib/lerpImages';
++	import { decode, disposeImage, loadImage, type LoadedImage } from '$lib/loadImage';
+ 
+-	let imageA = $state.raw<LoadedImage | null>(null);
+-	let imageB = $state.raw<LoadedImage | null>(null);
++	type WorkSet = {
++		id: string;
++		name: string;
++		a: LoadedImage | null;
++		b: LoadedImage | null;
++		weights: SetWeights;
++	};
++
++	// Raw state, replaced wholesale on every change rather than mutated through a
++	// proxy: the plates carry File and object-URL handles that should not be proxied.
++	let sets = $state.raw<WorkSet[]>([]);
++	let selectedId = $state<string | null>(null);
+ 	let pixelsA = $state.raw<ImageData | null>(null);
+ 	let pixelsB = $state.raw<ImageData | null>(null);
+ 	let errorMessage = $state('');
+-	let mode = $state<MixMode>('unified');
+-	let a = $state(0.5);
+-	let b = $state(0.5);
+-	let c = $state(0.5);
+-	let resultCanvas: HTMLCanvasElement | undefined;
+ 	let loading = $state(0);
+ 
++	// Live mix for the selected set. Mirrored out of the set on select and written
++	// back on change, so each set remembers where its sliders were left.
++	let mode = $state<MixMode>(DEFAULT_WEIGHTS.mode);
++	let a = $state(DEFAULT_WEIGHTS.a);
++	let b = $state(DEFAULT_WEIGHTS.b);
++	let c = $state(DEFAULT_WEIGHTS.c);
++	let weightsOwner = $state<string | null>(null);
++
++	let samplePairs = $state.raw<string[]>([]);
++	let sampleFormats = $state.raw<Map<string, string>>(new Map());
++	let sampleFilter = $state('');
++	let samplesOpen = $state(false);
++	let adding = $state.raw<{ done: number; total: number } | null>(null);
++
++	// The races between A (Anna) and B (Precious): one fitted a/b/c each, from static/race_values.json.
++	type Race = { slug: string; values: [number, number, number] };
++	/** The fitted mix values per endpoint pair: female = Anna/Precious, male = Caleb/Malik. */
++	let raceSets = $state.raw<Record<string, Race[]>>({});
++	// Follow image A's outline (the race maker does): drop what only B paints, keep what only A paints solid.
++	let outlineA = $state(true);
++	// The finished race plates the sandbox maker wrote (face pasted, neck shaved), by pair, race, then outfit.
++	let finished = $state.raw<Record<string, Record<string, string[]>>>({});
++	let finishedDirs = $state.raw<Record<string, string>>({});
++
++	let resultCanvas: HTMLCanvasElement | undefined;
+ 	let mixBuffer: ImageData | null = null;
+ 	let loadGeneration = 0;
++	const persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+ 
++	const selected = $derived(sets.find((s) => s.id === selectedId) ?? null);
++	const imageA = $derived(selected?.a ?? null);
++	const imageB = $derived(selected?.b ?? null);
++	// A `female_<outfit>` or `male_<outfit>` set is one of the pipeline's outfits on that pair; with a race chosen,
++	// its finished plate can be shown. The race buttons use that pair's values.
++	const pairSet = $derived(
++		selected?.name.startsWith('female_') ? 'female' : selected?.name.startsWith('male_') ? 'male' : null
++	);
++	const races = $derived(raceSets[pairSet ?? 'female'] ?? []);
++	// a, b, c always hold the mix that is applied; the mode only decides whether one slider or three are shown.
++	// In unified view the one slider moves all three together, and a chosen race's three values still apply.
++	const weights = $derived(weightsForMode('per-channel', a, b, c));
++	const channelsEqual = $derived(a === b && b === c);
++	// The see-through (alpha) mix weight the result uses: the mean of the three channel weights.
++	const alphaT = $derived((weights.r + weights.g + weights.b) / 3);
++	// Which race the values currently sit on, if any.
++	const activeRace = $derived(
++		races.find(
++			(r) =>
++				Math.abs(r.values[0] - a) < 0.0005 &&
++				Math.abs(r.values[1] - b) < 0.0005 &&
++				Math.abs(r.values[2] - c) < 0.0005
++		)?.slug ?? null
++	);
++	const canMix = $derived(!!pixelsA && !!pixelsB && loading === 0);
++	const finishedOutfit = $derived(pairSet && selected ? selected.name.slice(pairSet.length + 1) : null);
++	const finishedUrl = $derived(
++		pairSet && activeRace && finishedOutfit && finished[pairSet]?.[activeRace]?.includes(finishedOutfit)
++			? `/finished/${pairSet}/${activeRace}/${finishedOutfit}.png`
++			: null
++	);
++	const finishedCount = $derived(
++		pairSet ? Object.values(finished[pairSet] ?? {}).reduce((n, list) => n + list.length, 0) : 0
++	);
+ 	const sizesDiffer = $derived(
+ 		!!imageA && !!imageB && (imageA.width !== imageB.width || imageA.height !== imageB.height)
+ 	);
+-	const weights = $derived(weightsForMode(mode, a, b, c));
+-	const canMix = $derived(!!pixelsA && !!pixelsB && loading === 0);
++	const filteredSamples = $derived(
++		sampleFilter.trim()
++			? samplePairs.filter((s) => s.includes(sampleFilter.trim().toLowerCase()))
++			: samplePairs
++	);
++	// Only the listed pairs that are not already loaded under their own name.
++	const pendingSamples = $derived(
++		filteredSamples.filter((slug) => !sets.some((s) => s.name === slug))
++	);
+ 
+-	async function persistSlot(slot: 'a' | 'b', file: File) {
++	function replaceSet(id: string, patch: Partial<WorkSet>) {
++		sets = sets.map((s) => (s.id === id ? { ...s, ...patch } : s));
++	}
++
++	function schedulePersist(id: string) {
++		clearTimeout(persistTimers.get(id));
++		persistTimers.set(
++			id,
++			setTimeout(() => {
++				const set = sets.find((s) => s.id === id);
++				if (!set) return;
++				void saveSet({
++					id: set.id,
++					name: set.name,
++					a: set.a?.file ?? null,
++					b: set.b?.file ?? null,
++					weights: set.weights
++				}).catch((error) => console.warn('Could not save set.', error));
++			}, 250)
++		);
++	}
++
++	function persistMeta() {
++		void saveMeta({ order: sets.map((s) => s.id), selectedId }).catch((error) =>
++			console.warn('Could not save set order.', error)
++		);
++	}
++
++	/**
++	 * Decode the selected set's two plates, read their pixels, and close the bitmaps
++	 * again. Only the ImageData for the set being worked on is kept, so the number of
++	 * loaded sets costs nothing in decoded pixels.
++	 */
++	let pixelGeneration = 0;
++
++	async function rebuildPixelBuffers() {
++		mixBuffer = null;
++		const generation = ++pixelGeneration;
++		const set = sets.find((s) => s.id === selectedId) ?? null;
++		if (!set?.a || !set?.b) {
++			pixelsA = null;
++			pixelsB = null;
++			return;
++		}
++		const { a: plateA, b: plateB } = set;
++		let bitmapA: ImageBitmap | undefined;
++		let bitmapB: ImageBitmap | undefined;
+ 		try {
+-			await putCachedImage(slot, file);
++			[bitmapA, bitmapB] = await Promise.all([decode(plateA), decode(plateB)]);
++			if (generation !== pixelGeneration) return;
++			pixelsA = rasterize(bitmapA, plateA.width, plateA.height);
++			pixelsB = rasterize(bitmapB, plateA.width, plateA.height);
+ 		} catch (error) {
+-			console.warn('Could not cache image in IndexedDB.', error);
++			if (generation !== pixelGeneration) return;
++			pixelsA = null;
++			pixelsB = null;
++			errorMessage = error instanceof Error ? error.message : 'Could not decode that set.';
++		} finally {
++			bitmapA?.close();
++			bitmapB?.close();
+ 		}
+ 	}
+ 
+-	async function applySlot(slot: 'a' | 'b', file: File, persist: boolean, generation: number) {
++	function loadWeightsFrom(set: WorkSet | null) {
++		const w = set?.weights ?? DEFAULT_WEIGHTS;
++		mode = w.mode;
++		a = w.a;
++		// Sets saved before races could be chosen in unified view kept stale b and c there; unified meant "a for all".
++		const stale = w.mode === 'unified' && !races.some((r) => r.values[0] === w.a && r.values[1] === w.b && r.values[2] === w.c);
++		b = stale ? w.a : w.b;
++		c = stale ? w.a : w.c;
++		weightsOwner = set?.id ?? null;
++	}
++
++	function selectSet(id: string) {
++		if (id === selectedId) return;
++		selectedId = id;
++		loadWeightsFrom(sets.find((s) => s.id === id) ?? null);
++		void rebuildPixelBuffers();
++		persistMeta();
++	}
++
++	function createSet(name?: string, select = true): WorkSet {
++		const set: WorkSet = {
++			id: newSetId(),
++			name: name || `Set ${sets.length + 1}`,
++			a: null,
++			b: null,
++			weights: { ...DEFAULT_WEIGHTS }
++		};
++		sets = [...sets, set];
++		if (select) {
++			selectedId = set.id;
++			loadWeightsFrom(set);
++			void rebuildPixelBuffers();
++		}
++		schedulePersist(set.id);
++		persistMeta();
++		return set;
++	}
++
++	function removeSet(id: string) {
++		const set = sets.find((s) => s.id === id);
++		if (!set) return;
++		disposeImage(set.a);
++		disposeImage(set.b);
++		const index = sets.findIndex((s) => s.id === id);
++		sets = sets.filter((s) => s.id !== id);
++		clearTimeout(persistTimers.get(id));
++		persistTimers.delete(id);
++		void deleteSet(id).catch((error) => console.warn('Could not delete set.', error));
++		if (selectedId === id) {
++			const next = sets[Math.min(index, sets.length - 1)] ?? null;
++			selectedId = next?.id ?? null;
++			loadWeightsFrom(next);
++		}
++		void rebuildPixelBuffers();
++		persistMeta();
++	}
++
++	function renameSet(id: string, name: string) {
++		replaceSet(id, { name });
++		schedulePersist(id);
++	}
++
++	/** Put one file into a slot of a given set, decoding it first. */
++	async function applyFile(setId: string, slot: 'a' | 'b', file: File, generation: number) {
+ 		const loaded = await loadImage(file);
+-		if (generation !== loadGeneration) {
++		if (generation !== loadGeneration || !sets.some((s) => s.id === setId)) {
+ 			disposeImage(loaded);
+ 			return;
+ 		}
+-		if (slot === 'a') {
+-			disposeImage(imageA);
+-			imageA = loaded;
+-		} else {
+-			disposeImage(imageB);
+-			imageB = loaded;
++		const current = sets.find((s) => s.id === setId);
++		disposeImage(slot === 'a' ? (current?.a ?? null) : (current?.b ?? null));
++		replaceSet(setId, slot === 'a' ? { a: loaded } : { b: loaded });
++		if (setId === selectedId) void rebuildPixelBuffers();
++		schedulePersist(setId);
++	}
++
++	function baseName(name: string) {
++		return name.replace(/\.[^.]+$/, '');
++	}
++
++	/** Name a set from what its two filenames share, so "x_a.png"/"x_b.png" becomes "x". */
++	function pairName(first: string, second?: string) {
++		const one = baseName(first);
++		if (!second) return one;
++		const two = baseName(second);
++		let i = 0;
++		while (i < one.length && i < two.length && one[i] === two[i]) i += 1;
++		const shared = one.slice(0, i).replace(/[-_\s]+$/, '');
++		return shared.length >= 3 ? shared : one;
++	}
++
++	/**
++	 * Take any number of files and build sets from them two at a time, in filename
++	 * order. An odd file at the end becomes a set with only A filled.
++	 */
++	async function addFilesAsSets(fileList: FileList | null | undefined) {
++		const files = Array.from(fileList ?? []).sort((x, y) => x.name.localeCompare(y.name));
++		if (!files.length) return;
++		errorMessage = '';
++		const generation = ++loadGeneration;
++		loading += 1;
++		try {
++			for (let i = 0; i < files.length; i += 2) {
++				const first = files[i];
++				const second = files[i + 1];
++				const set = createSet(pairName(first.name, second?.name), i === 0);
++				await applyFile(set.id, 'a', first, generation);
++				if (second) await applyFile(set.id, 'b', second, generation);
++			}
++		} catch (error) {
++			errorMessage = error instanceof Error ? error.message : 'Could not load those images.';
++		} finally {
++			loading -= 1;
+ 		}
+-		rebuildPixelBuffers();
+-		if (persist && generation === loadGeneration) await persistSlot(slot, file);
+ 	}
+ 
+-	async function setSlot(slot: 'a' | 'b', file: File) {
++	function pairBase(slug: string | null) {
++		return slug ? `/samples/pairs/${slug}` : '/samples';
++	}
++
++	// index.json carries each pair's file format, so a pair can be stored as png or
++	// webp without the loader probing for it and logging a 404 on every miss.
++	async function fetchPairFile(base: string, slot: 'a' | 'b', ext: string) {
++		const response = await fetch(`${base}/${slot}.${ext}`);
++		if (!response.ok) throw new Error(`Could not load sample ${slot.toUpperCase()}.`);
++		const blob = await response.blob();
++		return new File([blob], `${slot}.${ext}`, { type: blob.type || `image/${ext}` });
++	}
++
++	async function addOnePair(slug: string | null, generation: number, select: boolean) {
++		const base = pairBase(slug);
++		const ext = (slug && sampleFormats.get(slug)) || 'png';
++		const [fileA, fileB] = await Promise.all([
++			fetchPairFile(base, 'a', ext),
++			fetchPairFile(base, 'b', ext)
++		]);
++		const set = createSet(slug ?? 'samples', select);
++		await applyFile(set.id, 'a', fileA, generation);
++		await applyFile(set.id, 'b', fileB, generation);
++	}
++
++	/** Add one of the bundled sample pairs as a new set. */
++	async function addSamplePair(slug: string | null) {
+ 		errorMessage = '';
+ 		const generation = ++loadGeneration;
+ 		loading += 1;
+ 		try {
+-			await applySlot(slot, file, true, generation);
++			await loadSampleIndex().catch(() => {});
++			await addOnePair(slug, generation, true);
+ 		} catch (error) {
+-			errorMessage = error instanceof Error ? error.message : 'Could not load that image.';
++			errorMessage = error instanceof Error ? error.message : 'Could not load sample images.';
+ 		} finally {
+ 			loading -= 1;
+ 		}
+ 	}
+ 
+-	async function restoreCachedImages() {
++	/**
++	 * Add every pair currently listed, one after another so the browser is not asked
++	 * for a hundred plates at once. Only the first is selected.
++	 */
++	async function addAllShown() {
++		const slugs = pendingSamples;
++		if (!slugs.length) return;
++		errorMessage = '';
+ 		const generation = ++loadGeneration;
++		adding = { done: 0, total: slugs.length };
+ 		loading += 1;
+ 		try {
+-			const cached = await getCachedImages();
+-			if (generation !== loadGeneration) return;
+-			if (cached.a) await applySlot('a', cached.a, false, generation);
+-			if (generation !== loadGeneration) return;
+-			if (cached.b) await applySlot('b', cached.b, false, generation);
++			for (const [i, slug] of slugs.entries()) {
++				if (generation !== loadGeneration) break;
++				await addOnePair(slug, generation, i === 0 && !selected);
++				adding = { done: i + 1, total: slugs.length };
++			}
+ 		} catch (error) {
+-			console.warn('Could not restore cached images.', error);
++			errorMessage = error instanceof Error ? error.message : 'Could not load sample images.';
+ 		} finally {
+ 			loading -= 1;
++			adding = null;
+ 		}
+ 	}
+ 
+-	function rebuildPixelBuffers() {
+-		mixBuffer = null;
+-		if (!imageA || !imageB) {
+-			pixelsA = null;
+-			pixelsB = null;
+-			return;
++	/**
++	 * index.json holds either a bare slug (a png pair, the original shape) or
++	 * `{ slug, ext }`. Both are accepted so a hand-made folder still works.
++	 */
++	async function loadSampleIndex() {
++		if (samplePairs.length) return;
++		const response = await fetch('/samples/pairs/index.json');
++		if (!response.ok) throw new Error('Could not list the sample pairs.');
++		const entries = (await response.json()) as (string | { slug: string; ext?: string })[];
++		const formats = new Map<string, string>();
++		const slugs: string[] = [];
++		for (const entry of entries) {
++			const slug = typeof entry === 'string' ? entry : entry.slug;
++			if (!slug) continue;
++			slugs.push(slug);
++			formats.set(slug, (typeof entry === 'string' ? 'png' : entry.ext) || 'png');
+ 		}
++		sampleFormats = formats;
++		samplePairs = slugs;
++	}
+ 
+-		const width = imageA.width;
+-		const height = imageA.height;
+-		pixelsA = rasterize(imageA.bitmap, width, height);
+-		pixelsB = rasterize(imageB.bitmap, width, height);
++	async function openSamples() {
++		samplesOpen = !samplesOpen;
++		if (!samplesOpen) return;
++		try {
++			await loadSampleIndex();
++		} catch (error) {
++			errorMessage = error instanceof Error ? error.message : 'Could not list the sample pairs.';
++		}
+ 	}
+ 
+ 	function setMode(next: MixMode) {
+-		if (next === 'per-channel' && mode === 'unified') {
+-			b = a;
+-			c = a;
+-		}
+ 		mode = next;
+ 	}
+ 
+-	async function loadSamplePair() {
+-		errorMessage = '';
++	/** Put the mix on a race's fitted values, in whichever view is open; the alpha weight follows as their mean. */
++	function chooseRace(race: Race) {
++		[a, b, c] = race.values;
++	}
++
++	/** The unified slider: one value for all three channels. */
++	function setUnified(value: number) {
++		a = value;
++		b = value;
++		c = value;
++	}
++
++	async function loadFinished() {
+ 		try {
+-			const [blobA, blobB] = await Promise.all([
+-				fetch('/samples/a.png').then((response) => {
+-					if (!response.ok) throw new Error('Could not load sample A.');
+-					return response.blob();
+-				}),
+-				fetch('/samples/b.png').then((response) => {
+-					if (!response.ok) throw new Error('Could not load sample B.');
+-					return response.blob();
+-				})
+-			]);
+-			await setSlot('a', new File([blobA], 'sample-a.png', { type: blobA.type || 'image/png' }));
+-			await setSlot('b', new File([blobB], 'sample-b.png', { type: blobB.type || 'image/png' }));
++			const response = await fetch('/finished/index.json');
++			if (!response.ok) return;
++			const data = (await response.json()) as {
++				dirs: Record<string, string>;
++				sets: Record<string, Record<string, string[]>>;
++			};
++			finished = data.sets;
++			finishedDirs = data.dirs;
+ 		} catch (error) {
+-			errorMessage = error instanceof Error ? error.message : 'Could not load sample images.';
++			console.warn('Could not list the finished plates.', error);
+ 		}
+ 	}
+ 
++	async function loadRaces() {
++		const files: Record<string, string> = { female: '/race_values.json', male: '/race_values_male.json' };
++		const loaded: Record<string, Race[]> = {};
++		for (const [set, file] of Object.entries(files)) {
++			try {
++				const response = await fetch(file);
++				if (!response.ok) continue;
++				const entries = (await response.json()) as Race[];
++				loaded[set] = entries.filter((r) => r.slug && Array.isArray(r.values) && r.values.length === 3);
++			} catch (error) {
++				console.warn(`Could not load the race values from ${file}.`, error);
++			}
++		}
++		raceSets = loaded;
++	}
++
+ 	function swapImages() {
+-		const nextA = imageB;
+-		const nextB = imageA;
+-		imageA = nextA;
+-		imageB = nextB;
+-		rebuildPixelBuffers();
+-		if (imageA) void persistSlot('a', imageA.file);
+-		if (imageB) void persistSlot('b', imageB.file);
++		if (!selected) return;
++		replaceSet(selected.id, { a: selected.b, b: selected.a });
++		void rebuildPixelBuffers();
++		schedulePersist(selected.id);
+ 	}
+ 
+ 	function downloadResult() {
+ 		if (!resultCanvas) return;
++		const name = selected?.name ?? 'lerp';
+ 		resultCanvas.toBlob((blob) => {
+ 			if (!blob) {
+ 				errorMessage = 'Could not export the result image.';
+@@ -142,19 +453,77 @@
+ 			const url = URL.createObjectURL(blob);
+ 			const link = document.createElement('a');
+ 			link.href = url;
+-			link.download = 'lerp.png';
++			link.download = `${name.replace(/[^\w.-]+/g, '_')}_lerp.png`;
+ 			link.click();
+ 			URL.revokeObjectURL(url);
+ 		}, 'image/png');
+ 	}
+ 
++	// Write the live sliders back into whichever set owns them.
++	$effect(() => {
++		const current = mode;
++		const va = a;
++		const vb = b;
++		const vc = c;
++		const set = sets.find((s) => s.id === selectedId);
++		if (!set || weightsOwner !== set.id) return;
++		if (
++			set.weights.mode === current &&
++			set.weights.a === va &&
++			set.weights.b === vb &&
++			set.weights.c === vc
++		)
++			return;
++		set.weights = { mode: current, a: va, b: vb, c: vc };
++		schedulePersist(set.id);
++	});
++
++	async function restore() {
++		loading += 1;
++		const generation = ++loadGeneration;
++		try {
++			const stored = await loadSets();
++			const restored: WorkSet[] = [];
++			for (const s of stored.sets) {
++				const set: WorkSet = { id: s.id, name: s.name, a: null, b: null, weights: s.weights };
++				if (s.a) set.a = await loadImage(s.a).catch(() => null);
++				if (s.b) set.b = await loadImage(s.b).catch(() => null);
++				restored.push(set);
++			}
++			if (generation !== loadGeneration) {
++				for (const s of restored) {
++					disposeImage(s.a);
++					disposeImage(s.b);
++				}
++				return;
++			}
++			sets = restored;
++			selectedId = stored.selectedId;
++			loadWeightsFrom(restored.find((s) => s.id === stored.selectedId) ?? null);
++			void rebuildPixelBuffers();
++		} catch (error) {
++			console.warn('Could not restore sets.', error);
++		} finally {
++			loading -= 1;
++		}
++
++		// ?pair=<slug> still works: with nothing stored it seeds the first set.
++		const slug = new URLSearchParams(window.location.search).get('pair');
++		if (slug && sets.length === 0) await addSamplePair(slug);
++	}
++
+ 	onMount(() => {
+-		void restoreCachedImages();
++		void restore();
++		void loadRaces();
++		void loadFinished();
+ 	});
+ 
+ 	onDestroy(() => {
+-		disposeImage(imageA);
+-		disposeImage(imageB);
++		for (const timer of persistTimers.values()) clearTimeout(timer);
++		for (const set of sets) {
++			disposeImage(set.a);
++			disposeImage(set.b);
++		}
+ 	});
+ </script>
+ 
+@@ -166,138 +535,266 @@
+ 	<header class="hero">
+ 		<h1>Image lerp</h1>
+ 		<p>
+-			Load two images and mix them with linear interpolation.
++			Load as many A/B sets as you like, then pick one at a time to mix.
+ 			<code>A + t · (B − A)</code>
+ 			per RGB channel. <code>t = 0</code> is image A, <code>t = 1</code> is image B. Negative
+ 			<code>t</code> subtracts B; <code>t &gt; 1</code> subtracts A. Channel values clamp to 0–255.
++			Each set keeps its own sliders.
+ 		</p>
+ 	</header>
+ 
+-	<div class="sources">
+-		<ImageDrop label="Image A" image={imageA} onFile={(file) => setSlot('a', file)} />
+-		<ImageDrop label="Image B" image={imageB} onFile={(file) => setSlot('b', file)} />
+-	</div>
+-
+-	<section class="panel controls">
+-		<div class="mode-row">
+-			<fieldset>
+-				<legend>Mix mode</legend>
+-				<label>
++	<div class="library">
++		<div class="library-head">
++			<h2>Sets <span class="count">{sets.length}</span></h2>
++			<div class="actions">
++				<label class="filebtn">
++					<span>Add files…</span>
+ 					<input
+-						type="radio"
+-						name="mode"
+-						value="unified"
+-						checked={mode === 'unified'}
+-						onchange={() => setMode('unified')}
++						class="sr-only"
++						type="file"
++						accept="image/*"
++						multiple
++						onchange={(event) => {
++							addFilesAsSets(event.currentTarget.files);
++							event.currentTarget.value = '';
++						}}
+ 					/>
+-					Unified RGB
+ 				</label>
+-				<label>
++				<button type="button" onclick={openSamples}>
++					{samplesOpen ? 'Hide samples' : 'Sample pairs…'}
++				</button>
++			</div>
++		</div>
++
++		{#if samplesOpen}
++			<div class="samples">
++				<div class="samples-head">
+ 					<input
+-						type="radio"
+-						name="mode"
+-						value="per-channel"
+-						checked={mode === 'per-channel'}
+-						onchange={() => setMode('per-channel')}
++						type="search"
++						placeholder="Filter {samplePairs.length} sample pairs"
++						bind:value={sampleFilter}
+ 					/>
+-					Separate R, G, B
+-				</label>
+-			</fieldset>
+-			<div class="actions">
+-				<button type="button" onclick={loadSamplePair}>Load samples</button>
+-				<button type="button" disabled={!imageA || !imageB} onclick={swapImages}>Swap A / B</button>
++					<button type="button" disabled={!pendingSamples.length || !!adding} onclick={addAllShown}>
++						{#if adding}
++							Adding {adding.done}/{adding.total}…
++						{:else if pendingSamples.length}
++							Add all {pendingSamples.length}
++						{:else}
++							All loaded
++						{/if}
++					</button>
++				</div>
++				<div class="sample-list">
++					{#each filteredSamples as slug (slug)}
++						<button type="button" onclick={() => addSamplePair(slug)}>{slug}</button>
++					{:else}
++						<p class="empty">No sample pairs matched.</p>
++					{/each}
++				</div>
+ 			</div>
+-		</div>
++		{/if}
+ 
+-		{#snippet weightTicks()}
+-			<span class="ticks" aria-hidden="true">
+-				<span style:left="0%">−0.25</span>
+-				<span style:left="16.67%">0</span>
+-				<span style:left="83.33%">1</span>
+-				<span style:left="100%">1.25</span>
+-			</span>
+-		{/snippet}
+-
+-		{#if mode === 'unified'}
+-			<p class="formula">R′ = G′ = B′ = A + a · (B − A)</p>
+-			<label class="slider">
+-				<span>a = {a.toFixed(3)}</span>
+-				<input type="range" min={WEIGHT_MIN} max={WEIGHT_MAX} step="0.001" bind:value={a} />
+-				{@render weightTicks()}
++		<SetStrip
++			{sets}
++			{selectedId}
++			onSelect={selectSet}
++			onRemove={removeSet}
++			onRename={renameSet}
++			onNew={() => createSet()}
++		/>
++	</div>
++
++	{#if !selected}
++		<section class="panel">
++			<p class="empty">
++				No set selected. Add files, pick a sample pair, or press <strong>New set</strong> and drop two
++				images into it.
++			</p>
++		</section>
++	{:else}
++		<section class="panel controls">
++			<div class="mode-row">
++				<fieldset>
++					<legend>Mix mode · <span class="editing">{selected.name}</span></legend>
++					<label>
++						<input
++							type="radio"
++							name="mode"
++							value="unified"
++							checked={mode === 'unified'}
++							onchange={() => setMode('unified')}
++						/>
++						Unified RGB
++					</label>
++					<label>
++						<input
++							type="radio"
++							name="mode"
++							value="per-channel"
++							checked={mode === 'per-channel'}
++							onchange={() => setMode('per-channel')}
++						/>
++						Separate R, G, B
++					</label>
++				</fieldset>
++				<div class="actions">
++					<button type="button" disabled={!imageA || !imageB} onclick={swapImages}>Swap A / B</button>
++				</div>
++			</div>
++
++			{#if races.length}
++				<div class="races">
++					<span class="races-label">Race ({pairSet === 'male' ? 'A = Caleb, B = Malik' : 'A = Anna, B = Precious'})</span>
++					{#each races as race (race.slug)}
++						<button
++							type="button"
++							class:active={activeRace === race.slug}
++							title="a {race.values[0]}, b {race.values[1]}, c {race.values[2]}"
++							onclick={() => chooseRace(race)}
++						>
++							{race.slug}
++						</button>
++					{/each}
++				</div>
++			{/if}
++			<label class="check">
++				<input type="checkbox" bind:checked={outlineA} />
++				Follow A's outline: see-through from image A; pixels only B paints are dropped, pixels only A paints stay
++				solid in the mixed colour of the skin beside them
+ 			</label>
+-		{:else}
+ 			<p class="formula">
+-				R′ = A<sub>R</sub> + a · (B<sub>R</sub> − A<sub>R</sub>)
+-				· G′ = A<sub>G</sub> + b · (B<sub>G</sub> − A<sub>G</sub>)
+-				· B′ = A<sub>B</sub> + c · (B<sub>B</sub> − A<sub>B</sub>)
++				{#if outlineA}
++					alpha (see-through) = image A's{#if activeRace}&nbsp;· {activeRace}{/if}
++				{:else}
++					alpha (see-through) uses the mean of the three: t<sub>α</sub> = {alphaT.toFixed(3)}
++					{#if activeRace}· {activeRace}{/if}
++				{/if}
+ 			</p>
+-			<label class="slider red">
+-				<span>a (red) = {a.toFixed(3)}</span>
+-				<input type="range" min={WEIGHT_MIN} max={WEIGHT_MAX} step="0.001" bind:value={a} />
+-				{@render weightTicks()}
+-			</label>
+-			<label class="slider green">
+-				<span>b (green) = {b.toFixed(3)}</span>
+-				<input type="range" min={WEIGHT_MIN} max={WEIGHT_MAX} step="0.001" bind:value={b} />
+-				{@render weightTicks()}
+-			</label>
+-			<label class="slider blue">
+-				<span>c (blue) = {c.toFixed(3)}</span>
+-				<input type="range" min={WEIGHT_MIN} max={WEIGHT_MAX} step="0.001" bind:value={c} />
+-				{@render weightTicks()}
+-			</label>
+-		{/if}
+ 
+-		{#if sizesDiffer && imageA}
+-			<p class="note">
+-				Images are different sizes. The result uses image A ({imageA.width}×{imageA.height}); image B
+-				is stretched to match.
+-			</p>
+-		{/if}
+-		{#if errorMessage}
+-			<p class="error">{errorMessage}</p>
+-		{/if}
+-	</section>
++			{#snippet weightTicks()}
++				<span class="ticks" aria-hidden="true">
++					<span style:left="0%">−0.25</span>
++					<span style:left="16.67%">0</span>
++					<span style:left="83.33%">1</span>
++					<span style:left="100%">1.25</span>
++				</span>
++			{/snippet}
+ 
+-	<section class="panel result">
+-		<div class="result-head">
+-			<h2>Result</h2>
+-			<button type="button" disabled={!canMix} onclick={downloadResult}>Download PNG</button>
+-		</div>
++			{#if mode === 'unified'}
++				{#if channelsEqual}
++					<p class="formula">R′ = G′ = B′ = A + a · (B − A)</p>
++				{:else}
++					<p class="formula">
++						{activeRace ?? 'custom'}: a (red) = {a.toFixed(3)} · b (green) = {b.toFixed(3)} · c (blue) =
++						{c.toFixed(3)}. Drag the slider to put one value on all three.
++					</p>
++				{/if}
++				<label class="slider">
++					<span>{channelsEqual ? `a = ${a.toFixed(3)}` : `one value for all: ${alphaT.toFixed(3)}`}</span>
++					<input
++						type="range"
++						min={WEIGHT_MIN}
++						max={WEIGHT_MAX}
++						step="0.001"
++						value={channelsEqual ? a : alphaT}
++						oninput={(event) => setUnified(Number(event.currentTarget.value))}
++					/>
++					{@render weightTicks()}
++				</label>
++			{:else}
++				<p class="formula">
++					R′ = A<sub>R</sub> + a · (B<sub>R</sub> − A<sub>R</sub>)
++					· G′ = A<sub>G</sub> + b · (B<sub>G</sub> − A<sub>G</sub>)
++					· B′ = A<sub>B</sub> + c · (B<sub>B</sub> − A<sub>B</sub>)
++				</p>
++				<label class="slider red">
++					<span>a (red) = {a.toFixed(3)}</span>
++					<input type="range" min={WEIGHT_MIN} max={WEIGHT_MAX} step="0.001" bind:value={a} />
++					{@render weightTicks()}
++				</label>
++				<label class="slider green">
++					<span>b (green) = {b.toFixed(3)}</span>
++					<input type="range" min={WEIGHT_MIN} max={WEIGHT_MAX} step="0.001" bind:value={b} />
++					{@render weightTicks()}
++				</label>
++				<label class="slider blue">
++					<span>c (blue) = {c.toFixed(3)}</span>
++					<input type="range" min={WEIGHT_MIN} max={WEIGHT_MAX} step="0.001" bind:value={c} />
++					{@render weightTicks()}
++				</label>
++			{/if}
+ 
+-		{#if !imageA || !imageB}
+-			<p class="empty">Load both images to mix them.</p>
+-		{:else if loading > 0}
+-			<p class="empty">Decoding…</p>
+-		{:else}
+-			<canvas
+-				class="output"
+-				width={pixelsA?.width ?? 1}
+-				height={pixelsA?.height ?? 1}
+-				{@attach (canvas) => {
+-					resultCanvas = canvas;
+-					const ctx = canvas.getContext('2d');
+-					if (!ctx) return;
+-
+-					$effect(() => {
+-						const srcA = pixelsA;
+-						const srcB = pixelsB;
+-						const mix = weights;
+-						if (!srcA || !srcB) return;
+-						if (!mixBuffer || mixBuffer.width !== srcA.width || mixBuffer.height !== srcA.height) {
+-							mixBuffer = new ImageData(srcA.width, srcA.height);
+-						}
+-						lerpImageData(srcA, srcB, mixBuffer, mix);
+-						ctx.putImageData(mixBuffer, 0, 0);
+-					});
+-
+-					return () => {
+-						if (resultCanvas === canvas) resultCanvas = undefined;
+-					};
+-				}}
+-			></canvas>
+-		{/if}
+-	</section>
++			{#if sizesDiffer && imageA}
++				<p class="note">
++					Images are different sizes. The result uses image A ({imageA.width}×{imageA.height}); image B
++					is stretched to match.
++				</p>
++			{/if}
++			{#if errorMessage}
++				<p class="error">{errorMessage}</p>
++			{/if}
++		</section>
++
++		<section class="panel result">
++			<div class="result-head">
++				<h2>Result · <span class="editing">{selected.name}</span></h2>
++				<button type="button" disabled={!canMix} onclick={downloadResult}>Download PNG</button>
++			</div>
++
++			{#if !imageA || !imageB}
++				<p class="empty">Drop both images into this set to mix them.</p>
++			{:else if loading > 0}
++				<p class="empty">Decoding…</p>
++			{:else}
++				<div class="outputs" class:two={!!finishedOutfit}>
++				<canvas
++					class="output"
++					width={pixelsA?.width ?? 1}
++					height={pixelsA?.height ?? 1}
++					{@attach (canvas) => {
++						resultCanvas = canvas;
++						const ctx = canvas.getContext('2d');
++						if (!ctx) return;
++
++						$effect(() => {
++							const srcA = pixelsA;
++							const srcB = pixelsB;
++							const mix = weights;
++							const follow = outlineA;
++							if (!srcA || !srcB) return;
++							if (!mixBuffer || mixBuffer.width !== srcA.width || mixBuffer.height !== srcA.height) {
++								mixBuffer = new ImageData(srcA.width, srcA.height);
++							}
++							lerpImageData(srcA, srcB, mixBuffer, mix, follow);
++							ctx.putImageData(mixBuffer, 0, 0);
++						});
++
++						return () => {
++							if (resultCanvas === canvas) resultCanvas = undefined;
++						};
++					}}
++				></canvas>
++				{#if finishedOutfit}
++					<div class="finished">
++						{#if finishedUrl}
++							<img src={finishedUrl} alt="Finished {activeRace} plate of {finishedOutfit}" />
++							<p class="caption">
++								Finished plate · {pairSet} · {activeRace} · face pasted along the chin, neck shaved to the body's outline
++								<a href={finishedUrl} download="{finishedOutfit}--{activeRace}.png">Download</a>
++							</p>
++						{:else if !activeRace}
++							<p class="empty">Pick a race above to see the finished plate the maker wrote for it.</p>
++						{:else if finishedCount === 0}
++							<p class="empty">No finished plates found in {finishedDirs[pairSet ?? ''] || 'the finished-plates folder'}.</p>
++						{:else}
++							<p class="empty">No finished {activeRace} plate for {finishedOutfit} yet.</p>
++						{/if}
++					</div>
++				{/if}
++				</div>
++			{/if}
++		</section>
++	{/if}
+ </main>
+ 
+ <style>
+@@ -324,16 +821,77 @@
+ 		font-size: 0.9em;
+ 	}
+ 
+-	.sources {
++	.library {
+ 		display: grid;
+-		grid-template-columns: 1fr;
++		gap: 0.6rem;
++		min-width: 0;
++	}
++
++	.library-head {
++		display: flex;
++		align-items: center;
++		justify-content: space-between;
+ 		gap: 1rem;
++		flex-wrap: wrap;
+ 	}
+ 
+-	@media (min-width: 720px) {
+-		.sources {
+-			grid-template-columns: 1fr 1fr;
+-		}
++	.library-head h2 {
++		margin: 0;
++		font-size: 1.1rem;
++	}
++
++	.count {
++		color: var(--muted);
++		font-weight: 400;
++		font-size: 0.9rem;
++	}
++
++	.editing {
++		color: var(--accent);
++		font-weight: 600;
++	}
++
++	.samples {
++		background: var(--panel);
++		border: 1px solid var(--border);
++		border-radius: 1rem;
++		padding: 0.75rem;
++		display: grid;
++		gap: 0.6rem;
++	}
++
++	.samples-head {
++		display: flex;
++		gap: 0.5rem;
++		align-items: center;
++	}
++
++	.samples-head button {
++		flex: 0 0 auto;
++		white-space: nowrap;
++	}
++
++	.samples input[type='search'] {
++		width: 100%;
++		font: inherit;
++		background: var(--bg);
++		color: var(--text);
++		border: 1px solid var(--border);
++		border-radius: 0.6rem;
++		padding: 0.4rem 0.6rem;
++	}
++
++	.sample-list {
++		display: flex;
++		flex-wrap: wrap;
++		gap: 0.35rem;
++		max-height: 12rem;
++		overflow-y: auto;
++	}
++
++	.sample-list button {
++		font-size: 0.8rem;
++		padding: 0.3rem 0.55rem;
+ 	}
+ 
+ 	.panel {
+@@ -362,6 +920,41 @@
+ 		gap: 0.5rem;
+ 	}
+ 
++	.races {
++		display: flex;
++		flex-wrap: wrap;
++		align-items: center;
++		gap: 0.4rem;
++	}
++
++	.races-label {
++		color: var(--muted);
++		font-size: 0.9rem;
++		margin-right: 0.3rem;
++	}
++
++	.races button {
++		font-size: 0.85rem;
++		padding: 0.3rem 0.6rem;
++	}
++
++	.races button.active {
++		border-color: var(--accent);
++		background: var(--accent);
++		color: #041022;
++	}
++
++	.check {
++		align-items: flex-start;
++		color: var(--muted);
++		font-size: 0.9rem;
++	}
++
++	.check input {
++		margin-top: 0.2rem;
++		accent-color: var(--accent);
++	}
++
+ 	fieldset {
+ 		border: 0;
+ 		margin: 0;
+@@ -383,6 +976,20 @@
+ 		gap: 0.4rem;
+ 	}
+ 
++	.filebtn {
++		display: inline-flex;
++		border: 1px solid var(--border);
++		background: var(--accent-soft);
++		color: var(--text);
++		border-radius: 0.6rem;
++		padding: 0.45rem 0.8rem;
++		cursor: pointer;
++	}
++
++	.filebtn:hover {
++		border-color: var(--accent);
++	}
++
+ 	.slider {
+ 		display: grid;
+ 		gap: 0.35rem;
+@@ -479,4 +1086,37 @@
+ 		border-radius: 0.75rem;
+ 		background: rgba(0, 0, 0, 0.25);
+ 	}
++	.outputs {
++		display: grid;
++		gap: 1rem;
++		align-items: start;
++	}
++
++	.outputs.two {
++		grid-template-columns: 1fr 1fr;
++	}
++
++	.finished img {
++		display: block;
++		width: 100%;
++		height: auto;
++		border-radius: 0.5rem;
++		background: var(--panel, #1f2328);
++	}
++
++	.finished .caption {
++		margin: 0.5rem 0 0;
++		color: var(--muted);
++		font-size: 0.9rem;
++		display: flex;
++		gap: 0.75rem;
++		flex-wrap: wrap;
++		align-items: baseline;
++	}
++
++	@media (max-width: 56rem) {
++		.outputs.two {
++			grid-template-columns: 1fr;
++		}
++	}
+ </style>
+diff --git a/image-lerp/src/routes/finished/[set]/[race]/[outfit]/+server.ts b/image-lerp/src/routes/finished/[set]/[race]/[outfit]/+server.ts
+new file mode 100644
+index 0000000..c68ddf9
+--- /dev/null
++++ b/image-lerp/src/routes/finished/[set]/[race]/[outfit]/+server.ts
+@@ -0,0 +1,22 @@
++import { promises as fs } from 'node:fs';
++import { error } from '@sveltejs/kit';
++import { finishedPath, safeName } from '$lib/server/finished';
++import type { RequestHandler } from './$types';
++
++/** One finished plate as png: /finished/<set>/<race>/<outfit>.png */
++export const GET: RequestHandler = async ({ params }) => {
++	const set = safeName(params.set);
++	const race = safeName(params.race);
++	const outfit = safeName(params.outfit.endsWith('.png') ? params.outfit.slice(0, -4) : params.outfit);
++	const file = set && race && outfit ? finishedPath(set, race, outfit) : null;
++	if (!file) error(404, 'No such plate.');
++	let bytes: Buffer;
++	try {
++		bytes = await fs.readFile(file);
++	} catch {
++		error(404, 'No such plate.');
++	}
++	return new Response(new Uint8Array(bytes), {
++		headers: { 'content-type': 'image/png', 'cache-control': 'no-store' }
++	});
++};
+diff --git a/image-lerp/src/routes/finished/index.json/+server.ts b/image-lerp/src/routes/finished/index.json/+server.ts
+new file mode 100644
+index 0000000..bf2aae5
+--- /dev/null
++++ b/image-lerp/src/routes/finished/index.json/+server.ts
+@@ -0,0 +1,8 @@
++import { json } from '@sveltejs/kit';
++import { FINISHED_DIRS, listFinished } from '$lib/server/finished';
++import type { RequestHandler } from './$types';
++
++export const GET: RequestHandler = async () => {
++	const sets = await listFinished();
++	return json({ dirs: FINISHED_DIRS, sets }, { headers: { 'cache-control': 'no-store' } });
++};
+diff --git a/image-lerp/static/race_values.json b/image-lerp/static/race_values.json
+new file mode 100644
+index 0000000..64f4f3e
+--- /dev/null
++++ b/image-lerp/static/race_values.json
+@@ -0,0 +1,66 @@
++[
++ {
++  "slug": "east-asian",
++  "values": [
++   -0.04,
++   -0.02,
++   0.09
++  ]
++ },
++ {
++  "slug": "southeast-asian",
++  "values": [
++   0.11,
++   0.24,
++   0.48
++  ]
++ },
++ {
++  "slug": "mediterranean",
++  "values": [
++   0.14,
++   0.25,
++   0.47
++  ]
++ },
++ {
++  "slug": "middle-eastern",
++  "values": [
++   0.2,
++   0.31,
++   0.58
++  ]
++ },
++ {
++  "slug": "north-african",
++  "values": [
++   0.18,
++   0.31,
++   0.57
++  ]
++ },
++ {
++  "slug": "south-asian",
++  "values": [
++   0.26,
++   0.5,
++   0.87
++  ]
++ },
++ {
++  "slug": "indigenous",
++  "values": [
++   0.27,
++   0.55,
++   0.82
++  ]
++ },
++ {
++  "slug": "pacific-islander",
++  "values": [
++   0.28,
++   0.5,
++   0.91
++  ]
++ }
++]
+\ No newline at end of file
+diff --git a/image-lerp/static/race_values_male.json b/image-lerp/static/race_values_male.json
+new file mode 100644
+index 0000000..4437f53
+--- /dev/null
++++ b/image-lerp/static/race_values_male.json
+@@ -0,0 +1,66 @@
++[
++ {
++  "slug": "east-asian",
++  "values": [
++   -0.0,
++   -0.04,
++   -0.0233
++  ]
++ },
++ {
++  "slug": "southeast-asian",
++  "values": [
++   0.1548,
++   0.1733,
++   0.2558
++  ]
++ },
++ {
++  "slug": "mediterranean",
++  "values": [
++   0.1071,
++   0.2667,
++   0.4186
++  ]
++ },
++ {
++  "slug": "middle-eastern",
++  "values": [
++   0.2857,
++   0.36,
++   0.5116
++  ]
++ },
++ {
++  "slug": "north-african",
++  "values": [
++   0.2619,
++   0.3867,
++   0.6047
++  ]
++ },
++ {
++  "slug": "south-asian",
++  "values": [
++   0.5476,
++   0.7333,
++   1.093
++  ]
++ },
++ {
++  "slug": "indigenous",
++  "values": [
++   0.5833,
++   0.76,
++   1.0698
++  ]
++ },
++ {
++  "slug": "pacific-islander",
++  "values": [
++   0.4643,
++   0.6267,
++   1.0
++  ]
++ }
++]
+\ No newline at end of file

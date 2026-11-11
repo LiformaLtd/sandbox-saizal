@@ -1,0 +1,350 @@
+From 12acc951802bfee34722d96befc0e3cd80e5ff69 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:42:57 +0000
+Subject: [PATCH 3/4] Show the generated outfit suggestions first in the
+ character clothes picker
+
+The setup generator's starting outfit and up to three more suggestions are kept
+in the setup draft and listed first in Clothes, captioned "Suggested for <role>".
+Only outfits the chosen avatar has are shown; picking one uses the normal
+selection. When the avatar lacks the generated starting outfit, it still starts
+in the white T-shirt, and the console now says so.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../flow/CustomisableCharacterPanel.svelte    |  6 +++++-
+ .../flow/ExperienceSetupWizard.svelte         |  5 ++++-
+ .../src/lib/characterCreationWizard.test.ts   | 19 +++++++++++++++--
+ .../src/lib/characterCreationWizard.ts        | 16 ++++++++++++++
+ packages/experience-studio/src/lib/client.ts  |  2 ++
+ .../src/lib/experienceSetupGeneration.test.ts | 21 +++++++++++++++++++
+ .../src/lib/experienceSetupGeneration.ts      |  4 ++++
+ .../src/lib/studioCreateDraftStorage.test.ts  | 14 +++++++++++--
+ .../src/lib/studioCreateDraftStorage.ts       | 12 +++++++++++
+ .../CharacterAppearanceStage.svelte           | 16 +++++++++++---
+ 10 files changed, 106 insertions(+), 9 deletions(-)
+
+diff --git a/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte b/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte
+index 31087fd..17350c2 100644
+--- a/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte
++++ b/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte
+@@ -65,6 +65,8 @@
+ 		initialAge?: number | null;
+ 		initialEthnicity?: string;
+ 	initialClothesId?: string;
++		/** More outfits the setup generator suggested; shown first in Clothes with initialClothesId. */
++		suggestedClothesIds?: readonly string[];
+ 	initialHairId?: string;
+ 	experienceContext?: Readonly<Record<string, unknown>>;
+ 		/** When true, show Cancel that calls oncancel (dialog host). */
+@@ -114,6 +116,7 @@
+ 		initialAge = null,
+ 		initialEthnicity = '',
+ 	initialClothesId = '',
++		suggestedClothesIds = [],
+ 	initialHairId = '',
+ 	experienceContext = {},
+ 		showCancel = true,
+@@ -361,7 +364,8 @@
+ 			<div class="look-body" hidden={view === 'details'} class:preview={view === 'summary'}>
+ 				<CharacterAppearanceStage bind:avatarId bind:thumbnailPath bind:ethnicity bind:appearance bind:eye bind:appearanceForSave bind:keepChosenPlate bind:wearingContext
+ 					{avatars} {cdnBaseUrl} {projectId} displayName={label} {gender} disabled={busy || generating} canAuthor={canAuthorWardrobe}
+-					fillHost={view === 'summary'} guidedStep={view === 'ethnicity' || view === 'clothes' || view === 'hair' ? view : null} onGuidedSelect={nextLook} />
++					fillHost={view === 'summary'} guidedStep={view === 'ethnicity' || view === 'clothes' || view === 'hair' ? view : null} onGuidedSelect={nextLook}
++					suggestedClothesIds={[initialClothesId, ...suggestedClothesIds].filter(Boolean)} suggestedClothesFor={role} />
+ 			</div>
+ 	{/if}
+ 	</div>
+diff --git a/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte b/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte
+index 5bfe59c..ceb93e3 100644
+--- a/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte
++++ b/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte
+@@ -278,6 +278,7 @@
+ 	let detailsInitialization = $state(restoredSetupDraft?.detailsInitialization ?? null);
+ 	let generatedCharacterName = $state(restoredSetupDraft?.characterName ?? '');
+ 	let generatedCharacterClothesId = $state(restoredSetupDraft?.characterClothesId ?? '');
++	let generatedSuggestedClothesIds = $state(restoredSetupDraft?.suggestedClothesIds ?? []);
+  let generatedCharacterHairId = $state(restoredSetupDraft?.characterHairId ?? '');
+ 	let generatedCharacterRole = $state(restoredSetupDraft?.characterRole ?? '');
+ 	let generatedCharacterPersonality = $state(
+@@ -405,6 +406,7 @@
+ 			introduction: detailsCandidate.introduction,
+ 			characterName: generatedCharacterName,
+  characterClothesId: generatedCharacterClothesId,
++			suggestedClothesIds: generatedSuggestedClothesIds,
+  characterHairId: generatedCharacterHairId,
+ 			characterRole: generatedCharacterRole,
+ 			characterPersonality: generatedCharacterPersonality,
+@@ -769,7 +771,7 @@
+ 				introduction: generated.introduction
+ 			};
+ 		}
+-		if (!characterGenderTouched) { generatedCharacterClothesId = generated.characterClothesId ?? ''; generatedCharacterHairId = generated.characterHairId ?? ''; }
++		if (!characterGenderTouched) { generatedCharacterClothesId = generated.characterClothesId ?? ''; generatedSuggestedClothesIds = generated.suggestedClothesIds ?? []; generatedCharacterHairId = generated.characterHairId ?? ''; }
+ 		if (!characterNameTouched) generatedCharacterName = generated.characterName;
+ 		if (!characterRoleTouched) generatedCharacterRole = generated.characterRole;
+ 		if (!characterPersonalityTouched) {
+@@ -1416,6 +1418,7 @@
+ 								draftScope={knownExperience.id ? `experience:${knownExperience.id}` : ''}
+ 								experienceContext={aiContext}
+  initialClothesId={generatedCharacterClothesId}
++								suggestedClothesIds={generatedSuggestedClothesIds}
+  initialHairId={generatedCharacterHairId}
+  initialName={generatedCharacterName}
+ 								initialRole={generatedCharacterRole}
+diff --git a/packages/experience-studio/src/lib/characterCreationWizard.test.ts b/packages/experience-studio/src/lib/characterCreationWizard.test.ts
+index 9edca46..4cd80ee 100644
+--- a/packages/experience-studio/src/lib/characterCreationWizard.test.ts
++++ b/packages/experience-studio/src/lib/characterCreationWizard.test.ts
+@@ -1,6 +1,6 @@
+-import { describe, expect, it } from 'vitest';
++import { describe, expect, it, vi } from 'vitest';
+ import type { AvatarSummary } from './types';
+-import { characterCreationAvatar, characterCreationAppearance, CHARACTER_CREATION_STEPS } from './characterCreationWizard';
++import { characterCreationAvatar, characterCreationAppearance, CHARACTER_CREATION_STEPS, suggestedClothesFirst } from './characterCreationWizard';
+ const avatars = [
+ 	{ id: 'e05a0001', gender: 'female', ethnicity: 'european', age: 35, clothesIds: ['white_t_shirt_and_jeans', 'doctor'], hairIds: ['bob-blonde_blue.1', 'bob-brown.1', 'long-black.1'] },
+ 	{ id: 'e05b0001', gender: 'male', ethnicity: 'european', age: 35, clothesIds: ['white_shirt_with_blue_outlined_flowers_and_jeans', 'white_t_shirt_and_jeans'], hairIds: ['short-blue.1', 'sweptback-brown.1'] }
+@@ -15,6 +15,21 @@ describe('character creation defaults', () => {
+ 		expect(characterCreationAppearance(avatars, avatars[0])).toEqual({ clothes: 'white_t_shirt_and_jeans', hair: 'bob-brown.1' });
+ 		expect(characterCreationAppearance(avatars, avatars[1])).toEqual({ clothes: 'white_t_shirt_and_jeans', hair: 'sweptback-brown.1' });
+ 		expect(characterCreationAppearance(avatars, avatars[0], 'doctor', 'long-black.1')).toEqual({ clothes: 'doctor', hair: 'long-black.1' });
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+ 		expect(characterCreationAppearance(avatars, avatars[0], 'nonexistent', 'nonexistent')).toEqual({ clothes: 'white_t_shirt_and_jeans', hair: 'bob-brown.1' });
++		expect(warn).toHaveBeenCalledWith('[character create] avatar e05a0001 has no "nonexistent" outfit, so it starts in the white T-shirt');
++		warn.mockRestore();
++	});
++	it('puts the suggested outfits the avatar has first, captioned with the role', () => {
++		const options = ['white_t_shirt_and_jeans', 'doctor', 'barista', 'chef'].map(id => ({ id, kind: 'Clothes' }));
++		expect(suggestedClothesFirst(options, ['chef', 'astronaut', 'doctor'], 'Hospital chef')).toEqual([
++			{ id: 'chef', kind: 'Suggested for Hospital chef' },
++			{ id: 'doctor', kind: 'Suggested for Hospital chef' },
++			{ id: 'white_t_shirt_and_jeans', kind: 'Clothes' },
++			{ id: 'barista', kind: 'Clothes' }
++		]);
++		expect(suggestedClothesFirst(options, ['barista'], ' ')[0]).toEqual({ id: 'barista', kind: 'Suggested' });
++		expect(suggestedClothesFirst(options, [], 'Chef')).toBe(options);
++		expect(suggestedClothesFirst(options, ['astronaut'], 'Chef')).toBe(options);
+ 	});
+ });
+diff --git a/packages/experience-studio/src/lib/characterCreationWizard.ts b/packages/experience-studio/src/lib/characterCreationWizard.ts
+index bdb7106..58398f5 100644
+--- a/packages/experience-studio/src/lib/characterCreationWizard.ts
++++ b/packages/experience-studio/src/lib/characterCreationWizard.ts
+@@ -18,8 +18,24 @@ export function characterCreationAppearance(avatars: readonly AvatarSummary[], a
+ 	const clothes = wardrobe.avatarSet?.clothesIds ?? wardrobe.clothesIds ?? [];
+ 	const hair = hairIdsForCharacter(wardrobe.hairIds ?? [], avatar.ethnicity ?? 'european', avatar);
+ 	const brown = hair.find(id => hairColourOf(id) === 'darkbrown' || hairColourOf(id) === 'chestnut');
++	if (suggestedClothes && !clothes.includes(suggestedClothes)) {
++		console.warn(`[character create] avatar ${avatar.id} has no "${suggestedClothes}" outfit, so it starts in the white T-shirt`);
++	}
+ 	return {
+ 		clothes: clothes.includes(suggestedClothes) ? suggestedClothes : clothes.find(id => /^white[_ -]*t[_ -]*shirt(?:[_ -]|$)/i.test(id)) ?? '',
+ 		hair: hair.includes(suggestedHair) ? suggestedHair : brown ?? hair[0] ?? ''
+ 	};
+ }
++/** Puts the suggested outfits this avatar has first, captioned "Suggested for <role>"; the rest keep their order. */
++export function suggestedClothesFirst<T extends { readonly id: string; readonly kind?: string }>(
++	options: readonly T[], suggestedIds: readonly string[], role: string
++): readonly T[] {
++	const caption = role.trim() ? `Suggested for ${role.trim()}` : 'Suggested';
++	const suggested = [...new Set(suggestedIds)].flatMap(id => {
++		const option = options.find(row => row.id === id);
++		return option ? [{ ...option, kind: caption }] : [];
++	});
++	if (suggested.length === 0) return options;
++	const shown = new Set(suggested.map(row => row.id));
++	return [...suggested, ...options.filter(row => !shown.has(row.id))];
++}
+diff --git a/packages/experience-studio/src/lib/client.ts b/packages/experience-studio/src/lib/client.ts
+index 9f11dc2..0b5dd82 100644
+--- a/packages/experience-studio/src/lib/client.ts
++++ b/packages/experience-studio/src/lib/client.ts
+@@ -32,6 +32,8 @@ export type GeneratedExperienceSetupDetails = {
+ 	readonly characterAge: 8 | 16 | 25 | 35 | 50 | 70;
+ 	readonly characterEthnicity: string;
+  readonly characterClothesId?: string;
++	/** Up to three more outfits that suit the character, best first. */
++	readonly suggestedClothesIds?: readonly string[];
+  readonly characterHairId?: string;
+ 	readonly characterPersonality: string;
+ 	readonly characterInstructions: string;
+diff --git a/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts b/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts
+index 26a1f68..04e5e82 100644
+--- a/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts
++++ b/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts
+@@ -90,5 +90,26 @@ describe('mergeGeneratedExperienceSetupDraft', () => {
+ 		expect(next.suggestedSets).toEqual([]);
+ 		expect(next.setPickedByAuthor).toBe(true);
+ 	});
++
++	it('carries the suggested outfits unless the author changed the look', () => {
++		const first = mergeGeneratedExperienceSetupDraft(null, 'Hotel roleplay', {
++			...generated,
++			characterClothesId: 'hotel_receptionist',
++			suggestedClothesIds: ['business_suit', 'blazer']
++		});
++		expect(first.suggestedClothesIds).toEqual(['business_suit', 'blazer']);
++
++		const touched: ExperienceSetupCreateDraft = {
++			...first,
++			kind: 'experienceSetup',
++			characterGenderTouched: true,
++			updatedAt: Date.now()
++		};
++		const next = mergeGeneratedExperienceSetupDraft(touched, 'Hotel roleplay', {
++			...generated,
++			suggestedClothesIds: ['chef']
++		});
++		expect(next.suggestedClothesIds).toEqual(['business_suit', 'blazer']);
++	});
+ });
+ 
+diff --git a/packages/experience-studio/src/lib/experienceSetupGeneration.ts b/packages/experience-studio/src/lib/experienceSetupGeneration.ts
+index 842f850..ba8165d 100644
+--- a/packages/experience-studio/src/lib/experienceSetupGeneration.ts
++++ b/packages/experience-studio/src/lib/experienceSetupGeneration.ts
+@@ -14,6 +14,7 @@ const EMPTY_SETUP_DRAFT: SetupDraftInput = {
+ 	characterAge: null,
+ 	characterEthnicity: '',
+  characterClothesId: '',
++	suggestedClothesIds: [],
+  characterHairId: '',
+ 	characterPersonality: '',
+ 	characterInstructions: '',
+@@ -66,6 +67,9 @@ export function mergeGeneratedExperienceSetupDraft(
+ 			? current.characterEthnicity
+ 			: generated.characterEthnicity,
+  characterClothesId: current.characterGenderTouched ? current.characterClothesId : generated.characterClothesId ?? '',
++		suggestedClothesIds: current.characterGenderTouched
++			? (current.suggestedClothesIds ?? [])
++			: (generated.suggestedClothesIds ?? []),
+  characterHairId: current.characterGenderTouched ? current.characterHairId : generated.characterHairId ?? '',
+ 		characterPersonality: current.characterPersonalityTouched
+ 			? current.characterPersonality
+diff --git a/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts b/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts
+index e15769d..0f828a0 100644
+--- a/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts
++++ b/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts
+@@ -153,8 +153,8 @@ describe('parse + round-trip', () => {
+  });
+ 
+  it('keeps generated wardrobe defaults in the experience draft', () => {
+-  writeExperienceSetupCreateDraft('wardrobe-test', { creationBrief: 'A doctor', title: 'Check-in', description: '', introduction: '', characterClothesId: 'doctor', characterHairId: 'bob-brown.1' });
+-  expect(readExperienceSetupCreateDraft('wardrobe-test')).toMatchObject({ characterClothesId: 'doctor', characterHairId: 'bob-brown.1' });
++  writeExperienceSetupCreateDraft('wardrobe-test', { creationBrief: 'A doctor', title: 'Check-in', description: '', introduction: '', characterClothesId: 'doctor', suggestedClothesIds: ['nurse', 'surgeon'], characterHairId: 'bob-brown.1' });
++  expect(readExperienceSetupCreateDraft('wardrobe-test')).toMatchObject({ characterClothesId: 'doctor', suggestedClothesIds: ['nurse', 'surgeon'], characterHairId: 'bob-brown.1' });
+  });
+ 
+ });
+@@ -185,5 +185,15 @@ describe('experience setup draft suggested sets', () => {
+ 		expect(parsed?.setPickedByAuthor).toBe(true);
+ 		expect(parseExperienceSetupCreateDraft({ creationBrief: 'x', updatedAt: Date.now() })?.suggestedSets).toEqual([]);
+ 	});
++
++	it('keeps up to three suggested outfit ids', () => {
++		const parsed = parseExperienceSetupCreateDraft({
++			creationBrief: 'Hospital',
++			suggestedClothesIds: ['nurse', '', 7, 'surgeon', 'porter', 'chef'],
++			updatedAt: Date.now()
++		});
++		expect(parsed?.suggestedClothesIds).toEqual(['nurse', 'surgeon', 'porter']);
++		expect(parseExperienceSetupCreateDraft({ creationBrief: 'x', updatedAt: Date.now() })?.suggestedClothesIds).toEqual([]);
++	});
+ });
+ 
+diff --git a/packages/experience-studio/src/lib/studioCreateDraftStorage.ts b/packages/experience-studio/src/lib/studioCreateDraftStorage.ts
+index 4472dbf..0aa043c 100644
+--- a/packages/experience-studio/src/lib/studioCreateDraftStorage.ts
++++ b/packages/experience-studio/src/lib/studioCreateDraftStorage.ts
+@@ -22,6 +22,8 @@ export type ExperienceSetupCreateDraft = {
+ 	readonly characterAge: number | null;
+ 	readonly characterEthnicity: string;
+  readonly characterClothesId?: string;
++	/** More outfits the generator suggested for the character, best first. */
++	readonly suggestedClothesIds?: readonly string[];
+  readonly characterHairId?: string;
+ 	readonly characterPersonality: string;
+ 	readonly characterInstructions: string;
+@@ -124,6 +126,14 @@ function suggestedSetsFrom(value: unknown): SuggestedSetupSet[] {
+ 		.slice(0, 3);
+ }
+ 
++function clothesIdsFrom(value: unknown): string[] {
++	if (!Array.isArray(value)) return [];
++	return value
++		.filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
++		.map((id) => clip(id, 200))
++		.slice(0, 3);
++}
++
+ function isFresh(updatedAt: number, now = Date.now()): boolean {
+ 	return Number.isFinite(updatedAt) && now - updatedAt <= STUDIO_CREATE_DRAFT_TTL_MS;
+ }
+@@ -147,6 +157,7 @@ export function parseExperienceSetupCreateDraft(value: unknown): ExperienceSetup
+ 				? row.characterAge
+ 				: null,
+ 		characterClothesId: typeof row.characterClothesId === 'string' ? clip(row.characterClothesId, 200) : '',
++		suggestedClothesIds: clothesIdsFrom(row.suggestedClothesIds),
+ 		characterHairId: typeof row.characterHairId === 'string' ? clip(row.characterHairId, 200) : '',
+ 		characterEthnicity:
+ 			typeof row.characterEthnicity === 'string' ? clip(row.characterEthnicity, 64) : '',
+@@ -313,6 +324,7 @@ export function writeExperienceSetupCreateDraft(
+ 				: null,
+ 		characterEthnicity: clip(draft.characterEthnicity ?? '', 64),
+  characterClothesId: clip(draft.characterClothesId ?? '', 200),
++		suggestedClothesIds: clothesIdsFrom(draft.suggestedClothesIds),
+  characterHairId: clip(draft.characterHairId ?? '', 200),
+ 		characterPersonality: clip(draft.characterPersonality ?? '', 2500),
+ 		characterInstructions: clip(draft.characterInstructions ?? '', 5000),
+diff --git a/src/lib/components/CharacterAppearanceStage.svelte b/src/lib/components/CharacterAppearanceStage.svelte
+index 521e852..27976ea 100644
+--- a/src/lib/components/CharacterAppearanceStage.svelte
++++ b/src/lib/components/CharacterAppearanceStage.svelte
+@@ -5,6 +5,7 @@
+ <script lang="ts">
+ 	import type { Snippet } from 'svelte';
+ 	import { characterWearingContext } from '../../../packages/experience-studio/src/lib/characterWearingContext';
++	import { suggestedClothesFirst } from '../../../packages/experience-studio/src/lib/characterCreationWizard';
+ 	import StudioAvatarPreview from '../../../packages/experience-studio/src/components/StudioAvatarPreview.svelte';
+ 	import { SvelteSet } from 'svelte/reactivity';
+ 	import { CharacterEthnicityTryOn } from '#lib/avatarSetClothes/characterEthnicityTryOn.svelte.js';
+@@ -133,7 +134,9 @@
+  guidedStep = null,
+  onGuidedSelect,
+  hideControls = false,
+- thumbnailOnly = false
++ thumbnailOnly = false,
++		suggestedClothesIds = [],
++		suggestedClothesFor = ''
+ 	}: {
+ 		avatarId?: string;
+ 		thumbnailPath?: string;
+@@ -169,6 +172,10 @@
+  onGuidedSelect?: () => void;
+  hideControls?: boolean;
+  thumbnailOnly?: boolean;
++		/** Outfits the setup generator suggested, best first; listed first in the clothes chooser. */
++		suggestedClothesIds?: readonly string[];
++		/** The character role the suggested outfits are captioned with. */
++		suggestedClothesFor?: string;
+ 	} = $props();
+ 
+ 	let clothesPickerOpen = $state(false);
+@@ -484,8 +491,11 @@
+ 		const listed = tryOn.clothesOptions(baseClothesOptions, clothesChooserVisible).filter(
+ 			(row) => !isWholeCostumeOptionId(row.id)
+ 		);
+-		if (listed.length > 0) return listed;
+-		return baseClothesOptions;
++		return suggestedClothesFirst(
++			listed.length > 0 ? listed : baseClothesOptions,
++			suggestedClothesIds,
++			suggestedClothesFor
++		);
+ 	});
+ 	const offeredHairIds = $derived([
+ 		...new Set([
+-- 
+2.50.1 (Apple Git-155)
+

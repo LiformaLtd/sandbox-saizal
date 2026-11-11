@@ -1,0 +1,85 @@
+diff --git a/src/lib/runtime/morph-engine/animate/render/webgpu/irisGpuLayers.ts b/src/lib/runtime/morph-engine/animate/render/webgpu/irisGpuLayers.ts
+index 848d1f6..0c09b8a 100644
+--- a/src/lib/runtime/morph-engine/animate/render/webgpu/irisGpuLayers.ts
++++ b/src/lib/runtime/morph-engine/animate/render/webgpu/irisGpuLayers.ts
+@@ -553,6 +553,50 @@ export function earClipClosedLoop(pts: readonly Point2D[], out: number[]): boole
+ 	return true;
+ }
+ 
++/**
++ * Lid-to-lid strips across the eye hole (2026-11-03): point i of the first half (one lid) joined to point n - i of the
++ * second half (the other lid), corner to corner, so every triangle spans the hole from lid to lid and stays short along
++ * it. Ear clipping cut the hole into a fan of long thin triangles all ending at the inner corner; whatever is laid on
++ * them (the corner patch, the white's shading) is stretched a little differently in each, which showed as a straight
++ * sharp cut through the inner corner. Expects the eyelid draw order (corners at 0 and n/2, as
++ * {@link triangulateUpperLidShadow}). False when n is odd or a strip folds over (a lid crossing the other mid-blink);
++ * the caller then ear-clips.
++ */
++export function lidStripTris(pts: readonly Point2D[], out: number[]): boolean {
++	out.length = 0;
++	const n = pts.length;
++	if (n < 4 || n % 2 !== 0) return false;
++	let area2 = 0;
++	for (let k = 0; k < n; k++) {
++		const p = pts[k]!;
++		const q = pts[(k + 1) % n]!;
++		area2 += p.x * q.y - q.x * p.y;
++	}
++	if (Math.abs(area2) < 1e-9) return false;
++	const orient = area2 > 0 ? 1 : -1;
++	const push = (a: number, b: number, c: number): boolean => {
++		const pa = pts[a]!;
++		const pb = pts[b]!;
++		const pc = pts[c]!;
++		if (((pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x)) * orient < -1e-9) return false;
++		out.push(a, b, c);
++		return true;
++	};
++	const h = n / 2;
++	for (let k = 0; k < h; k++) {
++		const a = k;
++		const b = k + 1;
++		const c = (n - k - 1) % n;
++		const d = (n - k) % n;
++		const ok = a === d ? push(a, b, c) : b === c ? push(a, b, d) : push(a, b, c) && push(a, c, d);
++		if (!ok) {
++			out.length = 0;
++			return false;
++		}
++	}
++	return true;
++}
++
+ /**
+  * Lid cut ({@link innerEyeLidCutForPicture}): fill the eyelid loop exactly, opaque inside and fading to clear on the lid
+  * line over `softEdgePx`, so the face's own lid line and lashes are never painted over.
+@@ -569,11 +613,11 @@ export function triangulateLidCutEye(
+ 	if (n < 3) return floatOffset;
+ 	const inner = insetClosedLidLoop(lidLoop, softEdgePx);
+ 	let i = floatOffset;
+-	// Inside the soft edge: ear clipping (never overlaps). If the inner ring cannot be clipped, fill the outline itself
+-	// with a hard edge; if the outline crosses itself too (closing lids mid-blink), a centre fan, which for this normal
+-	// (not darkening) layer only paints the same eyeball twice.
++	// Inside the soft edge: lid-to-lid strips (lidStripTris), else ear clipping (never overlaps). If the inner ring
++	// cannot be clipped, fill the outline itself with a hard edge; if the outline crosses itself too (closing lids
++	// mid-blink), a centre fan, which for this normal (not darkening) layer only paints the same eyeball twice.
+ 	const tris = lidCutInnerTris;
+-	if (!earClipClosedLoop(inner, tris)) {
++	if (!(n === lidLoopIn.length && lidStripTris(inner, tris)) && !earClipClosedLoop(inner, tris)) {
+ 		if (earClipClosedLoop(lidLoop, tris)) {
+ 			for (let t = 0; t + 2 < tris.length; t += 3) {
+ 				i = pushTriFloatsPerCornerAlpha(out, i, lidLoop[tris[t]!]!, 1, lidLoop[tris[t + 1]!]!, 1, lidLoop[tris[t + 2]!]!, 1, uvFor);
+@@ -740,10 +784,10 @@ export function triangulateLidCutShade(
+ 	}
+ 	const a = Math.max(0, Math.min(1, strength));
+ 	let i = floatOffset;
+-	// Same inside triangles as triangulateLidCutEye (ear clipping of the same inner ring): with a darkening blend an
+-	// overlap would darken twice and show as a dark line.
++	// Same inside triangles as triangulateLidCutEye (strips, else ear clipping, of the same inner ring): with a darkening
++	// blend an overlap would darken twice and show as a dark line.
+ 	const tris = lidCutInnerTris;
+-	if (!earClipClosedLoop(inner, tris)) {
++	if (!(n === lidLoopIn.length && lidStripTris(inner, tris)) && !earClipClosedLoop(inner, tris)) {
+ 		// Same fallback as triangulateLidCutEye: hard-edged fill of the outline itself, never a centre fan.
+ 		if (!earClipClosedLoop(lidLoop, tris)) return i;
+ 		for (let t = 0; t + 2 < tris.length; t += 3) {

@@ -1,0 +1,81 @@
+From 80b2f059eadf61272a05fbf3dd1132a13c50b371 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 17:10:24 +0100
+Subject: [PATCH 6/6] Clothes picker: the pointing hint is an action, so the
+ tile wrapper needs no ARIA role.
+
+svelte-check warned (a11y_no_static_element_interactions) on the pointer handlers added to the tile wrapper in 1c03266. The
+hint prepares a tile and is not an interaction of its own, so it is attached the same way as the visibility watch
+(use:hoverTile), with the same pointer and focus events and a cleanup.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../fields/AppearanceIdPicker.svelte          | 43 ++++++++++++-------
+ 1 file changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+index 097db2d..ca2ad81 100644
+--- a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
++++ b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+@@ -128,16 +128,34 @@
+ 	}
+ 
+ 	let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+-	function hoverStart(id: string) {
+-		if (!onOptionHover) return;
+-		clearTimeout(hoverTimer);
+-		hoverTimer = setTimeout(() => onOptionHover?.(id), 120);
+-	}
+-	function hoverEnd() {
+-		clearTimeout(hoverTimer);
+-	}
+ 	$effect(() => () => clearTimeout(hoverTimer));
+ 
++	/** Reports the pointer (or focus) resting on a tile for 120 ms: a hint to prepare it, not an action of its own. */
++	function hoverTile(node: HTMLElement, id: string) {
++		let current = id;
++		const start = () => {
++			if (!onOptionHover) return;
++			clearTimeout(hoverTimer);
++			hoverTimer = setTimeout(() => onOptionHover?.(current), 120);
++		};
++		const end = () => clearTimeout(hoverTimer);
++		node.addEventListener('pointerenter', start);
++		node.addEventListener('pointerleave', end);
++		node.addEventListener('focusin', start);
++		node.addEventListener('focusout', end);
++		return {
++			update(next: string) {
++				current = next;
++			},
++			destroy() {
++				node.removeEventListener('pointerenter', start);
++				node.removeEventListener('pointerleave', end);
++				node.removeEventListener('focusin', start);
++				node.removeEventListener('focusout', end);
++			}
++		};
++	}
++
+ 	function observeTile(node: HTMLElement, key: string) {
+ 		if (!onOptionVisible) return;
+ 		const observer = new IntersectionObserver(
+@@ -497,14 +515,7 @@
+ 						Select
+ 					</button>
+ 				{/snippet}
+-				<div
+-					class="tile-watch"
+-					use:observeTile={option.key ?? option.id}
+-					onpointerenter={() => hoverStart(option.id)}
+-					onpointerleave={hoverEnd}
+-					onfocusin={() => hoverStart(option.id)}
+-					onfocusout={hoverEnd}
+-				>
++				<div class="tile-watch" use:observeTile={option.key ?? option.id} use:hoverTile={option.id}>
+ 				<LibraryGridCard
+ 					as="article"
+ 					label={optionLabel}
+-- 
+2.50.1 (Apple Git-155)
+

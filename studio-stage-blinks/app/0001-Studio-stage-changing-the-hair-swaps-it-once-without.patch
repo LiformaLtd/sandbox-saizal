@@ -1,0 +1,182 @@
+From fd558bf46bb2d414f9029a84e02b6ed8309bc47f Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:21:46 +0100
+Subject: [PATCH 1/6] Studio stage: changing the hair swaps it once, without
+ reloading the outfit.
+
+Picking a hair rebuilt the whole stage picture: the outfit and hair images were keyed on the hair URL, so a hair change threw
+the outfit away and loaded it again (a frame with only the hair showing on staging), then both swapped a second time to the
+contact-shadow pair; a plate hairstyle also dropped the hair while it was being made.
+
+- ExperiencePreview: the layer images are keyed on the outfit only. When the pair changes, the previous settled pair stays
+  on screen until the new one is ready (contact shadow made, both decoded), then both swap at once; at most 4 s.
+- Character page: while a newly picked plate hairstyle is being made, the stage keeps the hair it shows
+  (CharacterPlateHair.stageImageFor), on the normal and the ethnicity try-on stage.
+
+Checked in the local Studio: a hair change is one swap after ~0.3 s, nothing removed or reloaded, also with an ethnicity
+outfit on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/components/ExperiencePreview.svelte   | 53 +++++++++++++++----
+ .../hairPlates/characterPlateHair.svelte.ts   | 13 +++++
+ .../characters/[charId]/+page.svelte          |  4 +-
+ 3 files changed, 59 insertions(+), 11 deletions(-)
+
+diff --git a/packages/experience-studio/src/components/ExperiencePreview.svelte b/packages/experience-studio/src/components/ExperiencePreview.svelte
+index f84c874..0218542 100644
+--- a/packages/experience-studio/src/components/ExperiencePreview.svelte
++++ b/packages/experience-studio/src/components/ExperiencePreview.svelte
+@@ -105,9 +105,8 @@
+ 	);
+ 
+ 	const layered = $derived(avatarCompositePreview);
+-	const layerKey = $derived(
+-		layered ? `${layered.clothesUrl}|${layered.hairUrl}` : (avatarImage ?? '')
+-	);
++	/** Longest the previous clothes + hair pair stays on screen while a new pair is prepared. */
++	const PAIR_HOLD_MS = 4000;
+ 
+ 	let viewportW = $state(0);
+ 	let viewportH = $state(0);
+@@ -134,6 +133,12 @@
+ 	let contactClothesUrl = $state('');
+ 	let contactHairUrl = $state('');
+ 	let contactSourceKey = $state('');
++	/**
++	 * The settled clothes + hair pair last on screen. When the hair or outfit changes, this pair stays while the new one is
++	 * prepared (contact shadow made, both decoded), then the new pair replaces it at once: changing the hair no longer reloads
++	 * the outfit or blanks the character (2026-10-22).
++	 */
++	let shownPair = $state<{ clothes: string; hair: string } | null>(null);
+ 
+ 	const parallaxEnabled = $derived(parallax !== false && !reduceMotion);
+ 	const parallaxActive = $derived(parallaxEnabled && hovering);
+@@ -185,14 +190,29 @@
+ 	 * Prefer contact-shadow plates once ready for this sized pair. Never keep a previous
+ 	 * outfit's blob while the sized CDN URLs have already moved on.
+ 	 */
++	const pairSettled = $derived(contactSourceKey === sizedContactKey);
++	/** The previous pair is still on screen while the new one is prepared (already decoded: nothing reloads or blanks). */
++	const holdingPair = $derived(
++		!pairSettled && shownPair !== null && Boolean(sizedClothesUrl) && Boolean(sizedHairUrl)
++	);
+ 	const displayClothesUrl = $derived(
+-		contactSourceKey === sizedContactKey && contactClothesUrl ? contactClothesUrl : sizedClothesUrl
++		pairSettled && contactClothesUrl
++			? contactClothesUrl
++			: holdingPair
++				? (shownPair?.clothes ?? sizedClothesUrl)
++				: sizedClothesUrl
+ 	);
+ 	const displayHairUrl = $derived(
+-		contactSourceKey === sizedContactKey && contactHairUrl ? contactHairUrl : sizedHairUrl
++		pairSettled && contactHairUrl
++			? contactHairUrl
++			: holdingPair
++				? (shownPair?.hair ?? sizedHairUrl)
++				: sizedHairUrl
+ 	);
+-	const clothesReady = $derived(Boolean(sizedClothesUrl) && clothesReadyFor === sizedClothesUrl);
+-	const hairReady = $derived(Boolean(sizedHairUrl) && hairReadyFor === sizedHairUrl);
++	const clothesReady = $derived(
++		holdingPair || (Boolean(sizedClothesUrl) && clothesReadyFor === sizedClothesUrl)
++	);
++	const hairReady = $derived(holdingPair || (Boolean(sizedHairUrl) && hairReadyFor === sizedHairUrl));
+ 	const backgroundChain = $derived.by(() => {
+ 		if (emptySetBackdrop) {
+ 			if (avifOk == null) return [];
+@@ -265,19 +285,33 @@
+ 		const hair = sizedHairUrl;
+ 		const key = `${clothes}|${hair}`;
+ 		// A failed canvas read leaves the original plates on screen.
+-		if (!clothes || !hair) return;
++		if (!clothes || !hair) {
++			// No pair (bald, or no clothes layer): nothing to keep showing when a hair is picked again.
++			shownPair = null;
++			return;
++		}
+ 		let cancelled = false;
+ 		void hairContactPlates(clothes, hair).then((plates) => {
+ 			if (cancelled) return;
+ 			contactClothesUrl = plates.clothesUrl ?? '';
+ 			contactHairUrl = plates.hairUrl ?? '';
+ 			contactSourceKey = key;
++			shownPair = { clothes: plates.clothesUrl ?? clothes, hair: plates.hairUrl ?? hair };
+ 			// In-place src swap must not leave ready false (attach was keyed on the CDN URL).
+ 			if (plates.clothesUrl) clothesReadyFor = clothes;
+ 			if (plates.hairUrl) hairReadyFor = hair;
+ 		});
++		// The previous pair is never held longer than this: then the new plates show as they load.
++		const giveUp = setTimeout(() => {
++			if (cancelled || contactSourceKey === key) return;
++			contactClothesUrl = '';
++			contactHairUrl = '';
++			contactSourceKey = key;
++			shownPair = { clothes, hair };
++		}, PAIR_HOLD_MS);
+ 		return () => {
+ 			cancelled = true;
++			clearTimeout(giveUp);
+ 		};
+ 	});
+ 
+@@ -536,7 +570,8 @@
+ 					{/key}
+ 				{/snippet}
+ 			{#if layered && sizedClothesUrl}
+-				{#key `${layerKey}|${sizedClothesUrl}|${sizedHairUrl}`}
++				<!-- Keyed on the outfit only: a hair change swaps the hair (and its shadow) in these same images, it never reloads the outfit. -->
++				{#key sizedClothesUrl}
+ 					<img
+ 						class="preview-avatar preview-avatar-clothes"
+ 						src={displayClothesUrl}
+diff --git a/src/lib/hairPlates/characterPlateHair.svelte.ts b/src/lib/hairPlates/characterPlateHair.svelte.ts
+index 80d8115..3de961b 100644
+--- a/src/lib/hairPlates/characterPlateHair.svelte.ts
++++ b/src/lib/hairPlates/characterPlateHair.svelte.ts
+@@ -62,6 +62,19 @@ export class CharacterPlateHair {
+ 		return '';
+ 	}
+ 
++	/** The hair last put on the stage (not reactive: stageImageFor only remembers it). */
++	#onStage = { avatarId: '', url: '' };
++
++	/** imageFor at 1024 for the stage, which never drops the hair it shows: while a newly picked plate hairstyle is being made, the
++	 * hair already on the stage for this avatar stays, so the stage swaps the hair once (2026-10-22). `shownUrl` is the stage's
++	 * picture of a catalogue hair (remembered the same way). null = a catalogue hair. */
++	stageImageFor(avatarId: string, hairId: string, shownUrl = ''): string | null {
++		const made = this.imageFor(avatarId, hairId, 1024);
++		const url = made === null ? shownUrl : made || (this.#onStage.avatarId === avatarId ? this.#onStage.url : '');
++		if (url) this.#onStage = { avatarId, url };
++		return made === null ? null : url;
++	}
++
+ 	/** Let go of the made pictures (page closed). */
+ 	dispose() {
+ 		for (const url of this.#images.values()) if (url && url !== 'x') URL.revokeObjectURL(url);
+diff --git a/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte b/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
+index 7790780..12c71a7 100644
+--- a/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
++++ b/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
+@@ -658,7 +658,7 @@
+ 				libraryCostumes = rows;
+ 			});
+ 		},
+-		madeHairUrl: (avatarId, hairId) => plateHair.imageFor(avatarId, hairId, 1024)
++		madeHairUrl: (avatarId, hairId) => plateHair.stageImageFor(avatarId, hairId)
+ 	});
+ 	/** Hair is only editable over a clothes layer, not a whole costume. */
+ 	const hairChangeEnabled = $derived(Boolean(resolvedClothes(editAppearance)));
+@@ -890,7 +890,7 @@
+ 	 * this browser ('' while it is being made: the clothes alone). */
+ 	const previewScene = $derived.by(() => {
+ 		const layers = catalogueScene.avatarCompositePreview;
+-		const made = layers ? plateHair.imageFor(editAvatarId, hairId, 1024) : null;
++		const made = layers ? plateHair.stageImageFor(editAvatarId, hairId, layers.hairUrl) : null;
+ 		return layers && made !== null
+ 			? { ...catalogueScene, avatarCompositePreview: { ...layers, hairUrl: made } }
+ 			: catalogueScene;
+-- 
+2.50.1 (Apple Git-155)
+

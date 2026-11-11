@@ -1,0 +1,188 @@
+From 4464d9ee7eaeb92fab958143949ac972f2ab6d29 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:33:05 +0100
+Subject: [PATCH 2/6] Studio stage: no blink when changing hair; the last drawn
+ look stays until the new one is drawn.
+
+The hair swap still blinked in two ways: a swapped-in picture could paint empty while it decoded, and a first hair on a bald
+character (one picture -> clothes + hair layers, and back for Bald) hid the character and faded it back in.
+
+- The new clothes + hair pair is decoded off screen before it replaces the old one.
+- The stage keeps the look it last drew, out of sight and already loaded; while a new look is still loading, that look is
+  shown on top and the new pictures wait hidden, then take over in one frame with no fade (at most 4 s). A look counts as
+  drawn only once each of its pictures has loaded. The first appearance of a page still fades in as before.
+
+Checked in the local Studio frame by frame (bald -> hair, hair -> hair, hair -> Bald, Bald -> hair): every frame shows a
+loaded picture, never hidden or blank; each change is one swap after 0.1-0.3 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/components/ExperiencePreview.svelte   | 84 +++++++++++++++++--
+ 1 file changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/packages/experience-studio/src/components/ExperiencePreview.svelte b/packages/experience-studio/src/components/ExperiencePreview.svelte
+index 0218542..1e4fd6c 100644
+--- a/packages/experience-studio/src/components/ExperiencePreview.svelte
++++ b/packages/experience-studio/src/components/ExperiencePreview.svelte
+@@ -1,4 +1,5 @@
+ <script lang="ts">
++	import { untrack } from 'svelte';
+ 	import type { Attachment } from 'svelte/attachments';
+ 	import { attachImageReady } from '@liforma/client/thumbnail';
+ 
+@@ -129,6 +130,8 @@
+ 	/** Hair plate failed every fallback. Show the clothes plate (it already has the face) anyway. */
+ 	let hairBlocked = $state(false);
+ 	let avatarReady = $state(false);
++	/** The single picture URL that finished loading (avatarReady can lag a frame behind a URL change). */
++	let avatarDrawnFor = $state('');
+ 	/** Contact-shadow blobs; only used when `contactSourceKey` matches the current sized pair. */
+ 	let contactClothesUrl = $state('');
+ 	let contactHairUrl = $state('');
+@@ -261,7 +264,44 @@
+ 		avatarReady
+ 	});
+ 	const sceneRevealed = $derived(studioPreviewSceneRevealed(revealInput));
+-	const subjectRevealed = $derived(studioPreviewSubjectRevealed(revealInput));
++	/** The look asked for is drawn. */
++	const lookDrawn = $derived(studioPreviewSubjectRevealed(revealInput));
++	/**
++	 * The look the stage last drew in full (picture sources, bottom to top). When the stage changes how it draws the character
++	 * (one picture <-> clothes + hair layers: a first hair, Bald, another face), this look stays on top until the new one is
++	 * drawn, instead of the character fading out and back in; at most PAIR_HOLD_MS (2026-10-22).
++	 */
++	let drawnLook = $state<string[]>([]);
++	let lookHoldTimedOut = $state(false);
++	const waitingForLook = $derived(!lookDrawn && drawnLook.length > 0 && Boolean(layered || avatarImage));
++	const holdingLook = $derived(waitingForLook && !lookHoldTimedOut);
++	const subjectRevealed = $derived(lookDrawn || holdingLook);
++	/** The pictures on screen now, only when each is known to be drawn (null while any is still loading). */
++	const drawnNow = $derived.by((): string[] | null => {
++		if (layered && sizedClothesUrl) {
++			if (holdingPair && shownPair) return [shownPair.clothes, shownPair.hair];
++			if (clothesReadyFor !== sizedClothesUrl) return null;
++			if (sizedHairUrl && hairReadyFor !== sizedHairUrl) return null;
++			return [displayClothesUrl, ...(sizedHairUrl ? [displayHairUrl] : [])];
++		}
++		return sizedAvatarImage && avatarDrawnFor === sizedAvatarImage ? [sizedAvatarImage] : null;
++	});
++	$effect(() => {
++		if (!layered && !avatarImage) {
++			drawnLook = [];
++			return;
++		}
++		const now = drawnNow;
++		if (now && now.join('|') !== untrack(() => drawnLook).join('|')) drawnLook = now;
++	});
++	$effect(() => {
++		if (!waitingForLook) {
++			lookHoldTimedOut = false;
++			return;
++		}
++		const timer = setTimeout(() => (lookHoldTimedOut = true), PAIR_HOLD_MS);
++		return () => clearTimeout(timer);
++	});
+ 
+ 	$effect(() => {
+ 		void displayBackground;
+@@ -291,7 +331,10 @@
+ 			return;
+ 		}
+ 		let cancelled = false;
+-		void hairContactPlates(clothes, hair).then((plates) => {
++		void hairContactPlates(clothes, hair).then(async (plates) => {
++			if (cancelled) return;
++			// Decode both before they replace the pair on screen: a swapped-in picture still decoding paints as a blink.
++			await Promise.all([decodedImage(plates.clothesUrl ?? clothes), decodedImage(plates.hairUrl ?? hair)]);
+ 			if (cancelled) return;
+ 			contactClothesUrl = plates.clothesUrl ?? '';
+ 			contactHairUrl = plates.hairUrl ?? '';
+@@ -447,6 +490,13 @@
+ 		return (element) => attachImageReady(element, () => onReady(expectedSrc));
+ 	}
+ 
++	/** Loads and decodes a picture off screen, so the stage image that takes it next draws it in the same frame. Never rejects. */
++	function decodedImage(src: string): Promise<void> {
++		const image = new Image();
++		image.src = src;
++		return image.decode().catch(() => undefined);
++	}
++
+ 	function nextAvatarSrc(img: HTMLImageElement, chain: readonly string[]): string | null {
+ 		const current = img.currentSrc || img.src;
+ 		const next =
+@@ -549,7 +599,7 @@
+ 
+ 	{#if layered || avatarImage}
+ 		<div class="preview-avatar-stage">
+-			<div class="preview-avatar-inner" style:transform={stageTransform}>
++			<div class="preview-avatar-inner" class:holding-look={holdingLook} style:transform={stageTransform}>
+ 				{#snippet eyesImg()}
+ 					<!-- LOCAL DEV: the eye-colour layer, over the body/clothes and under the hair; it waits for the picture under it. -->
+ 					{#key sizedEyesUrl}
+@@ -648,7 +698,10 @@
+ 						alt=""
+ 						decoding="async"
+ 						{@attach imageReadyAttachment(sizedAvatarImage, (src) => {
+-							if (src === sizedAvatarImage) avatarReady = true;
++							if (src === sizedAvatarImage) {
++								avatarReady = true;
++								avatarDrawnFor = src;
++							}
+ 						})}
+ 						onerror={(event) => {
+ 							const img = event.currentTarget as HTMLImageElement;
+@@ -662,6 +715,10 @@
+ 				{/key}
+ 				{#if sizedEyesUrl}{@render eyesImg()}{/if}
+ 			{/if}
++			<!-- The look last drawn, kept loaded out of sight; shown on top while a new look is not drawn yet (which is hidden meanwhile). -->
++			{#each drawnLook as src (src)}
++				<img class="preview-avatar preview-avatar-held" {src} alt="" />
++			{/each}
+ 			</div>
+ 		</div>
+ 	{/if}
+@@ -969,7 +1026,8 @@
+ 
+ 	.preview-avatar-clothes,
+ 	.preview-avatar-eyes,
+-	.preview-avatar-hair {
++	.preview-avatar-hair,
++	.preview-avatar-held {
+ 		position: absolute;
+ 		inset: 0;
+ 	}
+@@ -978,6 +1036,17 @@
+ 		visibility: hidden;
+ 	}
+ 
++	/* The last drawn look waits out of sight. While it is held on top, the new pictures load out of sight instead (no fade when
++	   they take over). */
++	.preview-avatar-held,
++	.holding-look .preview-avatar:not(.preview-avatar-held) {
++		visibility: hidden;
++	}
++
++	.holding-look .preview-avatar-held {
++		visibility: visible;
++	}
++
+ 	.experience-preview.fill-host .preview-avatar-clothes,
+ 	.experience-preview.fill-host .preview-avatar-eyes,
+ 	.experience-preview.fill-host .preview-avatar-hair,
+@@ -986,7 +1055,10 @@
+ 	.experience-preview.character .preview-avatar-hair,
+ 	.experience-preview.appearance .preview-avatar-clothes,
+ 	.experience-preview.appearance .preview-avatar-eyes,
+-	.experience-preview.appearance .preview-avatar-hair {
++	.experience-preview.appearance .preview-avatar-hair,
++	.experience-preview.fill-host .preview-avatar-held,
++	.experience-preview.character .preview-avatar-held,
++	.experience-preview.appearance .preview-avatar-held {
+ 		inset: auto;
+ 		left: 50%;
+ 		bottom: 0;
+-- 
+2.50.1 (Apple Git-155)
+

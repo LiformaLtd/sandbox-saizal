@@ -1,0 +1,1658 @@
+From 26813e6d1f757063f110e0bb20f13239bd299994 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:38:44 +0000
+Subject: [PATCH] Neck fit for ethnicity outfit plates (catalogue outfits,
+ mixed ethnicities)
+
+The 28 Oct neck fit (neckFit.ts + neckFitJaw.ts) joins the avatar's head onto a catalogue
+outfit: the band round the jaw slides so cloth hugs the new chin, a bare neck stays put and
+the avatar's own neck is shaded to meet it. bakePlatePng uses it for a catalogue outfit on
+a mixed ethnicity when the set has a head shape (maker/head_shape.png); then the avatar's
+head+neck picture, the outfit's collar file, the outlines and the white-tee picture must all
+be there, and a missing one fails the bake with its key logged. Costumes, new outfits, the
+European/African seeds and sets without a head shape still use the maker.
+
+Per-set and per-avatar fit work is kept in memory; a failed load is not kept.
+New route internal/avatar-sets/[id]/fitted-plate serves the same bake for the Studio preview.
+
+Checked: the bake gives the same pixels as the 28 Oct pictures on 4 outfits x 8 ethnicities
+(women and men), 0 values differ.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib/server/catalog/avatarSets.ts          |   9 +
+ src/lib/server/catalog/headNeckPlate.test.ts  |  14 +
+ src/lib/server/catalog/headNeckPlate.ts       |  26 +
+ src/lib/server/catalog/neckFit.test.ts        | 131 +++
+ src/lib/server/catalog/neckFit.ts             | 750 ++++++++++++++++++
+ src/lib/server/catalog/neckFitJaw.ts          | 297 +++++++
+ .../resolveOrBakeAvatarSetClothes.test.ts     |  43 +-
+ .../catalog/resolveOrBakeAvatarSetClothes.ts  | 157 ++++
+ .../[avatarSetId]/fitted-plate/+server.ts     |  71 ++
+ 9 files changed, 1494 insertions(+), 4 deletions(-)
+ create mode 100644 src/lib/server/catalog/headNeckPlate.test.ts
+ create mode 100644 src/lib/server/catalog/headNeckPlate.ts
+ create mode 100644 src/lib/server/catalog/neckFit.test.ts
+ create mode 100644 src/lib/server/catalog/neckFit.ts
+ create mode 100644 src/lib/server/catalog/neckFitJaw.ts
+ create mode 100644 src/routes/internal/avatar-sets/[avatarSetId]/fitted-plate/+server.ts
+
+diff --git a/src/lib/server/catalog/avatarSets.ts b/src/lib/server/catalog/avatarSets.ts
+index 166488b..38251f2 100644
+--- a/src/lib/server/catalog/avatarSets.ts
++++ b/src/lib/server/catalog/avatarSets.ts
+@@ -167,6 +167,15 @@ export async function loadAvatarSetByAvatarIdMap(
+ 	return map;
+ }
+ 
++/** One avatar set by its id, or null. */
++export async function loadAvatarSetById(db: Db, avatarSetId: string): Promise<AvatarSetPayload | null> {
++	const row = await db.avatarSet.findUnique({
++		where: { id: avatarSetId },
++		include: { members: { orderBy: [{ ethnicity: 'asc' }, { switchTo: 'desc' }] } }
++	});
++	return row ? asPayload(row) : null;
++}
++
+ /** Ethnicity from the set for a member avatar, when present. */
+ export function ethnicityFromAvatarSet(
+ 	avatarSet: AvatarSetPayload | null | undefined,
+diff --git a/src/lib/server/catalog/headNeckPlate.test.ts b/src/lib/server/catalog/headNeckPlate.test.ts
+new file mode 100644
+index 0000000..c2a9af6
+--- /dev/null
++++ b/src/lib/server/catalog/headNeckPlate.test.ts
+@@ -0,0 +1,14 @@
++import { describe, expect, it } from 'vitest';
++
++import { keepAtSize } from './headNeckPlate';
++
++const SIZE = 256;
++
++describe('keepAtSize', () => {
++	it('scales the kept clothing to the plate size', () => {
++		const mask = keepAtSize([[440, 512, 520]], SIZE);
++		expect(mask[110 * SIZE + 128]).toBe(1);
++		expect(mask[110 * SIZE + 129]).toBe(1);
++		expect(mask[110 * SIZE + 130]).toBe(0);
++	});
++});
+diff --git a/src/lib/server/catalog/headNeckPlate.ts b/src/lib/server/catalog/headNeckPlate.ts
+new file mode 100644
+index 0000000..5dcca3b
+--- /dev/null
++++ b/src/lib/server/catalog/headNeckPlate.ts
+@@ -0,0 +1,26 @@
++// The outfit collar file the neck fit (neckFit.ts) reads, and the clothing it keeps by the jaw as a mask.
++
++/**
++ * One outfit's collar file (made once per outfit, shared by every ethnicity): `line` is the row where clothing starts
++ * under the chin, one per column (1024 = no clothing); `keep` lists the clothing over the old head as runs [y, x0, x1).
++ */
++export type OutfitCollar = {
++	readonly line: ArrayLike<number>;
++	readonly keep: ArrayLike<readonly [number, number, number]>;
++};
++
++const FRAME = 1024;
++
++/** The clothing kept over the old head, as a size×size mask. */
++export function keepAtSize(keep: OutfitCollar['keep'], size: number): Uint8Array {
++	const out = new Uint8Array(size * size);
++	const k = size / FRAME;
++	for (let r = 0; r < keep.length; r++) {
++		const [y, x0, x1] = keep[r];
++		const row = Math.min(size - 1, Math.floor(y * k));
++		const from = Math.floor(x0 * k);
++		const to = Math.min(size, Math.max(from + 1, Math.ceil(x1 * k)));
++		out.fill(1, row * size + from, row * size + to);
++	}
++	return out;
++}
+diff --git a/src/lib/server/catalog/neckFit.test.ts b/src/lib/server/catalog/neckFit.test.ts
+new file mode 100644
+index 0000000..4def90f
+--- /dev/null
++++ b/src/lib/server/catalog/neckFit.test.ts
+@@ -0,0 +1,131 @@
++import { describe, expect, it } from 'vitest';
++
++import type { FaceOutline } from './ethnicityPlateMaker';
++import { outfitJaws, prepareFitAvatar, prepareFitSeeds, stackFitPlate } from './neckFit';
++import { jawCut } from './neckFitJaw';
++
++const W = 1024;
++const N = W * W;
++
++/** The face-outline dots the fit reads, on an ellipse round (512, 300) (every other dot at 0, 0). */
++function outline(rx: number, ry: number): FaceOutline {
++	const dots: number[][] = Array.from({ length: 478 }, () => [0, 0, 0]);
++	// lower half of the face, under one ear round the chin to under the other, in picture order (left to right)
++	const jaw = [132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361];
++	jaw.forEach((id, j) => {
++		const a = Math.PI - (Math.PI * j) / (jaw.length - 1);
++		dots[id] = [512 + rx * Math.cos(a), 300 + ry * Math.sin(a), 0];
++	});
++	return { width: W, dots478: dots };
++}
++
++const inEllipse = (x: number, y: number, rx: number, ry: number) =>
++	((x + 0.5 - 512) / rx) ** 2 + ((y + 0.5 - 300) / ry) ** 2 <= 1;
++
++/** A bald head (face ellipse rx × ry), a 2 px shadow line under its chin, its neck, and below row `wearFrom` `wear`. */
++function person(
++	rx: number,
++	ry: number,
++	face: number[],
++	neck: number[],
++	wear: number[],
++	wearFrom: number
++): Uint8ClampedArray {
++	const out = new Uint8ClampedArray(N * 4);
++	for (let y = 150; y < 600; y++) {
++		for (let x = 380; x < 644; x++) {
++			const k = (y * W + x) * 4;
++			let rgb: number[] | null = null;
++			if (y >= wearFrom) rgb = wear;
++			else if (inEllipse(x, y, rx, ry)) rgb = face;
++			else if (inEllipse(x, y, rx + 2, ry + 2) && y > 300) rgb = [40, 28, 24];
++			else if (x >= 462 && x < 562 && y > 300) rgb = neck;
++			if (rgb) out.set([...rgb, 255], k);
++		}
++	}
++	return out;
++}
++
++const NAVY = [20, 30, 60];
++const TEE = [235, 235, 235];
++const MIX: [number, number, number] = [0.5, 0.5, 0.5];
++
++/** Seeds with chins at row 378 (ry 78); the avatar's chin at row 370 (ry 70), 8 px higher. */
++function scene() {
++	const lightFace = [230, 190, 160];
++	const darkFace = [110, 70, 50];
++	const lightNeck = [210, 170, 140];
++	const darkNeck = [100, 64, 46];
++	const base = person(90, 78, lightFace, lightNeck, TEE, 460);
++	const baseDark = person(90, 78, darkFace, darkNeck, TEE, 460);
++	const light = person(90, 78, lightFace, lightNeck, NAVY, 420);
++	const dark = person(90, 78, darkFace, darkNeck, NAVY, 420);
++	const avatarFace = [200, 140, 100];
++	const avatarNeck = [180, 120, 86];
++	const own = person(90, 70, avatarFace, avatarNeck, TEE, 460);
++	const head = person(90, 70, avatarFace, avatarNeck, [0, 0, 0], 600);
++	const headShape = new Uint8ClampedArray(N * 4);
++	for (let y = 0; y < W; y++) {
++		for (let x = 0; x < W; x++) {
++			const oldHead = inEllipse(x, y, 91, 79) && y < 382;
++			headShape.set([y >= 292 && y < 382 ? 255 : 0, y < 382 ? 255 : 0, oldHead ? 255 : 0, 255], (y * W + x) * 4);
++		}
++	}
++	const seeds = prepareFitSeeds(outline(88, 76), outline(88, 76), base, baseDark);
++	const avatar = prepareFitAvatar({
++		head,
++		outline: outline(88, 68),
++		own,
++		base,
++		baseDark,
++		headShape,
++		seeds,
++		lightOutline: outline(88, 76),
++		darkOutline: outline(88, 76),
++		mix: MIX
++	});
++	return { light, dark, headShape, seeds, avatar, avatarFace };
++}
++
++const at = (rgba: ArrayLike<number>, x: number, y: number) => {
++	const k = (y * W + x) * 4;
++	return [rgba[k], rgba[k + 1], rgba[k + 2], rgba[k + 3]];
++};
++
++describe('jawCut', () => {
++	it('cuts a head at the dark line under its chin', () => {
++		const head = person(90, 70, [200, 140, 100], [180, 120, 86], TEE, 460);
++		const cut = jawCut(outline(88, 68), head);
++		const chin = cut.cut.reduce((p, q) => (Math.abs(q[0] - 512) < Math.abs(p[0] - 512) ? q : p));
++		expect(chin[1]).toBeGreaterThan(369.5);
++		expect(chin[1]).toBeLessThan(373);
++	});
++});
++
++describe('stackFitPlate', () => {
++	it("moves the outfit's own neck up to a higher jaw, so no part of the old face shows", () => {
++		const s = scene();
++		const out = stackFitPlate(
++			s.light,
++			s.dark,
++			s.headShape,
++			{ line: [], keep: [] },
++			MIX,
++			s.avatar,
++			outfitJaws(s.light, s.dark, s.seeds)
++		);
++		// the head is the avatar's
++		expect(at(out, 512, 330).slice(0, 3)).toEqual(s.avatarFace);
++		// right under its chin (row 370) nothing is see-through and nothing is the seeds' mixed face colour
++		const seedFace = [170, 130, 105];
++		for (let y = 372; y < 380; y++) {
++			const p = at(out, 512, y);
++			expect(p[3]).toBe(255);
++			expect(
++				Math.abs(p[0] - seedFace[0]) + Math.abs(p[1] - seedFace[1]) + Math.abs(p[2] - seedFace[2])
++			).toBeGreaterThan(20);
++		}
++		// the collar is where it was
++		expect(at(out, 512, 440)).toEqual([...NAVY, 255]);
++	});
++});
+diff --git a/src/lib/server/catalog/neckFit.ts b/src/lib/server/catalog/neckFit.ts
+new file mode 100644
+index 0000000..537b97a
+--- /dev/null
++++ b/src/lib/server/catalog/neckFit.ts
+@@ -0,0 +1,750 @@
++// An ethnicity outfit plate with the neck "fitted" (2026-10-28), made in place of the maker (ethnicityPlateMaker.ts) for a
++// catalogue outfit in a set that has a head shape. One join for every outfit, open neck to scarf, women and men.
++//
++// Every outfit picture was drawn round a seed's head (European / African). Their jaws are not the avatar's jaw, so a
++// plain paste either shows the seed's jaw edge under a higher jaw (a pale line), leaves a hole where a wider seed jaw
++// was (women's scarves), or mixes two jaws (a soft double jaw). Here, point by point along the jaw:
++//
++//   cloth under the old jaw   (a scarf, a turtleneck, a high collar, or the neck in a garment's shadow - the outfit
++//                             differs from the seed's own white-tee picture there): the band within FIT_REACH px round
++//                             the jaw SLIDES, the same in both pictures, so the lower of the two seed jaws lands on the
++//                             avatar's jaw cut - the cloth hugs the new chin, nothing is painted; the head goes on top,
++//                             cut at its own jaw, fading into the outfit's skin over FEATHER px
++//   a bare neck               nothing moves (the neck's outline and the collar stay exactly where they are): the head
++//                             WITH its own neck covers down to 3 px under the lowest of the three chins (as the live way),
++//                             its neck strip shaded to meet the outfit's neck below, then fades into it over FEATHER px
++//
++// Then, everywhere: the two pictures are mixed and what is left of the old head is cleared with the set's head shape; the
++// outfit's skin is recoloured to the avatar's (one colour change, full under the chins, easing out down the chest) and
++// shaded like its own white-tee neck for SHADE_REACH px under the jaw; the avatar's own neck is never laid over cloth.
++// Made once per outfit: each picture's seed jaw (measured once on the seed's white tee, moved by how far the outfit's
++// face sits from the seed's). Made once per avatar: its jaw cut, the band round it, its colour change and shading.
++//
++// Works on 1024×1024 RGBA arrays in the plate frame.
++
++import type { FaceOutline } from './ethnicityPlateMaker';
++import { keepAtSize, type OutfitCollar } from './headNeckPlate';
++import { alignFace, chinLine, faceEdges, jawCut, lum, type JawCut, type Point, type Rgba } from './neckFitJaw';
++
++const W = 1024;
++const N = W * W;
++
++/** px out from the jaw over which the move fades to nothing */
++const FIT_REACH = 40;
++/** dot steps at each end of the jaw line (up the cheeks) over which the move eases to nothing */
++const END_EASE = 2;
++/** samples either side the move is averaged over along the jaw */
++const MOVE_SMOOTH = 6;
++/** the neck's colour change: full for 60 px under the chins, then easing out over 160 px */
++const GAIN_FULL = 60;
++const GAIN_FADE = 160;
++/** a face that matches its seed less than this is not shifted */
++const FACE_MATCH = 0.6;
++/** the shading under the jaw, calibrated on the white tee: px out from the cut, the last SHADE_EASE easing out; both
++ *  pictures are blurred (radius SHADE_BLUR, twice) first, so only soft shading is carried over */
++const SHADE_REACH = 40;
++const SHADE_EASE = 16;
++const SHADE_BLUR = 2;
++/** the move is smoothed over the band (a box of this radius, twice), so it never jumps from one row to the next */
++const MOVE_BLUR = 3;
++/** how far past the old jaw the outfit is read to decide whether it slides (cloth there) or not (a bare neck), and how
++ *  much a pixel must differ from the light seed's own white-tee picture to count as "not a bare neck" */
++const CLOTH_REACH = 14;
++const BARE_DIFF = 28;
++/** the avatar's own neck strip is shaded towards the outfit's neck by a factor in this range */
++const STRIP_MIN = 0.6;
++const STRIP_MAX = 1.15;
++/** under the jaw, over the outfit's skin, the head fades out over this many px past its cut - only where the outfit's
++ *  neck is about as lit as the avatar's own there (fully from LIT_HIGH, not at all below LIT_LOW) */
++const FEATHER = 6;
++const LIT_LOW = 0.72;
++const LIT_HIGH = 0.92;
++
++/** How much a pixel is skin in an outfit: the dark picture clearly darker than the light one (0..1). */
++export function skinWeight(light: Rgba, dark: Rgba, k: number): number {
++	if (light[k + 3] < 128 || dark[k + 3] < 128) return 0;
++	const la = lum(light, k);
++	if (la < 8) return 0;
++	const d = (la - lum(dark, k)) / la;
++	return d <= 0.15 ? 0 : d >= 0.35 ? 1 : (d - 0.15) / 0.2;
++}
++
++/** The mixed picture: light + mix × (dark − light), the light colour where the dark one is see-through. */
++function mixed(light: Rgba, dark: Rgba, mix: readonly number[]): Uint8ClampedArray {
++	const out = new Uint8ClampedArray(N * 4);
++	for (let k = 0; k < N * 4; k += 4) {
++		const solid = dark[k + 3] >= 128;
++		for (let c = 0; c < 3; c++)
++			out[k + c] = solid ? Math.round(light[k + c] + mix[c] * (dark[k + c] - light[k + c])) : light[k + c];
++		out[k + 3] = light[k + 3];
++	}
++	return out;
++}
++
++/** Made once per avatar: per row, per colour, its own white-tee skin / the seeds' white-tee skin mixed with its numbers,
++ *  on the neck under `chins` (smoothed over 13 rows; rows without skin take the nearest). */
++export function rowGain(
++	own: Rgba,
++	base: Rgba,
++	baseDark: Rgba,
++	mix: readonly number[],
++	chins: ArrayLike<number>
++): Float32Array {
++	const M = mixed(base, baseDark, mix);
++	let top = W;
++	let bottom = 0;
++	for (let x = 300; x < 724; x++) {
++		top = Math.min(top, Math.floor(chins[x]) - 10);
++		bottom = Math.max(bottom, Math.ceil(chins[x]) + GAIN_FULL + GAIN_FADE + 10);
++	}
++	const g = new Float32Array(W * 3).fill(NaN);
++	for (let y = Math.max(0, top); y < Math.min(W, bottom); y++) {
++		const r: number[][] = [[], [], []];
++		for (let x = 300; x < 724; x++) {
++			const k = (y * W + x) * 4;
++			if (own[k + 3] < 250 || skinWeight(base, baseDark, k) < 1) continue;
++			const mx = Math.max(own[k], own[k + 1], own[k + 2]);
++			const mn = Math.min(own[k], own[k + 1], own[k + 2]);
++			if (mx < 20 || (mx - mn) / mx < 0.15) continue; // the avatar's own pixel must be skin too (not its tee)
++			for (let c = 0; c < 3; c++) if (M[k + c] > 4) r[c].push(own[k + c] / M[k + c]);
++		}
++		if (r[0].length >= 12) {
++			for (let c = 0; c < 3; c++) {
++				r[c].sort((a, b) => a - b);
++				g[y * 3 + c] = r[c][r[c].length >> 1];
++			}
++		}
++	}
++	const out = new Float32Array(W * 3).fill(1);
++	for (let y = 0; y < W; y++) {
++		for (let c = 0; c < 3; c++) {
++			let s = 0;
++			let n = 0;
++			for (let d = -6; d <= 6; d++) {
++				const v = g[(y + d) * 3 + c];
++				if (y + d >= 0 && y + d < W && !Number.isNaN(v)) {
++					s += v;
++					n++;
++				}
++			}
++			out[y * 3 + c] = n ? s / n : NaN;
++		}
++	}
++	for (let y = 1; y < W; y++)
++		if (Number.isNaN(out[y * 3])) for (let c = 0; c < 3; c++) out[y * 3 + c] = out[(y - 1) * 3 + c];
++	for (let y = W - 2; y >= 0; y--)
++		if (Number.isNaN(out[y * 3])) for (let c = 0; c < 3; c++) out[y * 3 + c] = out[(y + 1) * 3 + c];
++	for (let i = 0; i < out.length; i++) if (Number.isNaN(out[i])) out[i] = 1;
++	return out;
++}
++
++/** What a set needs to fit its outfits: both seeds' jaws (measured once on their white tees, where the neck is clear
++ *  of any collar) and their white-tee face edges. */
++export type FitSeeds = {
++	readonly lightJaw: JawCut;
++	readonly darkJaw: JawCut;
++	readonly lightEdges: Float32Array;
++	readonly darkEdges: Float32Array;
++};
++
++/** `base`/`baseDark` = the seeds' white-tee pictures. */
++export function prepareFitSeeds(
++	lightOutline: FaceOutline,
++	darkOutline: FaceOutline,
++	base: Rgba,
++	baseDark: Rgba
++): FitSeeds {
++	return {
++		lightJaw: jawCut(lightOutline, base, { seed: true }),
++		darkJaw: jawCut(darkOutline, baseDark, { seed: true }),
++		lightEdges: faceEdges(base),
++		darkEdges: faceEdges(baseDark)
++	};
++}
++
++/** One outfit's two seed jaws, as they sit in its own pictures. */
++export type OutfitJaws = { readonly light: JawCut; readonly dark: JawCut };
++
++function shiftedJaw(jaw: JawCut, dx: number, dy: number): JawCut {
++	return { ...jaw, cut: jaw.cut.map((q): Point => [q[0] + dx, q[1] + dy]) };
++}
++
++/**
++ * Made once per outfit: each picture's seed jaw, moved by how far its face sits from the seed's (lined up round the
++ * nose, mouth and chin). The dark picture is lined up with the dark seed AND with the outfit's own light picture - when
++ * it matches its light picture better (it was made from it) it takes the light seed's jaw. A face that matches only
++ * weakly is not shifted.
++ */
++export function outfitJaws(light: Rgba, dark: Rgba, seeds: FitSeeds): OutfitJaws {
++	const lightEdges = faceEdges(light);
++	const fa = alignFace(lightEdges, seeds.lightEdges);
++	const darkEdges = faceEdges(dark);
++	const bd = alignFace(darkEdges, seeds.darkEdges);
++	const ba = alignFace(darkEdges, lightEdges);
++	const fromLight = ba.score > bd.score;
++	const fb = fromLight ? { dx: fa.dx + ba.dx, dy: fa.dy + ba.dy, score: ba.score } : bd;
++	return {
++		light: fa.score >= FACE_MATCH ? shiftedJaw(seeds.lightJaw, fa.dx, fa.dy) : seeds.lightJaw,
++		dark: fb.score >= FACE_MATCH ? shiftedJaw(fromLight ? seeds.lightJaw : seeds.darkJaw, fb.dx, fb.dy) : seeds.darkJaw
++	};
++}
++
++/** A cut's point at a place along the dots. */
++function cutAt(jaw: JawCut, u: number): Point {
++	const { par, cut } = jaw;
++	let lo = 0;
++	let hi = par.length - 1;
++	if (u <= par[0]) return cut[0];
++	if (u >= par[hi]) return cut[hi];
++	while (hi - lo > 1) {
++		const m = (lo + hi) >> 1;
++		if (par[m] <= u) lo = m;
++		else hi = m;
++	}
++	const f = (u - par[lo]) / (par[hi] - par[lo]);
++	return [cut[lo][0] + (cut[hi][0] - cut[lo][0]) * f, cut[lo][1] + (cut[hi][1] - cut[lo][1]) * f];
++}
++
++/**
++ * Per outfit and avatar: how far each point of the avatar's jaw cut moves - as far out as the further of the outfit's
++ * two seed jaws (same place along the dots), so neither old face can show - averaged along the jaw and eased to nothing
++ * up the cheeks.
++ */
++function jawMoves(av: JawCut, jaws: OutfitJaws): Float32Array {
++	const n = av.cut.length;
++	const last = av.par[n - 1];
++	const D = av.cut.map((q, i) => {
++		const [tx, ty] = av.normals[i];
++		const a = cutAt(jaws.light, av.par[i]);
++		const b = cutAt(jaws.dark, av.par[i]);
++		// out along the avatar's jaw normal as far as the further of the two, along the jaw their average (so the move
++		// changes smoothly where the two jaws cross)
++		const out = Math.max((a[0] - q[0]) * -ty + (a[1] - q[1]) * tx, (b[0] - q[0]) * -ty + (b[1] - q[1]) * tx);
++		const along = ((a[0] - q[0]) * tx + (a[1] - q[1]) * ty + (b[0] - q[0]) * tx + (b[1] - q[1]) * ty) / 2;
++		return [out * -ty + along * tx, out * tx + along * ty];
++	});
++	const moves = new Float32Array(n * 2);
++	for (let i = 0; i < n; i++) {
++		let sx = 0;
++		let sy = 0;
++		let m = 0;
++		for (let j = Math.max(0, i - MOVE_SMOOTH); j <= Math.min(n - 1, i + MOVE_SMOOTH); j++) {
++			sx += D[j][0];
++			sy += D[j][1];
++			m++;
++		}
++		const u = Math.min(av.par[i], last - av.par[i]) / END_EASE;
++		const e = u >= 1 ? 1 : u <= 0 ? 0 : u * u * (3 - 2 * u);
++		moves[2 * i] = (sx / m) * e;
++		moves[2 * i + 1] = (sy / m) * e;
++	}
++	return moves;
++}
++
++/** Made once per avatar: every pixel round its jaw - the nearest cut point, how much of the move it takes (all of it
++ *  at and inside the cut, fading to nothing FIT_REACH px out), and whether it is under the jaw between the jaw corners
++ *  (there nothing of the old head can show, so nothing is cleared). */
++type FitBand = {
++	readonly idx: Int32Array;
++	readonly bi: Int32Array;
++	readonly w: Float32Array;
++	readonly free: Uint8Array;
++	/** how far out of the cut (+) or into it (−) */
++	readonly dist: Float32Array;
++	/** the band's bounding box: left, top, width, height */
++	readonly grid: readonly [number, number, number, number];
++};
++
++function fitBand(jaw: JawCut): FitBand {
++	const Q = jaw.cut;
++	const n = Q.length;
++	const xs = Q.map((q) => q[0]);
++	const ys = Q.map((q) => q[1]);
++	const x0 = Math.max(0, Math.floor(Math.min(...xs)) - FIT_REACH - 2);
++	const x1 = Math.min(W, Math.ceil(Math.max(...xs)) + FIT_REACH + 2);
++	const y0 = Math.max(0, Math.floor(Math.min(...ys)) - 14);
++	const y1 = Math.min(W, Math.ceil(Math.max(...ys)) + FIT_REACH + 2);
++	const idx: number[] = [];
++	const bis: number[] = [];
++	const ws: number[] = [];
++	const free: number[] = [];
++	const dist: number[] = [];
++	for (let y = y0; y < y1; y++) {
++		for (let x = x0; x < x1; x++) {
++			const px = x + 0.5;
++			const py = y + 0.5;
++			let best = Infinity;
++			let bi = 0;
++			for (let i = 0; i < n; i++) {
++				const dd = (px - Q[i][0]) ** 2 + (py - Q[i][1]) ** 2;
++				if (dd < best) {
++					best = dd;
++					bi = i;
++				}
++			}
++			const [tx, ty] = jaw.normals[bi];
++			const d = (px - Q[bi][0]) * -ty + (py - Q[bi][1]) * tx; // + = outside the jaw
++			if (d < -12 || d >= FIT_REACH) continue;
++			idx.push(y * W + x);
++			bis.push(bi);
++			ws.push(d <= 0 ? 1 : 1 - d / FIT_REACH);
++			free.push(bi >= jaw.from && bi <= jaw.to ? 1 : 0);
++			dist.push(d);
++		}
++	}
++	let gx0 = W;
++	let gx1 = 0;
++	let gy0 = W;
++	let gy1 = 0;
++	for (const i of idx) {
++		gx0 = Math.min(gx0, i % W);
++		gx1 = Math.max(gx1, i % W);
++		gy0 = Math.min(gy0, (i / W) | 0);
++		gy1 = Math.max(gy1, (i / W) | 0);
++	}
++	return {
++		idx: Int32Array.from(idx),
++		bi: Int32Array.from(bis),
++		w: Float32Array.from(ws),
++		free: Uint8Array.from(free),
++		dist: Float32Array.from(dist),
++		grid: [gx0, gy0, gx1 - gx0 + 1, gy1 - gy0 + 1]
++	};
++}
++
++/** Per outfit and avatar: how far each band pixel moves (smoothed over the band, so it never jumps row to row). */
++function moveField(band: FitBand, D: Float32Array): { dx: Float32Array; dy: Float32Array } {
++	const { idx, bi, w } = band;
++	const [x0, y0, gw, gh] = band.grid;
++	const blur = (f: Float32Array): Float32Array => {
++		const R = MOVE_BLUR;
++		for (let pass = 0; pass < 2; pass++) {
++			const t = new Float32Array(f.length);
++			for (let y = 0; y < gh; y++) {
++				let s = 0;
++				for (let x = -R; x < gw + R; x++) {
++					if (x + R < gw) s += f[y * gw + x + R];
++					if (x - R - 1 >= 0) s -= f[y * gw + x - R - 1];
++					if (x >= 0 && x < gw) t[y * gw + x] = s / (2 * R + 1);
++				}
++			}
++			const u = new Float32Array(f.length);
++			for (let x = 0; x < gw; x++) {
++				let s = 0;
++				for (let y = -R; y < gh + R; y++) {
++					if (y + R < gh) s += t[(y + R) * gw + x];
++					if (y - R - 1 >= 0) s -= t[(y - R - 1) * gw + x];
++					if (y >= 0 && y < gh) u[y * gw + x] = s / (2 * R + 1);
++				}
++			}
++			f = u;
++		}
++		return f;
++	};
++	let fx: Float32Array = new Float32Array(gw * gh);
++	let fy: Float32Array = new Float32Array(gw * gh);
++	for (let j = 0; j < idx.length; j++) {
++		const g = (((idx[j] / W) | 0) - y0) * gw + ((idx[j] % W) - x0);
++		fx[g] = w[j] * D[2 * bi[j]];
++		fy[g] = w[j] * D[2 * bi[j] + 1];
++	}
++	fx = blur(fx);
++	fy = blur(fy);
++	const dx = new Float32Array(idx.length);
++	const dy = new Float32Array(idx.length);
++	for (let j = 0; j < idx.length; j++) {
++		const g = (((idx[j] / W) | 0) - y0) * gw + ((idx[j] % W) - x0);
++		dx[j] = fx[g];
++		dy[j] = fy[g];
++	}
++	return { dx, dy };
++}
++
++/**
++ * Per outfit and avatar, per point of the avatar's jaw cut: whether the outfit slides there (1) or not (0). Read past
++ * the old (outer) jaw, along the jaw normal and straight down (at a jaw corner the normal points sideways, past a
++ * collar below): the outfit's light picture is "not a bare neck" where it is solid and differs from the light seed's own
++ * white-tee picture - cloth, or the neck in a garment's shadow - and slides; over a bare neck or background it does not
++ * (the avatar's own neck covers the old chin instead, as the live way). Averaged along the jaw.
++ */
++function slideWeights(jaw: JawCut, D: Float32Array, light: Rgba, base: Rgba): Float32Array {
++	const n = jaw.cut.length;
++	const raw = new Float32Array(n);
++	for (let q = 0; q < n; q++) {
++		const [tx, ty] = jaw.normals[q];
++		const ox = jaw.cut[q][0] + D[2 * q];
++		const oy = jaw.cut[q][1] + D[2 * q + 1];
++		const share = (dx: number, dy: number): number => {
++			let c = 0;
++			let m = 0;
++			for (let t = 1; t <= CLOTH_REACH; t++) {
++				const x = Math.floor(ox + dx * t);
++				const y = Math.floor(oy + dy * t);
++				if (x < 0 || y < 0 || x >= W || y >= W) continue;
++				const k = (y * W + x) * 4;
++				if (light[k + 3] < 128 && base[k + 3] < 128) continue;
++				m++;
++				const diff = Math.max(
++					Math.abs(light[k] - base[k]),
++					Math.abs(light[k + 1] - base[k + 1]),
++					Math.abs(light[k + 2] - base[k + 2])
++				);
++				if (light[k + 3] >= 200 && (base[k + 3] < 128 || diff > BARE_DIFF)) c++;
++			}
++			return m ? c / m : 0;
++		};
++		const f = Math.max(share(-ty, tx), share(0, 1));
++		raw[q] = Math.min(1, Math.max(0, (f - 0.2) / 0.4));
++	}
++	return raw.map((_, q) => {
++		let s = 0;
++		let k = 0;
++		for (let j = Math.max(0, q - 10); j <= Math.min(n - 1, q + 10); j++) {
++			s += raw[j];
++			k++;
++		}
++		return s / k;
++	});
++}
++
++/** Everything made once per avatar. */
++export type FitAvatar = {
++	readonly head: Rgba;
++	readonly jaw: JawCut;
++	readonly band: FitBand;
++	/** the neck colour change, per colour */
++	readonly gain: readonly [number, number, number];
++	/** per column, the row under which the colour change starts to fade */
++	readonly gainTop: Float32Array;
++	/** the shading right under the jaw, calibrated on the white tee: a factor per pixel and colour, and how much of it
++	 *  applies (null while it is being made) */
++	readonly shade: {
++		readonly ratio: Float32Array;
++		readonly weight: Float32Array;
++	} | null;
++	/** the light seed's white-tee picture (what a bare neck looks like in the outfit pictures) */
++	readonly base: Rgba;
++	/** per pixel, how far out of the jaw cut (NaN outside the band) */
++	readonly distPx: Float32Array;
++};
++
++/**
++ * `head` = the avatar's head+neck picture, `own` = its white-tee picture, `base`/`baseDark` = the seeds' white-tee
++ * pictures, `headShape` = the set's head shape, `mix` = its three numbers.
++ *
++ * The shading right under its jaw is calibrated on the white tee: the fit is run on the seeds' white tees, and in the
++ * band under the jaw (between the jaw corners, SHADE_REACH px out) every pixel of its own white-tee picture is divided by
++ * the fitted one, per colour - the soft shadow and beard fringe its own neck has there. Every outfit's skin in that band
++ * is multiplied by it (fading out over the last SHADE_EASE px), so on the white tee the plate is its own picture, and a
++ * collar's or scarf's own shading is kept on top.
++ */
++export function prepareFitAvatar(args: {
++	readonly head: Rgba;
++	readonly outline: FaceOutline;
++	readonly own: Rgba;
++	readonly base: Rgba;
++	readonly baseDark: Rgba;
++	readonly headShape: Rgba;
++	readonly seeds: FitSeeds;
++	readonly lightOutline: FaceOutline;
++	readonly darkOutline: FaceOutline;
++	readonly mix: readonly [number, number, number];
++}): FitAvatar {
++	const jaw = jawCut(args.outline, args.head, { steady: true });
++	const own = chinLine(args.outline);
++	const light = chinLine(args.lightOutline);
++	const dark = chinLine(args.darkOutline);
++	const gainTop = own.map((v, x) => Math.max(v, light[x], dark[x]) + 3);
++	const band = fitBand(jaw);
++	// one colour change per avatar: the row changes down the middle of its neck (12-60 px under the chins), their
++	// median - row by row it banded across open chests, where the white tee has no skin to measure
++	const rows = rowGain(args.own, args.base, args.baseDark, args.mix, gainTop);
++	const top = Math.round(gainTop[W / 2]);
++	const gain = [0, 1, 2].map((c) => {
++		const v: number[] = [];
++		for (let y = top + 12; y <= top + 60; y++) v.push(rows[y * 3 + c]);
++		v.sort((a, b) => a - b);
++		return v[v.length >> 1];
++	}) as [number, number, number];
++	const distPx = new Float32Array(N).fill(NaN);
++	band.idx.forEach((i, j) => {
++		distPx[i] = band.dist[j];
++	});
++	const unshaded: FitAvatar = {
++		head: args.head,
++		jaw,
++		band,
++		gain,
++		gainTop,
++		shade: null,
++		base: args.base,
++		distPx
++	};
++	const fitted = stackFitPlate(
++		args.base,
++		args.baseDark,
++		args.headShape,
++		{ line: [], keep: [] },
++		args.mix,
++		unshaded,
++		outfitJaws(args.base, args.baseDark, args.seeds),
++		{ head: false }
++	);
++	let x0 = W;
++	let x1 = 0;
++	let y0 = W;
++	let y1 = 0;
++	for (let j = 0; j < band.idx.length; j++) {
++		if (!band.free[j]) continue;
++		const x = band.idx[j] % W;
++		const y = (band.idx[j] / W) | 0;
++		x0 = Math.min(x0, x);
++		x1 = Math.max(x1, x);
++		y0 = Math.min(y0, y);
++		y1 = Math.max(y1, y);
++	}
++	const ownBlur = blurBox(args.own, x0 - 8, y0 - 8, x1 + 8, y1 + 8);
++	const fittedBlur = blurBox(fitted, x0 - 8, y0 - 8, x1 + 8, y1 + 8);
++	const ratio = new Float32Array(N * 3).fill(1);
++	const weight = new Float32Array(N);
++	for (let j = 0; j < band.idx.length; j++) {
++		if (!band.free[j]) continue;
++		const i = band.idx[j];
++		const k = i * 4;
++		const d = band.dist[j];
++		if (d < -1.5 || d > SHADE_REACH || args.own[k + 3] < 250 || fitted[k + 3] < 250) continue;
++		for (let c = 0; c < 3; c++)
++			ratio[i * 3 + c] = Math.min(1.6, Math.max(0.6, (ownBlur[k + c] + 1) / (fittedBlur[k + c] + 1)));
++		const t = d <= SHADE_REACH - SHADE_EASE ? 0 : (d - SHADE_REACH + SHADE_EASE) / SHADE_EASE;
++		weight[i] = 1 - t * t * (3 - 2 * t);
++	}
++	return { ...unshaded, shade: { ratio, weight } };
++}
++
++/** A box blur (radius SHADE_BLUR), twice, of the colours inside [x0, x1] × [y0, y1]; see-through pixels left out. */
++function blurBox(P: Rgba, x0: number, y0: number, x1: number, y1: number): Float32Array {
++	let cur = Float32Array.from(P as ArrayLike<number>);
++	for (let pass = 0; pass < 2; pass++) {
++		const next = Float32Array.from(cur);
++		for (let y = Math.max(2, y0); y <= Math.min(W - 3, y1); y++) {
++			for (let x = Math.max(2, x0); x <= Math.min(W - 3, x1); x++) {
++				const k = (y * W + x) * 4;
++				if (P[k + 3] < 250) continue;
++				let r = 0;
++				let g = 0;
++				let b = 0;
++				let n = 0;
++				for (let dy = -SHADE_BLUR; dy <= SHADE_BLUR; dy++) {
++					for (let dx = -SHADE_BLUR; dx <= SHADE_BLUR; dx++) {
++						const q = k + (dy * W + dx) * 4;
++						if (P[q + 3] < 250) continue;
++						r += cur[q];
++						g += cur[q + 1];
++						b += cur[q + 2];
++						n++;
++					}
++				}
++				next[k] = r / n;
++				next[k + 1] = g / n;
++				next[k + 2] = b / n;
++			}
++		}
++		cur = next;
++	}
++	return cur;
++}
++
++/** Bilinear read of an RGBA picture at a point (pixel centres at +0.5), colour weighted by see-through. */
++function readPixel(P: Rgba, x: number, y: number, o: Float64Array): void {
++	const xa = Math.floor(x - 0.5);
++	const ya = Math.floor(y - 0.5);
++	const fx = x - 0.5 - xa;
++	const fy = y - 0.5 - ya;
++	let r = 0;
++	let g = 0;
++	let b = 0;
++	let a = 0;
++	for (const [dx, dy, w] of [
++		[0, 0, (1 - fx) * (1 - fy)],
++		[1, 0, fx * (1 - fy)],
++		[0, 1, (1 - fx) * fy],
++		[1, 1, fx * fy]
++	]) {
++		const xx = Math.min(W - 1, Math.max(0, xa + dx));
++		const yy = Math.min(W - 1, Math.max(0, ya + dy));
++		const k = (yy * W + xx) * 4;
++		const aw = w * P[k + 3];
++		r += aw * P[k];
++		g += aw * P[k + 1];
++		b += aw * P[k + 2];
++		a += aw;
++	}
++	if (a > 0) {
++		o[0] = r / a;
++		o[1] = g / a;
++		o[2] = b / a;
++	} else o[0] = o[1] = o[2] = 0;
++	o[3] = a;
++}
++
++/**
++ * One ethnicity plate. `light`/`dark` = the outfit's endpoint plates, `headShape` = the set's head shape, `collar` =
++ * the outfit's collar file, `mix` = the ethnicity's numbers, `avatar` from prepareFitAvatar, `jaws` from outfitJaws.
++ * `head: false` leaves the head off (the white-tee calibration).
++ */
++export function stackFitPlate(
++	light: Rgba,
++	dark: Rgba,
++	headShape: Rgba,
++	collar: OutfitCollar,
++	mix: readonly [number, number, number],
++	avatar: FitAvatar,
++	jaws: OutfitJaws,
++	opts: { readonly head?: boolean } = {}
++): Uint8ClampedArray<ArrayBuffer> {
++	for (const p of [light, dark, headShape, avatar.head]) {
++		if (p.length !== N * 4) throw new Error(`fitted plates need ${W}x${W} RGBA inputs`);
++	}
++	const withHead = opts.head !== false;
++	const { band, jaw, gain, gainTop, shade, head } = avatar;
++	const kept = keepAtSize(collar.keep, W);
++	// the outfit slides only where cloth (or the neck in a garment's shadow) sits under the old jaw: fully from a weight
++	// of 0.7, not at all under 0.3; one move for both pictures (their clothes are lined up, so they move together)
++	const D = jawMoves(jaw, jaws);
++	const slide = slideWeights(jaw, D, light, avatar.base);
++	const Dw = D.map((v, q) => v * Math.min(1, Math.max(0, (slide[q >> 1] - 0.3) / 0.4)));
++	const M = moveField(band, Dw);
++	const A = new Uint8ClampedArray(light as ArrayLike<number>);
++	const B = new Uint8ClampedArray(dark as ArrayLike<number>);
++	const S = new Uint8ClampedArray(headShape as ArrayLike<number>);
++	const K = new Uint8Array(kept);
++	const free = new Uint8Array(N); // under the jaw where it slides: nothing of the old head is left there
++	const slidePx = new Float32Array(N);
++	const fadeSlide = new Float32Array(N);
++	const o = new Float64Array(4);
++	for (let j = 0; j < band.idx.length; j++) {
++		const i = band.idx[j];
++		const k = i * 4;
++		const sx = (i % W) + 0.5 + M.dx[j];
++		const sy = ((i / W) | 0) + 0.5 + M.dy[j];
++		readPixel(light, sx, sy, o);
++		for (let c = 0; c < 4; c++) A[k + c] = o[c];
++		readPixel(dark, sx, sy, o);
++		for (let c = 0; c < 4; c++) B[k + c] = o[c];
++		const s = Math.min(W - 1, Math.max(0, Math.floor(sy))) * W + Math.min(W - 1, Math.max(0, Math.floor(sx)));
++		for (let c = 0; c < 3; c++) S[k + c] = headShape[s * 4 + c];
++		K[i] = kept[s];
++		const w = slide[band.bi[j]];
++		slidePx[i] = w;
++		if (band.free[j] && w >= 0.5) free[i] = 1;
++		if (band.free[j]) {
++			const t = Math.min(1, Math.max(0, band.dist[j] / FEATHER));
++			fadeSlide[i] = 1 - t * t * (3 - 2 * t);
++		}
++	}
++
++	// pass 1: the outfit, mixed, the old head cleared with the head shape except where it slides under the jaw
++	const out = new Uint8ClampedArray(N * 4);
++	const covered = new Float32Array(N); // the outfit's see-through value
++	const cleared = new Uint8Array(N); // the old face was cleared here
++	for (let i = 0; i < N; i++) {
++		const k = i * 4;
++		const y = (i / W) | 0;
++		const oldHead = !free[i] && S[k + 2] >= 128;
++		const above = !free[i] && S[k + 1] >= 128;
++		const jawZone = S[k] >= 128;
++		let keep = true;
++		if (oldHead) keep = jawZone && K[i] === 1;
++		else if (above && !jawZone) keep = B[k + 3] >= 128;
++		const ab = keep ? A[k + 3] / 255 : 0;
++		covered[i] = ab;
++		cleared[i] = oldHead ? 1 : 0;
++		if (ab <= 0) continue;
++		const isMixed = B[k + 3] >= 128 && !oldHead;
++		// skin is recoloured to the avatar's own: full under the chins, easing out down the chest, and shaded as its own
++		// white-tee neck under the jaw
++		const sw = isMixed ? skinWeight(A, B, k) : 0;
++		const t = Math.min(1, Math.max(0, (y - gainTop[i % W] - GAIN_FULL) / GAIN_FADE));
++		const f = sw * (1 - t * t * (3 - 2 * t));
++		for (let c = 0; c < 3; c++) {
++			let m = isMixed ? A[k + c] + mix[c] * (B[k + c] - A[k + c]) : A[k + c];
++			if (f > 0) m *= 1 + f * (gain[c] - 1);
++			if (sw > 0 && shade && shade.weight[i] > 0) m *= 1 + sw * shade.weight[i] * (shade.ratio[i * 3 + c] - 1);
++			out[k + c] = Math.round(m);
++		}
++		out[k + 3] = Math.round(ab * 255);
++	}
++
++	// the avatar's own neck strip (on a bare neck, between its jaw and the line where the outfit takes over) is shaded to
++	// meet the outfit's neck just below that line: per column, the outfit's skin 2-7 px under the line / the head
++	// picture's there (median), smoothed across 21 columns
++	const strip = new Float32Array(W).fill(1);
++	if (withHead) {
++		const raw = new Float32Array(W).fill(NaN);
++		for (let x = 360; x < 664; x++) {
++			const v: number[] = [];
++			for (let y = Math.ceil(gainTop[x]) + 2; y <= Math.ceil(gainTop[x]) + 7; y++) {
++				const k = (y * W + x) * 4;
++				if (out[k + 3] < 250 || head[k + 3] < 200 || skinWeight(A, B, k) < 0.5) continue;
++				const lh = lum(head, k);
++				if (lh > 8) v.push(lum(out, k) / lh);
++			}
++			if (v.length >= 3) {
++				v.sort((a, b) => a - b);
++				raw[x] = v[v.length >> 1];
++			}
++		}
++		for (let x = 360; x < 664; x++) {
++			const v: number[] = [];
++			for (let d = -10; d <= 10; d++) if (!Number.isNaN(raw[x + d])) v.push(raw[x + d]);
++			if (v.length) {
++				v.sort((a, b) => a - b);
++				strip[x] = Math.min(STRIP_MAX, Math.max(STRIP_MIN, v[v.length >> 1]));
++			}
++		}
++	}
++
++	// pass 2: the avatar's head on top
++	const hc = [0, 0, 0];
++	for (let i = 0; withHead && i < N; i++) {
++		const k = i * 4;
++		const y = (i / W) | 0;
++		const x = i % W;
++		const ab = covered[i];
++		// where nothing slides (a bare neck): the head WITH its own neck down to 3 px under the lowest of the three chins
++		// (a line running on flat past the jaw ends, as the live way), fading out over FEATHER px below it; where the
++		// outfit slides: the head cut at its own jaw, fading out over FEATHER px past the cut; in between, mixed by the
++		// slide weight. Where the old face was cleared the head is always drawn in full (no gap), and its own neck is never
++		// laid over the outfit's cloth (a collar or scarf stays the outfit's)
++		const c = slidePx[i];
++		const below = y + 0.5 - gainTop[x];
++		const tN = Math.min(1, Math.max(0, below / FEATHER));
++		const fadeN = below <= 0 ? 0 : 1 - tN * tN * (3 - 2 * tN);
++		const onCloth = ab > 0 && (B[k + 3] < 128 || skinWeight(A, B, k) < 0.5);
++		let cover = cleared[i] ? 1 : (1 - c) * (!onCloth && below <= 0 ? 1 : jaw.mask[i]) + c * jaw.mask[i];
++		// its own neck strip, shaded towards the outfit's neck below (none at the jaw cut, all of it at the line)
++		let sh = 1;
++		if (strip[x] !== 1 && c < 1 && jaw.mask[i] < 1) {
++			const d = avatar.distPx[i];
++			const r = Number.isNaN(d) || d <= 0 ? 0 : below >= 0 ? 1 : d / (d - below);
++			sh = 1 + (1 - c) * r * (strip[x] - 1);
++		}
++		for (let q = 0; q < 3; q++) hc[q] = head[k + q] * sh;
++		// the fade only over the outfit's skin, and only where its neck is about as lit as the avatar's own (shaded) neck
++		// there: under a scarf's or collar's shadow its lit neck would show as a light band, so there the edge stays sharp
++		const soft = (1 - c) * fadeN + c * fadeSlide[i];
++		if (soft > 0 && ab > 0) {
++			const lh = 0.299 * hc[0] + 0.587 * hc[1] + 0.114 * hc[2];
++			const lit = lh > 8 ? lum(out, k) / lh : 1;
++			const f =
++				(B[k + 3] >= 128 ? skinWeight(A, B, k) : 0) * Math.min(1, Math.max(0, (lit - LIT_LOW) / (LIT_HIGH - LIT_LOW)));
++			if (f > 0) cover += f * (Math.max(cover, soft) - cover);
++		}
++		const at = (head[k + 3] / 255) * cover;
++		if (at <= 0) continue;
++		const a = at + ab * (1 - at);
++		for (let q = 0; q < 3; q++) out[k + q] = Math.round((hc[q] * at + out[k + q] * ab * (1 - at)) / a);
++		out[k + 3] = Math.round(a * 255);
++	}
++	return out;
++}
+diff --git a/src/lib/server/catalog/neckFitJaw.ts b/src/lib/server/catalog/neckFitJaw.ts
+new file mode 100644
+index 0000000..3df65eb
+--- /dev/null
++++ b/src/lib/server/catalog/neckFitJaw.ts
+@@ -0,0 +1,297 @@
++// Where a face's jaw ends, for the neck fit (neckFit.ts): the dark line under a jaw, a
++// face's chin line, and lining one face up with another.
++
++import type { FaceOutline } from './ethnicityPlateMaker';
++
++export type Rgba = ArrayLike<number>;
++export type Point = [number, number];
++
++const W = 1024;
++const N = W * W;
++
++/** px outwards the dark line under a jaw is looked for (RIM_REACH for a seed's jaw) */
++const CUT_REACH = 6;
++const RIM_REACH = 10;
++/** a seed's jaw: how wide a rim of light under a dark chin can be, and how close to the dark point it falls back */
++const RIM_WIDTH = 4;
++const RIM_BACK = 8;
++/** a seed's jaw that never brightens within reach: the first point within SEED_NEAR of the darkest, if that is
++ *  SEED_DARKER darker than at the dots */
++const SEED_NEAR = 5;
++const SEED_DARKER = 15;
++/** an avatar's cut: a short stretch more than NOTCH px off the median of the 25 points round it is put back on it */
++const NOTCH = 1.5;
++/** brighter than the darkest point by this much = the neck has started */
++const CUT_RISE = 22;
++/** px along the jaw over which the cut eases from the cheek edge onto the dark line */
++const CORNER_EASE = 8;
++/** face edges are lined up over this box, shifts up to FACE_SHIFT px */
++const FACE_BOX = { x0: 440, x1: 584, y0: 250, y1: 362 };
++const FACE_SHIFT = 6;
++
++/** The lower half of the face outline: under one ear, round the chin, to under the other. */
++const JAW_OUTLINE = [132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361];
++/** The chin line used for the neck colour change (flat past either end). */
++const CHIN = [136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365];
++
++export const lum = (p: Rgba, k: number) => 0.299 * p[k] + 0.587 * p[k + 1] + 0.114 * p[k + 2];
++
++function dot(o: FaceOutline, i: number): Point {
++	const k = W / o.width;
++	return [o.dots478[i][0] * k, o.dots478[i][1] * k];
++}
++
++/** A face's chin line per column, flat past either end. */
++export function chinLine(o: FaceOutline): Float32Array {
++	const P = CHIN.map((i) => dot(o, i));
++	return Float32Array.from({ length: W }, (_, x) => {
++		const t = x + 0.5;
++		if (t <= P[0][0]) return P[0][1];
++		if (t >= P[P.length - 1][0]) return P[P.length - 1][1];
++		for (let j = 1; j < P.length; j++) {
++			if (t <= P[j][0]) return P[j - 1][1] + ((P[j][1] - P[j - 1][1]) * (t - P[j - 1][0])) / (P[j][0] - P[j - 1][0]);
++		}
++		return P[P.length - 1][1];
++	});
++}
++
++/** Where a head ends: the dark line under its jaw. */
++export type JawCut = {
++	/** how much of each pixel is above the cut (the cut drawn as one smooth shape, 4 lines per pixel) */
++	readonly mask: Float32Array;
++	/** the cut, one point per px along the jaw outline */
++	readonly cut: readonly Point[];
++	/** where each cut point sits along the outline dots (0..16), so two faces' cuts can be matched */
++	readonly par: readonly number[];
++	/** unit direction along the jaw at each point (outwards = [-ty, tx]) */
++	readonly normals: readonly Point[];
++	/** the jaw corners (dots 172 and 397) as cut indices */
++	readonly from: number;
++	readonly to: number;
++};
++
++/**
++ * The dark line under a face's jaw, found in `head` (the picture that has that face). At every pixel along the jaw
++ * outline between the jaw corners the picture is read outwards across the jaw edge, averaged over 5 px along the jaw:
++ * the cut is the darkest point before it brightens into the neck (or within 2 px of where it turns see-through). Up the
++ * cheek sides the cut is left well outside, so the head keeps its own edge there.
++ * `seed`: a seed's jaw on its white tee - looks further out, and past a rim of light on a dark chin's underside.
++ * `steady` (a head's cut): a short stretch where the search jumped (a dark patch inside a beard read as the jaw shadow) is
++ * put back, and the cut is averaged along the jaw.
++ */
++export function jawCut(o: FaceOutline, head: Rgba, opts: { seed?: boolean; steady?: boolean } = {}): JawCut {
++	const P = JAW_OUTLINE.map((i) => dot(o, i));
++	const pts: Point[] = [];
++	const at = [0];
++	const par: number[] = [];
++	for (let j = 1; j < P.length; j++) {
++		const [x0, y0] = P[j - 1];
++		const [x1, y1] = P[j];
++		const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0)));
++		for (let t = 0; t < n; t++) {
++			pts.push([x0 + ((x1 - x0) * t) / n, y0 + ((y1 - y0) * t) / n]);
++			par.push(j - 1 + t / n);
++		}
++		at.push(pts.length);
++	}
++	pts.push(P[P.length - 1]);
++	par.push(P.length - 1);
++	const from = at[JAW_OUTLINE.indexOf(172)];
++	const to = at[JAW_OUTLINE.indexOf(397)];
++	const read = (x: number, y: number): [number, number] => {
++		const x0 = Math.floor(x - 0.5);
++		const y0 = Math.floor(y - 0.5);
++		const fx = x - 0.5 - x0;
++		const fy = y - 0.5 - y0;
++		let l = 0;
++		let a = 0;
++		for (const [dx, dy, w] of [
++			[0, 0, (1 - fx) * (1 - fy)],
++			[1, 0, fx * (1 - fy)],
++			[0, 1, (1 - fx) * fy],
++			[1, 1, fx * fy]
++		]) {
++			const kk = ((y0 + dy) * W + x0 + dx) * 4;
++			l += w * lum(head, kk);
++			a += w * head[kk + 3];
++		}
++		return [l, a / 255];
++	};
++	const normals: Point[] = pts.map((_, i) => {
++		const a = pts[Math.max(0, i - 2)];
++		const b = pts[Math.min(pts.length - 1, i + 2)];
++		const l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
++		return [(b[0] - a[0]) / l, (b[1] - a[1]) / l];
++	});
++	const off = pts.map((p, i) => {
++		if (i < from || i > to) return CUT_REACH;
++		const [tx, ty] = normals[i];
++		const nx = -ty;
++		const ny = tx;
++		const ds: number[] = [];
++		const ss: number[] = [];
++		let edge: number | null = null;
++		for (let d = -4; d <= (opts.seed ? RIM_REACH : CUT_REACH); d += 0.5) {
++			if (read(p[0] + nx * d, p[1] + ny * d)[1] < 0.8) {
++				edge = d;
++				break;
++			}
++			let s = 0;
++			let n = 0;
++			for (let t = -2; t <= 2; t++) {
++				const [l, a] = read(p[0] + nx * d + tx * t, p[1] + ny * d + ty * t);
++				if (a >= 0.8) {
++					s += l;
++					n++;
++				}
++			}
++			ds.push(d);
++			ss.push(s / n);
++		}
++		// the darkest point before it brightens by CUT_RISE, from sample `start` on: [dark point, rise] (−1 = none)
++		const darkest = (start: number): [number, number] => {
++			let lo = Infinity;
++			let atDark = -1;
++			for (let j = start; j < ss.length; j++) {
++				if (ss[j] < lo) {
++					lo = ss[j];
++					atDark = j;
++				} else if (ss[j] > lo + CUT_RISE) return [atDark, j];
++			}
++			return [atDark, -1];
++		};
++		let [atDark, rise] = darkest(0);
++		let rim = false;
++		// a seed's dark chin can have a rim of light on its underside: when the brightening falls back to the dark
++		// point's level within RIM_WIDTH px, the edge is past the rim
++		while (opts.seed && rise >= 0) {
++			let back = -1;
++			for (let j = rise + 1; j < ss.length && ds[j] <= ds[rise] + RIM_WIDTH; j++) {
++				if (ss[j] <= ss[atDark] + RIM_BACK) {
++					back = j;
++					break;
++				}
++			}
++			if (back < 0) break;
++			[atDark, rise] = darkest(back);
++			rim = true;
++		}
++		const dark = atDark >= 0 ? ds[atDark] : null;
++		if (rise >= 0) return dark as number; // it brightened into the neck before any see-through edge
++		if (edge !== null) return dark === null ? edge - 0.5 : Math.max(dark, edge - 2);
++		if (rim) return dark as number;
++		if (opts.seed && atDark >= 0) {
++			// never brightens within reach: the first point about as dark as the darkest, if clearly darker than at the dots
++			const first = ss.findIndex((v, j) => j <= atDark && v <= ss[atDark] + SEED_NEAR);
++			const atDots = ds.findIndex((d) => d >= 0);
++			if (atDots >= 0 && ss[atDots] - ss[atDark] > SEED_DARKER) return ds[first];
++		}
++		return 0.5; // never brightens: 1 px under the dots
++	});
++	for (let i = Math.max(0, from - CORNER_EASE); i < from; i++)
++		off[i] = off[from] + ((CUT_REACH - off[from]) * (from - i)) / CORNER_EASE;
++	for (let i = to + 1; i <= Math.min(pts.length - 1, to + CORNER_EASE); i++)
++		off[i] = off[to] + ((CUT_REACH - off[to]) * (i - to)) / CORNER_EASE;
++	if (opts.steady) {
++		const med = off.map((_, i) => {
++			const v = off.slice(Math.max(0, i - 12), i + 13).sort((p, q) => p - q);
++			return v[v.length >> 1];
++		});
++		for (let i = 0; i < off.length; i++) if (Math.abs(off[i] - med[i]) > NOTCH) off[i] = med[i];
++	}
++	let sm = off.map((_, i) => {
++		const v = off.slice(Math.max(0, i - 4), i + 5).sort((p, q) => p - q);
++		return v[v.length >> 1];
++	});
++	// a head's cut is then averaged over 11 points, so its edge follows the jaw without 1 px bumps
++	if (opts.steady) {
++		sm = sm.map((_, i) => {
++			let s = 0;
++			let n = 0;
++			for (let j = Math.max(0, i - 5); j <= Math.min(sm.length - 1, i + 5); j++) {
++				s += sm[j];
++				n++;
++			}
++			return s / n;
++		});
++	}
++	const cut: Point[] = pts.map((p, i) => [p[0] - normals[i][1] * (sm[i] + 0.5), p[1] + normals[i][0] * (sm[i] + 0.5)]);
++	// the kept shape: above the cut, and past either end of the jaw above a steep line out to the sides (ears never cut)
++	const first = cut[0];
++	const last = cut[cut.length - 1];
++	const E0: Point = [first[0] - 60, first[1] + 180];
++	const E1: Point = [last[0] + 60, last[1] + 180];
++	const poly: Point[] = [[-10, -10], [-10, E0[1]], E0, ...cut, E1, [W + 10, E1[1]], [W + 10, -10]];
++	const top = Math.max(0, Math.floor(Math.min(...cut.map((q) => q[1]))) - 1);
++	const bottom = Math.min(W, Math.ceil(Math.max(E0[1], E1[1])) + 1);
++	const mask = new Float32Array(N);
++	mask.fill(1, 0, top * W);
++	for (let y = top; y < bottom; y++) {
++		for (let sub = 0; sub < 4; sub++) {
++			const ys = y + (sub + 0.5) / 4;
++			const hits: [number, number][] = [];
++			for (let j = 0; j < poly.length; j++) {
++				const [ax, ay] = poly[j];
++				const [bx, by] = poly[(j + 1) % poly.length];
++				if ((ay <= ys && ys < by) || (by <= ys && ys < ay))
++					hits.push([ax + ((ys - ay) * (bx - ax)) / (by - ay), by > ay ? 1 : -1]);
++			}
++			hits.sort((p, q) => p[0] - q[0]);
++			let wind = 0;
++			for (let h = 0; h < hits.length - 1; h++) {
++				wind += hits[h][1];
++				if (!wind) continue;
++				const xa = Math.max(0, hits[h][0]);
++				const xb = Math.min(W, hits[h + 1][0]);
++				for (let x = Math.floor(xa); x < xb; x++) mask[y * W + x] += (Math.min(xb, x + 1) - Math.max(xa, x)) / 4;
++			}
++		}
++	}
++	return { mask, cut, par, normals, from, to };
++}
++
++/** A face's edges (how fast the brightness changes) round the nose, mouth and chin, for lining faces up. */
++export function faceEdges(P: Rgba): Float32Array {
++	const g = new Float32Array(N);
++	const { x0, x1, y0, y1 } = FACE_BOX;
++	for (let y = y0 - FACE_SHIFT - 1; y < y1 + FACE_SHIFT + 1; y++) {
++		for (let x = x0 - FACE_SHIFT - 1; x < x1 + FACE_SHIFT + 1; x++) {
++			const k = (y * W + x) * 4;
++			if (P[k + 3] < 200) continue;
++			g[y * W + x] = Math.hypot(lum(P, k + 4) - lum(P, k - 4), lum(P, k + W * 4) - lum(P, k - W * 4));
++		}
++	}
++	return g;
++}
++
++/** The shift (up to FACE_SHIFT px) that best lines `edges` up with `ref`, and how well (correlation, −1..1). */
++export function alignFace(edges: Float32Array, ref: Float32Array): { dx: number; dy: number; score: number } {
++	const { x0, x1, y0, y1 } = FACE_BOX;
++	let best = { dx: 0, dy: 0, score: -2 };
++	for (let dy = -FACE_SHIFT; dy <= FACE_SHIFT; dy++) {
++		for (let dx = -FACE_SHIFT; dx <= FACE_SHIFT; dx++) {
++			let sa = 0;
++			let sb = 0;
++			let sab = 0;
++			let saa = 0;
++			let sbb = 0;
++			let n = 0;
++			for (let y = y0; y < y1; y++) {
++				for (let x = x0; x < x1; x++) {
++					const a = ref[y * W + x];
++					const b = edges[(y + dy) * W + x + dx];
++					sa += a;
++					sb += b;
++					sab += a * b;
++					saa += a * a;
++					sbb += b * b;
++					n++;
++				}
++			}
++			const cov = sab / n - (sa / n) * (sb / n);
++			const score = cov / Math.sqrt((saa / n - (sa / n) ** 2) * (sbb / n - (sb / n) ** 2) + 1e-9);
++			if (score > best.score) best = { dx, dy, score };
++		}
++	}
++	return best;
++}
+diff --git a/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.test.ts b/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.test.ts
+index ded52fd..5f95c4a 100644
+--- a/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.test.ts
++++ b/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.test.ts
+@@ -21,7 +21,7 @@ vi.mock('$lib/server/authoring/r2', () => ({
+ 	privateAuthoringBucket: () => 'liforma-authoring',
+ 	publicCdnBucket: () => 'liforma',
+ 	getR2ObjectBuffer: vi.fn(async () => {
+-		throw new Error('missing authoring object');
++		throw Object.assign(new Error('missing authoring object'), { name: 'NoSuchKey' });
+ 	}),
+ 	putR2Object: vi.fn(),
+ 	headR2Object: vi.fn(),
+@@ -675,7 +675,7 @@ describe('bake misses', () => {
+ 		const keys: string[] = [];
+ 		vi.mocked(getR2ObjectBuffer).mockImplementation(async (_bucket, key) => {
+ 			keys.push(key);
+-			throw new Error('missing authoring object');
++			throw Object.assign(new Error('missing authoring object'), { name: 'NoSuchKey' });
+ 		});
+ 		const withEndpoints: AvatarSetPayload = {
+ 			...set,
+@@ -707,7 +707,42 @@ describe('bake misses', () => {
+ 		expect(keys).toContain('avatar-sets/09hmxcmk/maker/outlines/european_female_gpt_outline.json');
+ 		vi.mocked(getR2ObjectBuffer).mockReset();
+ 		vi.mocked(getR2ObjectBuffer).mockImplementation(async () => {
+-			throw new Error('missing authoring object');
++			throw Object.assign(new Error('missing authoring object'), { name: 'NoSuchKey' });
++		});
++	});
++
++	it('joins a catalogue outfit with the neck fit once the set has a head shape, and names a missing collar file', async () => {
++		const keys: string[] = [];
++		const png = await sharp({ create: { width: 4, height: 4, channels: 4, background: '#000' } }).png().toBuffer();
++		const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
++		vi.mocked(getR2ObjectBuffer).mockImplementation(async (_bucket, key) => {
++			keys.push(key);
++			if (key.endsWith('/maker/head_shape.png') || key.includes('/clothes/')) return png;
++			throw Object.assign(new Error('missing authoring object'), { name: 'NoSuchKey' });
++		});
++		await expect(
++			bakePlatePng({ set, clothesId: 'barista', ethnicity: 'south-asian', makerGender: 'female' })
++		).rejects.toThrow('Missing neck-fit collar file for barista for avatar set 09hmxcmk.');
++		expect(keys).toContain('avatar-sets/09hmxcmk/maker/collar/barista.json');
++		expect(keys).not.toContain('avatar-sets/09hmxcmk/maker/faces/south-asian_female_gpt-head_and_shoulders.webp');
++		expect(errors).toHaveBeenCalledWith(expect.stringContaining('avatar-sets/09hmxcmk/maker/collar/barista.json'));
++		errors.mockRestore();
++		vi.mocked(getR2ObjectBuffer).mockReset();
++		vi.mocked(getR2ObjectBuffer).mockImplementation(async () => {
++			throw Object.assign(new Error('missing authoring object'), { name: 'NoSuchKey' });
++		});
++	});
++
++	it('fails the bake when the head shape cannot be read, rather than joining the old way', async () => {
++		vi.mocked(getR2ObjectBuffer).mockImplementation(async () => {
++			throw new Error('socket hang up');
++		});
++		await expect(
++			bakePlatePng({ set, clothesId: 'barista', ethnicity: 'south-asian', makerGender: 'female' })
++		).rejects.toThrow('socket hang up');
++		vi.mocked(getR2ObjectBuffer).mockReset();
++		vi.mocked(getR2ObjectBuffer).mockImplementation(async () => {
++			throw Object.assign(new Error('missing authoring object'), { name: 'NoSuchKey' });
+ 		});
+ 	});
+ 
+@@ -838,7 +873,7 @@ describe('settlePuppetClothes: the seed plate of a set outfit', () => {
+ 		vi.mocked(headR2Object).mockReset();
+ 		vi.mocked(getR2ObjectBuffer).mockReset();
+ 		vi.mocked(getR2ObjectBuffer).mockImplementation(async () => {
+-			throw new Error('missing authoring object');
++			throw Object.assign(new Error('missing authoring object'), { name: 'NoSuchKey' });
+ 		});
+ 		vi.unstubAllGlobals();
+ 	});
+diff --git a/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.ts b/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.ts
+index fb56f10..1c53122 100644
+--- a/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.ts
++++ b/src/lib/server/catalog/resolveOrBakeAvatarSetClothes.ts
+@@ -39,6 +39,7 @@ import {
+ } from '$lib/server/catalog/avatarSets';
+ import { loadMakerFileGender, type MakerFileGender } from '$lib/server/catalog/avatarSetMakerInput';
+ import {
++	PLATE_SIZE,
+ 	makeEthnicityPlate,
+ 	prepareFace,
+ 	type EthnicityMix,
+@@ -49,6 +50,15 @@ import {
+ 	encodePlatePng as encodePng,
+ 	frameSeedMasterPng
+ } from '$lib/server/catalog/seedPlateFrame';
++import type { OutfitCollar } from '$lib/server/catalog/headNeckPlate';
++import {
++	outfitJaws,
++	prepareFitAvatar,
++	prepareFitSeeds,
++	stackFitPlate,
++	type FitAvatar,
++	type FitSeeds
++} from '$lib/server/catalog/neckFit';
+ 
+ const BASE_OUTFIT = 'white_t_shirt_and_jeans';
+ const BAKE_TIMEOUT_MS = 180_000;
+@@ -78,6 +88,21 @@ function authoringOutlineKey(avatarSetId: string, gender: MakerFileGender, name:
+ 	return `avatar-sets/${avatarSetId}/maker/outlines/${name}_${gender}_gpt_outline.json`;
+ }
+ 
++/** The avatar's head+neck picture: its own head, its neck fading to clear at the tee collar (neckFit.ts). */
++function authoringHeadNeckKey(avatarSetId: string, gender: MakerFileGender, ethnicity: string): string {
++	return `avatar-sets/${avatarSetId}/maker/head_neck/${ethnicity}_${gender}_gpt.png`;
++}
++
++/** One per set. A set that has it bakes catalogue outfits on mixed ethnicities with the neck fit (neckFit.ts). */
++function authoringHeadShapeKey(avatarSetId: string): string {
++	return `avatar-sets/${avatarSetId}/maker/head_shape.png`;
++}
++
++/** One per catalogue outfit: where clothing starts under the chin, and the clothing kept by the jaw. */
++function authoringCollarKey(avatarSetId: string, clothesId: string): string {
++	return `avatar-sets/${avatarSetId}/maker/collar/${clothesId}.json`;
++}
++
+ function publicSeedKey(
+ 	avatarSetId: string,
+ 	ethnicity: 'european' | 'african',
+@@ -225,6 +250,116 @@ function mixFromMember(
+ 	};
+ }
+ 
++/** A neck-fit input that is not there: logged with its key, and the bake fails rather than joining another way. */
++function missingNeckFitInput(avatarSetId: string, what: string, key: string): AuthoringError {
++	console.error(`[neck fit] avatar set ${avatarSetId}: missing ${what} (${key}).`);
++	return new AuthoringError(
++		400,
++		'AVATAR_SET_CLOTHES_BAKE_FAILED',
++		`Missing neck-fit ${what} for avatar set ${avatarSetId}.`
++	);
++}
++
++async function requireNeckFitInput(avatarSetId: string, what: string, key: string): Promise<Buffer> {
++	const bytes = await loadAuthoring(key, true);
++	if (!bytes) throw missingNeckFitInput(avatarSetId, what, key);
++	return bytes;
++}
++
++async function loadOutfitCollar(avatarSetId: string, clothesId: string): Promise<OutfitCollar> {
++	const key = authoringCollarKey(avatarSetId, clothesId);
++	const bytes = await requireNeckFitInput(avatarSetId, `collar file for ${clothesId}`, key);
++	const { line, keep } = JSON.parse(bytes.toString('utf8')) as { line?: unknown; keep?: unknown };
++	if (!Array.isArray(line) || line.length !== PLATE_SIZE || !Array.isArray(keep)) {
++		console.error(`[neck fit] avatar set ${avatarSetId}: collar file ${key} has no ${PLATE_SIZE}-column line or keep list.`);
++		throw new AuthoringError(
++			400,
++			'AVATAR_SET_CLOTHES_BAKE_FAILED',
++			`The neck-fit collar file for ${clothesId} in avatar set ${avatarSetId} is not valid.`
++		);
++	}
++	return { line: line as number[], keep: keep as [number, number, number][] };
++}
++
++/**
++ * What the neck fit makes once per set (the seed jaws) and once per avatar, kept for this process. A load that fails
++ * is dropped, so the next bake tries again.
++ */
++const fitSeedsMemo = new Map<string, Promise<FitSeeds>>();
++const fitAvatarMemo = new Map<string, Promise<FitAvatar>>();
++
++function remembered<T>(memo: Map<string, Promise<T>>, key: string, make: () => Promise<T>): Promise<T> {
++	let hit = memo.get(key);
++	if (!hit) {
++		hit = make();
++		memo.set(key, hit);
++		hit.catch(() => memo.delete(key));
++	}
++	return hit;
++}
++
++async function loadSeedOutlines(
++	avatarSetId: string,
++	gender: MakerFileGender
++): Promise<{ light: FaceOutline; dark: FaceOutline }> {
++	const [light, dark] = await Promise.all(
++		(['anna', 'precious'] as const).map(async (name) => {
++			const key = authoringOutlineKey(avatarSetId, gender, name);
++			const bytes = await requireNeckFitInput(avatarSetId, `${name} outline`, key);
++			return JSON.parse(bytes.toString('utf8')) as FaceOutline;
++		})
++	);
++	return { light, dark };
++}
++
++function loadFitSeeds(avatarSetId: string, gender: MakerFileGender): Promise<FitSeeds> {
++	return remembered(fitSeedsMemo, `${avatarSetId}:${gender}`, async () => {
++		const [outlines, base, baseDark] = await Promise.all([
++			loadSeedOutlines(avatarSetId, gender),
++			loadSeedPng(avatarSetId, 'european', BASE_OUTFIT, undefined, undefined, true).then(decodePlateRgba),
++			loadSeedPng(avatarSetId, 'african', BASE_OUTFIT, undefined, undefined, true).then(decodePlateRgba)
++		]);
++		return prepareFitSeeds(outlines.light, outlines.dark, base, baseDark);
++	});
++}
++
++/** The avatar's neck fit (neckFit.ts): its jaw cut, the band round it, its colour change and shading. */
++function loadFitAvatar(
++	avatarSetId: string,
++	ethnicity: string,
++	gender: MakerFileGender,
++	headShape: Uint8Array,
++	mix: readonly [number, number, number]
++): Promise<FitAvatar> {
++	return remembered(fitAvatarMemo, `${avatarSetId}:${gender}:${ethnicity}:${mix.join(',')}`, async () => {
++		const outlineKey = authoringOutlineKey(avatarSetId, gender, ethnicity);
++		const headNeckKey = authoringHeadNeckKey(avatarSetId, gender, ethnicity);
++		const faceKey = authoringFaceKey(avatarSetId, gender, ethnicity);
++		const [seeds, outlines, outlineBytes, headNeckBytes, ownBytes, base, baseDark] = await Promise.all([
++			loadFitSeeds(avatarSetId, gender),
++			loadSeedOutlines(avatarSetId, gender),
++			requireNeckFitInput(avatarSetId, `${ethnicity} outline`, outlineKey),
++			requireNeckFitInput(avatarSetId, `${ethnicity} head+neck picture`, headNeckKey),
++			requireNeckFitInput(avatarSetId, `${ethnicity} white-tee picture`, faceKey),
++			loadSeedPng(avatarSetId, 'european', BASE_OUTFIT, undefined, undefined, true).then(decodePlateRgba),
++			loadSeedPng(avatarSetId, 'african', BASE_OUTFIT, undefined, undefined, true).then(decodePlateRgba)
++		]);
++		const [head, own] = await Promise.all([decodePlateRgba(headNeckBytes), decodePlateRgba(ownBytes)]);
++		return prepareFitAvatar({
++			head,
++			outline: JSON.parse(outlineBytes.toString('utf8')) as FaceOutline,
++			own,
++			base,
++			baseDark,
++			headShape,
++			seeds,
++			lightOutline: outlines.light,
++			darkOutline: outlines.dark,
++			mix
++		});
++	});
++}
++
+ export async function bakePlatePng(args: {
+ 	readonly set: AvatarSetPayload;
+ 	readonly clothesId: string;
+@@ -272,6 +407,28 @@ export async function bakePlatePng(args: {
+ 		);
+ 	}
+ 
++	// a catalogue outfit on a mixed ethnicity, in a set that has a head shape, is joined with the neck fit (neckFit.ts);
++	// then every other input it needs must be there too. Costumes, "+ New clothes" outfits, the two seed ethnicities
++	// and sets without a head shape use the maker below
++	const seedEthnicity = ethnicity === 'european' || ethnicity === 'african';
++	if (!args.wholeCostume && !seedEthnicity && set.clothesIds.includes(clothesId)) {
++		const headShapeBytes = await loadAuthoring(authoringHeadShapeKey(set.id), true);
++		if (headShapeBytes) {
++			const [light, dark, headShape, collar] = await Promise.all([
++				loadSeedPng(set.id, 'european', clothesId, projectId, prisma, true).then(decodePlateRgba),
++				loadSeedPng(set.id, 'african', clothesId, projectId, prisma, true).then(decodePlateRgba),
++				decodePlateRgba(headShapeBytes),
++				loadOutfitCollar(set.id, clothesId)
++			]);
++			const [fit, seeds] = await Promise.all([
++				loadFitAvatar(set.id, ethnicity, makerGender(), headShape, mix.values),
++				loadFitSeeds(set.id, makerGender())
++			]);
++			const rgba = stackFitPlate(light, dark, headShape, collar, mix.values, fit, outfitJaws(light, dark, seeds));
++			return encodePng(new Uint8Array(rgba));
++		}
++	}
++
+ 	const [lightBytes, darkBytes, baseBytes, faceBytes, ownOutlineBytes, lightOutlineBytes, darkOutlineBytes] =
+ 		await Promise.all([
+ 			loadSeedPng(set.id, 'european', clothesId, projectId, prisma),
+diff --git a/src/routes/internal/avatar-sets/[avatarSetId]/fitted-plate/+server.ts b/src/routes/internal/avatar-sets/[avatarSetId]/fitted-plate/+server.ts
+new file mode 100644
+index 0000000..ede5059
+--- /dev/null
++++ b/src/routes/internal/avatar-sets/[avatarSetId]/fitted-plate/+server.ts
+@@ -0,0 +1,71 @@
++// An ethnicity outfit plate made here on the server, for the Studio's preview - the same bake a character save runs
++// (bakePlatePng: the neck fit for a catalogue outfit in a set with a head shape), so the browser does no blending and
++// the preview is the saved picture. ?outfit=<catalogue clothes id>&race=<ethnicity>&size=256|512|1024&format=webp|png
++import sharp from 'sharp';
++
++import { AuthoringError, authoringErrorJson } from '$lib/server/authoring/authoringHttp';
++import { isAvatarSetMakerInputName, loadMakerFileGender } from '$lib/server/catalog/avatarSetMakerInput';
++import { loadAvatarSetById } from '$lib/server/catalog/avatarSets';
++import { bakePlatePng } from '$lib/server/catalog/resolveOrBakeAvatarSetClothes';
++import { requestIdFromLocals } from '$lib/server/http/structuredApiError';
++import { requirePortalContext } from '$lib/server/platform/portalContext';
++
++import type { RequestHandler } from './$types';
++
++const SIZES = [256, 512, 1024] as const;
++const FORMATS = { webp: 'image/webp', png: 'image/png' } as const;
++/** Plates made here lately, kept for this process: switching back to an outfit or ethnicity answers at once. */
++const KEEP = 240;
++const made = new Map<string, Promise<Uint8Array<ArrayBuffer>>>();
++
++function remember(key: string, make: () => Promise<Uint8Array<ArrayBuffer>>): Promise<Uint8Array<ArrayBuffer>> {
++	let hit = made.get(key);
++	if (hit) {
++		made.delete(key);
++	} else {
++		hit = make();
++		hit.catch(() => made.delete(key));
++	}
++	made.set(key, hit);
++	while (made.size > KEEP) made.delete(made.keys().next().value as string);
++	return hit;
++}
++
++export const GET: RequestHandler = async (event) => {
++	const requestId = requestIdFromLocals(event.locals);
++	const portal = await requirePortalContext(event.request.headers.get('authorization'));
++	const avatarSetId = event.params.avatarSetId?.trim() ?? '';
++	const outfit = event.url.searchParams.get('outfit') ?? '';
++	const race = event.url.searchParams.get('race') ?? '';
++	const size = Number(event.url.searchParams.get('size') ?? 1024);
++	const format = (event.url.searchParams.get('format') ?? 'webp') as keyof typeof FORMATS;
++	if (
++		!outfit ||
++		!race ||
++		!isAvatarSetMakerInputName(outfit) ||
++		!isAvatarSetMakerInputName(race) ||
++		!(SIZES as readonly number[]).includes(size) ||
++		!(format in FORMATS)
++	) {
++		return authoringErrorJson(new AuthoringError(400, 'INVALID_BODY', 'Bad plate request.'), requestId);
++	}
++	try {
++		const bytes = await remember(`${avatarSetId}:${outfit}:${race}:${size}:${format}`, async () => {
++			const set = await loadAvatarSetById(portal.prisma, avatarSetId);
++			const member = set?.members.find((m) => m.ethnicity === race);
++			if (!set || !member) throw new AuthoringError(404, 'UNKNOWN_INPUT', 'No such plate.');
++			if (!set.clothesIds.includes(outfit)) throw new AuthoringError(404, 'UNKNOWN_INPUT', 'No such plate.');
++			const makerGender = await loadMakerFileGender(portal.prisma, member.avatarId);
++			const png = await bakePlatePng({ set, clothesId: outfit, ethnicity: race, makerGender });
++			const resized = sharp(png).resize(size, size, { kernel: 'lanczos3' });
++			const out = format === 'png' ? resized.png() : resized.webp({ quality: 92 });
++			return new Uint8Array(await out.toBuffer()) as Uint8Array<ArrayBuffer>;
++		});
++		return new Response(bytes, {
++			headers: { 'content-type': FORMATS[format], 'cache-control': 'private, max-age=86400' }
++		});
++	} catch (error) {
++		if (error instanceof AuthoringError) return authoringErrorJson(error, requestId);
++		throw error;
++	}
++};
+-- 
+2.50.1 (Apple Git-155)
+

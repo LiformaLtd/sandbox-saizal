@@ -1,0 +1,90 @@
+From 826ecaaece007be4baf34914f4aa361e7599a839 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:02:58 +0000
+Subject: [PATCH 5/5] Line-up check: a closest picture that cannot be read back
+ fails the step instead of ending the poll
+
+Left to throw, the poll would end without an answer and a later poll would run,
+and pay for, the same try again.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../clothesGeneration/raceOutfitSteps.test.ts | 20 +++++++++++++
+ .../clothesGeneration/raceOutfitSteps.ts      | 29 +++++++++++++------
+ 2 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts b/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
+index dd70501..471fdbb 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
+@@ -882,6 +882,26 @@ describe('automatic re-tries', () => {
+ 		expect(studioEdit.edit).toHaveBeenCalledTimes(3);
+ 	});
+ 
++	it('fails the step, without drawing again, when the closest picture cannot be read back', async () => {
++		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
++		const step = await startAfricanCoat();
++		const last = await notLinedUp(22, 30);
++		studioEdit.edit
++			.mockRejectedValueOnce(await notLinedUp(30, 10))
++			.mockRejectedValueOnce(await notLinedUp(14, 20))
++			.mockRejectedValueOnce(last);
++		await pollRaceOutfitStep(prisma, 'proj_1', step.token);
++		await pollRaceOutfitStep(prisma, 'proj_1', step.token);
++		r2.stored.delete(`race-outfit-edits/${step.invocationId}/lineup-2-rgb.png`);
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'failed', error: last.message });
++		expect(console.error).toHaveBeenCalledWith(
++			'clothes.lineup closest not read',
++			expect.objectContaining({ invocationId: step.invocationId, tryNo: 2 })
++		);
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'failed' });
++		expect(studioEdit.edit).toHaveBeenCalledTimes(3);
++	});
++
+ 	it('never keeps a try another check refused', async () => {
+ 		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
+ 		const step = await startAfricanCoat();
+diff --git a/src/lib/server/clothesGeneration/raceOutfitSteps.ts b/src/lib/server/clothesGeneration/raceOutfitSteps.ts
+index ebdb185..ce41c0f 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitSteps.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitSteps.ts
+@@ -635,16 +635,27 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 			// step's picture (the user's 10 Nov choice). Logged as an error, because the check did fail.
+ 			if (attempt.tryNo >= STUDIO_CLOTHES_MAX_TRIES && lineUpTries.length) {
+ 				const closest = lineUpTries.reduce((best, entry) => (entry.movedPx < best.movedPx ? entry : best));
+-				const kept = await loadRaceOutfitLineUpTry(ticket.invocationId, closest.tryNo);
+-				console.error('clothes.lineup kept closest', {
+-					invocationId: ticket.invocationId,
+-					tryNo: closest.tryNo,
+-					movedPx: closest.movedPx,
+-					tries: lineUpTries
++				// A kept picture that cannot be read back fails the step below, like any last failed try: left to throw,
++				// this poll would end without an answer and a later one would pay for the same try again.
++				const kept = await loadRaceOutfitLineUpTry(ticket.invocationId, closest.tryNo).catch((loadError: unknown) => {
++					console.error('clothes.lineup closest not read', {
++						invocationId: ticket.invocationId,
++						tryNo: closest.tryNo,
++						message: loadError instanceof Error ? loadError.message : String(loadError)
++					});
++					return null;
+ 				});
+-				await finishRaceOutfitEdit(ticket.invocationId, claim.token, kept.rgb, kept.alpha, null);
+-				await closeBilling(prisma, ticket, billing, usage, attempt.modelId);
+-				return stepView(ticket, { status: 'ready', jobStatus: 'succeeded', message: 'Ready' });
++				if (kept) {
++					console.error('clothes.lineup kept closest', {
++						invocationId: ticket.invocationId,
++						tryNo: closest.tryNo,
++						movedPx: closest.movedPx,
++						tries: lineUpTries
++					});
++					await finishRaceOutfitEdit(ticket.invocationId, claim.token, kept.rgb, kept.alpha, null);
++					await closeBilling(prisma, ticket, billing, usage, attempt.modelId);
++					return stepView(ticket, { status: 'ready', jobStatus: 'succeeded', message: 'Ready' });
++				}
+ 			}
+ 			if (attempt.tryNo > 1 || (attempt.hops ?? 0) > 0) {
+ 				console.error('clothes.edit failed after re-tries', {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,857 @@
+From 4808e030b598bf02e6102066f66738dd768db177 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:48:31 +0000
+Subject: [PATCH 5/5] Suggest sets from the participant's side, one hair id per
+ style, outfits per body
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three gaps found when the setup suggestions were reviewed on 10 Nov:
+
+- Sets: the first suggested set could be the view from the staff side of a
+  desk (airport test: "Check In Desk · Standing Behind Desk" for a check-in
+  agent character). Each public set now carries the side its view is drawn
+  from, read from its backdrop's reviewed interaction record (123 modern
+  sets: 14 customer-side, 7 staff-side, 102 both). One-sided lines say so,
+  the setup AI names participantSide (customer, service-provider or none),
+  and the server drops and logs a suggested set drawn from the other side.
+  participantSide is not sent on to the Studio.
+- Hair: the generator was sent every race copy of every hair id (873
+  women's and 665 men's ids for 106 and 116 styles and colours). It now gets
+  one id per style and colour, and the hair id it returns is checked against
+  that list like the outfit ids (logged and dropped when unknown). The
+  whole request is 45% smaller on the local database copy.
+- Outfits: an outfit id used on both bodies took its name and labels from
+  whichever row came first, so the women's high_school_teacher and
+  taxi_driver read the men's outfit. Each gender now reads only its own
+  bodies' catalogue rows.
+
+Checked with the real list code on the local database copy; not yet checked
+with real AI answers.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/lib/server/places/locationPreview.ts      |   2 +-
+ .../platform/characterWardrobeChoices.test.ts |  82 ++++++++-----
+ .../platform/characterWardrobeChoices.ts      |  69 ++++++++---
+ .../generateExperienceSetupDetails.test.ts    |  25 ++++
+ .../generateExperienceSetupDetails.ts         |  22 +++-
+ ...jectSetupDetailsGenerationEndpoint.test.ts |  10 +-
+ .../platform/setSuggestionChoices.test.ts     | 103 ++++++++++++----
+ .../server/platform/setSuggestionChoices.ts   | 112 +++++++++++++++---
+ 8 files changed, 332 insertions(+), 93 deletions(-)
+
+diff --git a/src/lib/server/places/locationPreview.ts b/src/lib/server/places/locationPreview.ts
+index e86f741..d5a8d4a 100644
+--- a/src/lib/server/places/locationPreview.ts
++++ b/src/lib/server/places/locationPreview.ts
+@@ -52,7 +52,7 @@ export function placeLocationPreviewFromRow(row: Location): PlaceLocationPreview
+ 	};
+ }
+ 
+-function indexLocationAliases(
++export function indexLocationAliases(
+ 	locationId: string,
+ 	studioId: string | null | undefined,
+ 	set: (key: string) => void
+diff --git a/src/lib/server/platform/characterWardrobeChoices.test.ts b/src/lib/server/platform/characterWardrobeChoices.test.ts
+index f57f5d9..02a2a4b 100644
+--- a/src/lib/server/platform/characterWardrobeChoices.test.ts
++++ b/src/lib/server/platform/characterWardrobeChoices.test.ts
+@@ -3,19 +3,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+ vi.mock('$lib/server/catalog/avatars', () => ({
+ 	listPublishedAvatars: async () => [
+-		{ id: 'anna', gender: 'female', supportsCostumes: true, clothesIds: ['barista--european', 'old_custom_coat'], hairIds: ['bob'] },
+-		{ id: 'caleb', gender: 'male', supportsCostumes: true, clothesIds: ['barista', 'chef'], hairIds: ['crew'] },
++		{ id: 'anna', gender: 'female', supportsCostumes: true, clothesIds: ['barista--european', 'old_custom_coat'], hairIds: ['bob', 'bob--african', 'lob--african'] },
++		{ id: 'ama', gender: 'female', supportsCostumes: true, clothesIds: [], hairIds: ['bob--african'] },
++		{ id: 'caleb', gender: 'male', supportsCostumes: true, clothesIds: ['barista', 'chef'], hairIds: ['crew', 'crew--african'] },
+ 		{ id: 'sofia', gender: 'female', supportsCostumes: false, clothesIds: ['ballgown'], hairIds: [] }
+ 	]
+ }));
+ 
+-const loadAvatarSetByAvatarIdMap = vi.hoisted(() =>
+-	vi.fn(async () => new Map([['anna', { clothesIds: ['barista', 'business_woman_in_suit.7'] }]]))
+-);
++const womenSet = { clothesIds: ['barista', 'business_woman_in_suit.7'] };
++const loadAvatarSetByAvatarIdMap = vi.hoisted(() => vi.fn());
+ vi.mock('$lib/server/catalog/avatarSets', () => ({ loadAvatarSetByAvatarIdMap }));
+ 
+ import {
+-	checkedClothesPicks,
++	checkedWardrobePicks,
+ 	loadCharacterWardrobeChoices,
+ 	wardrobePromptChoices,
+ 	type CharacterWardrobeChoices
+@@ -28,16 +28,24 @@ afterEach(() => {
+ });
+ 
+ describe('loadCharacterWardrobeChoices', () => {
+-	it('takes outfits from the avatar set the Studio dresses from, else the avatar list, with catalogue names and merged labels', async () => {
++	it('takes outfits from the avatar set the Studio dresses from, else the avatar list, each described from its own body', async () => {
++		loadAvatarSetByAvatarIdMap.mockResolvedValue(
++			new Map([
++				['anna', womenSet],
++				['ama', womenSet]
++			])
++		);
+ 		const findMany = vi.fn(async () => [
+-			{ catalogueKey: 'barista', name: 'Barista Apron Outfit', taxonomyAssignments: [label('role', 'Barista'), label('outfit-type', 'Uniform')] },
+-			{ catalogueKey: 'barista', name: 'Barista Apron Outfit', taxonomyAssignments: [label('outfit-type', 'Uniform'), label('formality', 'Casual')] },
+-			{ catalogueKey: 'chef', name: 'Chef Whites', taxonomyAssignments: [] }
++			{ catalogueKey: 'barista', avatarId: 'caleb', name: 'Barista Apron And Shirt', taxonomyAssignments: [label('outfit-type', 'Uniform'), label('formality', 'Smart casual')] },
++			{ catalogueKey: 'barista', avatarId: 'anna', name: 'Barista Apron And Blouse', taxonomyAssignments: [label('role', 'Barista'), label('outfit-type', 'Uniform')] },
++			{ catalogueKey: 'barista', avatarId: 'ama', name: 'Barista Apron And Blouse', taxonomyAssignments: [label('outfit-type', 'Uniform'), label('formality', 'Casual')] },
++			{ catalogueKey: 'barista', avatarId: 'unpublished', name: 'Barista On Another Body', taxonomyAssignments: [label('role', 'Waiter')] },
++			{ catalogueKey: 'chef', avatarId: 'caleb', name: 'Chef Whites', taxonomyAssignments: [] }
+ 		]);
+ 		const prisma = { clothes: { findMany } } as unknown as PrismaClient;
+ 		const choices = await loadCharacterWardrobeChoices(prisma);
+ 
+-		expect(loadAvatarSetByAvatarIdMap).toHaveBeenCalledWith(prisma, ['anna', 'caleb']);
++		expect(loadAvatarSetByAvatarIdMap).toHaveBeenCalledWith(prisma, ['anna', 'ama', 'caleb']);
+ 		expect(findMany).toHaveBeenCalledWith(
+ 			expect.objectContaining({
+ 				where: {
+@@ -50,61 +58,79 @@ describe('loadCharacterWardrobeChoices', () => {
+ 		);
+ 		expect(choices.female).toEqual({
+ 			clothes: [
+-				{ id: 'barista', name: 'Barista Apron Outfit', role: ['Barista'], outfitType: ['Uniform'], formality: ['Casual'] },
++				{ id: 'barista', name: 'Barista Apron And Blouse', role: ['Barista'], outfitType: ['Uniform'], formality: ['Casual'] },
+ 				{ id: 'business_woman_in_suit.7', name: '', role: [], outfitType: [], formality: [] }
+ 			],
+-			hair: ['bob']
++			hair: ['bob', 'lob']
+ 		});
+ 		expect(wardrobePromptChoices(choices)).toEqual({
+ 			female: {
+ 				clothes: {
+-					barista: 'Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)',
++					barista: 'Barista Apron And Blouse (role: Barista; outfit: Uniform; formality: Casual)',
+ 					'business_woman_in_suit.7': ''
+ 				},
+-				hair: ['bob']
++				hair: ['bob', 'lob']
+ 			},
+ 			male: {
+-				clothes: { barista: 'Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)', chef: 'Chef Whites' },
++				clothes: { barista: 'Barista Apron And Shirt (outfit: Uniform; formality: Smart casual)', chef: 'Chef Whites' },
+ 				hair: ['crew']
+ 			}
+ 		});
+ 	});
+ });
+ 
+-describe('checkedClothesPicks', () => {
++describe('checkedWardrobePicks', () => {
+ 	const choices: CharacterWardrobeChoices = {
+ 		female: {
+ 			clothes: ['barista', 'waitress', 'chef'].map((id) => ({ id, name: '', role: [], outfitType: [], formality: [] })),
+-			hair: []
++			hair: ['bob', 'lob']
+ 		},
+-		male: { clothes: [], hair: [] }
++		male: { clothes: [], hair: ['crew'] }
+ 	};
+ 
+ 	it('keeps listed ids and drops a repeat of the starting outfit', () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+ 		expect(
+-			checkedClothesPicks(
+-				{ characterGender: 'female', characterClothesId: 'barista', suggestedClothesIds: ['waitress', 'barista', 'chef'] },
++			checkedWardrobePicks(
++				{ characterGender: 'female', characterClothesId: 'barista', suggestedClothesIds: ['waitress', 'barista', 'chef'], characterHairId: ' lob ' },
+ 				choices
+ 			)
+-		).toEqual({ characterGender: 'female', characterClothesId: 'barista', suggestedClothesIds: ['waitress', 'chef'] });
+-		expect(checkedClothesPicks({ characterGender: 'female', characterClothesId: '', suggestedClothesIds: [] }, choices))
+-			.toEqual({ characterGender: 'female', characterClothesId: '', suggestedClothesIds: [] });
++		).toEqual({ characterGender: 'female', characterClothesId: 'barista', suggestedClothesIds: ['waitress', 'chef'], characterHairId: 'lob' });
++		expect(
++			checkedWardrobePicks({ characterGender: 'female', characterClothesId: '', suggestedClothesIds: [], characterHairId: '' }, choices)
++		).toEqual({ characterGender: 'female', characterClothesId: '', suggestedClothesIds: [], characterHairId: '' });
+ 		expect(warn).not.toHaveBeenCalled();
+ 	});
+ 
+-	it('logs and drops ids that are not in the list for that gender', () => {
++	it('logs and drops outfit ids that are not in the list for that gender', () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+ 		expect(
+-			checkedClothesPicks(
+-				{ characterGender: 'male', characterClothesId: 'barista', suggestedClothesIds: ['invented_coat'] },
++			checkedWardrobePicks(
++				{ characterGender: 'male', characterClothesId: 'barista', suggestedClothesIds: ['invented_coat'], characterHairId: 'crew' },
+ 				choices
+ 			)
+-		).toEqual({ characterGender: 'male', characterClothesId: '', suggestedClothesIds: [] });
++		).toEqual({ characterGender: 'male', characterClothesId: '', suggestedClothesIds: [], characterHairId: 'crew' });
++		expect(warn).toHaveBeenCalledTimes(1);
+ 		expect(warn).toHaveBeenCalledWith('[experience.setup.details] outfit ids are not in the published list', {
+ 			gender: 'male',
+ 			unknown: ['barista', 'invented_coat'],
+ 			offered: 0
+ 		});
+ 	});
++
++	it('logs and drops a hair id that is not in the list for that gender, such as a race copy', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(
++			checkedWardrobePicks(
++				{ characterGender: 'female', characterClothesId: 'chef', suggestedClothesIds: [], characterHairId: 'bob--african' },
++				choices
++			)
++		).toEqual({ characterGender: 'female', characterClothesId: 'chef', suggestedClothesIds: [], characterHairId: '' });
++		expect(warn).toHaveBeenCalledTimes(1);
++		expect(warn).toHaveBeenCalledWith('[experience.setup.details] hair id is not in the published list', {
++			gender: 'female',
++			unknown: 'bob--african',
++			offered: 2
++		});
++	});
+ });
+diff --git a/src/lib/server/platform/characterWardrobeChoices.ts b/src/lib/server/platform/characterWardrobeChoices.ts
+index 8523cdb..7c2a92e 100644
+--- a/src/lib/server/platform/characterWardrobeChoices.ts
++++ b/src/lib/server/platform/characterWardrobeChoices.ts
+@@ -13,43 +13,58 @@ export type ClothesChoice = {
+ 	readonly outfitType: readonly string[];
+ 	readonly formality: readonly string[];
+ };
+-export type CharacterWardrobeChoices = Record<'female' | 'male', { clothes: ClothesChoice[]; hair: string[] }>;
++type Gender = 'female' | 'male';
++export type CharacterWardrobeChoices = Record<Gender, { clothes: ClothesChoice[]; hair: string[] }>;
+ 
+ const LABEL_DIMENSIONS = { role: 'role', 'outfit-type': 'outfitType', formality: 'formality' } as const;
+ type LabelField = (typeof LABEL_DIMENSIONS)[keyof typeof LABEL_DIMENSIONS];
+ 
++/** `bob-brown.1--african` is the African head's copy of `bob-brown.1`. The generator picks the style; the Studio wears the chosen ethnicity's copy. */
++function baseHairId(id: string): string {
++	const at = id.lastIndexOf('--');
++	return at > 0 && at + 2 < id.length ? id.slice(0, at) : id;
++}
++
+ /**
+  * Only published wardrobe ids are supplied to the initial experience generator. Outfits come from the
+  * list the Studio dresses a character from: the avatar set's list when the avatar is in a set (the race
+- * looks share one), else the avatar's own list.
++ * looks share one), else the avatar's own list. Hair is one id per style and colour, without the race copies.
+  */
+ export async function loadCharacterWardrobeChoices(prisma: PrismaClient): Promise<CharacterWardrobeChoices> {
+ 	const avatars = (await listPublishedAvatars()).filter(avatar => avatar.supportsCostumes);
+ 	const sets = await loadAvatarSetByAvatarIdMap(prisma, avatars.map(avatar => avatar.id));
+-	const forGender = (gender: string) => {
++	const forGender = (gender: Gender) => {
+ 		const rows = avatars.filter(avatar => avatar.gender === gender);
+ 		return {
+ 			clothes: [...new Set(rows.flatMap(row => sets.get(row.id)?.clothesIds ?? row.clothesIds ?? []))],
+-			hair: [...new Set(rows.flatMap(row => row.hairIds ?? []))]
++			hair: [...new Set(rows.flatMap(row => row.hairIds ?? []).map(baseHairId))]
+ 		};
+ 	};
+ 	const female = forGender('female');
+ 	const male = forGender('male');
+-	const described = await describeCatalogueClothes(prisma, [...female.clothes, ...male.clothes]);
+-	const describe = (id: string): ClothesChoice => ({
++	const described = await describeCatalogueClothes(
++		prisma,
++		[...female.clothes, ...male.clothes],
++		new Map(avatars.map(avatar => [avatar.id, avatar.gender]))
++	);
++	const describe = (gender: Gender) => (id: string): ClothesChoice => ({
+ 		id,
+-		...(described.get(id.toLowerCase()) ?? { name: '', role: [], outfitType: [], formality: [] })
++		...(described.get(`${gender}:${id.toLowerCase()}`) ?? { name: '', role: [], outfitType: [], formality: [] })
+ 	});
+ 	return {
+-		female: { clothes: female.clothes.map(describe), hair: female.hair },
+-		male: { clothes: male.clothes.map(describe), hair: male.hair }
++		female: { clothes: female.clothes.map(describe('female')), hair: female.hair },
++		male: { clothes: male.clothes.map(describe('male')), hair: male.hair }
+ 	};
+ }
+ 
+-/** Name and labels of the public catalogue rows for these outfit ids. Each avatar has its own row, so labels are merged. */
++/**
++ * Name and labels of the public catalogue rows for these outfit ids, keyed `<gender>:<id>`. One outfit id
++ * can be a different outfit on the women's and the men's body, so each gender reads only its own bodies' rows.
++ */
+ async function describeCatalogueClothes(
+ 	prisma: PrismaClient,
+-	ids: readonly string[]
++	ids: readonly string[],
++	genderOfAvatar: ReadonlyMap<string, string | undefined>
+ ): Promise<Map<string, Omit<ClothesChoice, 'id'>>> {
+ 	const rows = await prisma.clothes.findMany({
+ 		where: {
+@@ -60,6 +75,7 @@ async function describeCatalogueClothes(
+ 		},
+ 		select: {
+ 			catalogueKey: true,
++			avatarId: true,
+ 			name: true,
+ 			taxonomyAssignments: {
+ 				where: { dimension: { in: Object.keys(LABEL_DIMENSIONS) } },
+@@ -69,8 +85,9 @@ async function describeCatalogueClothes(
+ 	});
+ 	const byKey = new Map<string, { name: string } & Record<LabelField, string[]>>();
+ 	for (const row of rows) {
+-		const key = row.catalogueKey?.toLowerCase();
+-		if (!key) continue;
++		const gender = genderOfAvatar.get(row.avatarId);
++		if (!row.catalogueKey || !gender) continue;
++		const key = `${gender}:${row.catalogueKey.toLowerCase()}`;
+ 		const entry = byKey.get(key) ?? { name: '', role: [], outfitType: [], formality: [] };
+ 		if (!entry.name) entry.name = row.name.trim();
+ 		for (const { dimension, value } of row.taxonomyAssignments) {
+@@ -105,18 +122,27 @@ export function wardrobePromptChoices(choices: CharacterWardrobeChoices) {
+ 	};
+ }
+ 
+-/** Keeps only outfit ids in the chosen gender's published list; any other id is logged and dropped, never swapped. */
+-export function checkedClothesPicks<
++/** Keeps only outfit and hair ids in the chosen gender's published lists; any other id is logged and dropped, never swapped. */
++export function checkedWardrobePicks<
+ 	T extends {
+ 		readonly characterGender: string;
+ 		readonly characterClothesId: string;
+ 		readonly suggestedClothesIds: readonly string[];
++		readonly characterHairId: string;
+ 	}
+ >(details: T, choices: CharacterWardrobeChoices | undefined): T {
+ 	const gender = details.characterGender;
+-	const offered = new Set(
+-		(gender === 'female' || gender === 'male' ? (choices?.[gender].clothes ?? []) : []).map(choice => choice.id)
+-	);
++	const forGender = gender === 'female' || gender === 'male' ? choices?.[gender] : undefined;
++	const offered = new Set((forGender?.clothes ?? []).map(choice => choice.id));
++	const offeredHair = new Set(forGender?.hair ?? []);
++	const hairId = details.characterHairId.trim();
++	if (hairId && !offeredHair.has(hairId)) {
++		console.warn('[experience.setup.details] hair id is not in the published list', {
++			gender,
++			unknown: hairId,
++			offered: offeredHair.size
++		});
++	}
+ 	const picked = [details.characterClothesId, ...details.suggestedClothesIds].map(id => id.trim()).filter(Boolean);
+ 	const unknown = picked.filter(id => !offered.has(id));
+ 	if (unknown.length > 0) {
+@@ -130,5 +156,10 @@ export function checkedClothesPicks<
+ 	const suggestedClothesIds = [...new Set(details.suggestedClothesIds.map(id => id.trim()))]
+ 		.filter(id => offered.has(id) && id !== characterClothesId)
+ 		.slice(0, MAX_SUGGESTED_CLOTHES);
+-	return { ...details, characterClothesId, suggestedClothesIds };
++	return {
++		...details,
++		characterClothesId,
++		suggestedClothesIds,
++		characterHairId: offeredHair.has(hairId) ? hairId : ''
++	};
+ }
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.test.ts b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+index f241c48..11e3379 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.test.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+@@ -211,6 +211,29 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 		expect(parseGeneratedExperienceSetupDetails(JSON.stringify(base))?.setUniverse).toBeUndefined();
+ 	});
+ 
++	it('keeps a known participant side and leaves out "none" or any other value', () => {
++		const base = {
++			title: 'Valid',
++			description: 'ok',
++			introduction: '',
++			characterName: 'Ada',
++			characterRole: 'Tutor',
++			characterPersonality: '',
++			characterInstructions: '',
++			setName: 'Room',
++			setDescription: 'A bright room in the daytime.',
++			startingMessage: 'Hello.',
++			systemInstructions: 'Help the participant practise.'
++		};
++		const side = (participantSide?: string) =>
++			parseGeneratedExperienceSetupDetails(JSON.stringify({ ...base, participantSide }))?.participantSide;
++		expect(side(' Customer ')).toBe('customer');
++		expect(side('service-provider')).toBe('service-provider');
++		expect(side('none')).toBeUndefined();
++		expect(side('passenger')).toBeUndefined();
++		expect(side()).toBeUndefined();
++	});
++
+ 	it('snaps a nearby age and a spaced ethnicity onto the character form values', () => {
+ 		expect(
+ 			parseGeneratedExperienceSetupDetails(
+@@ -268,5 +291,7 @@ describe('EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT', () => {
+ 			'exactly one of "contemporary", "historical", "fantasy", "science-fiction", "supernatural"'
+ 		);
+ 		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain('Suggest only sets whose universe is setUniverse');
++		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain('"participantSide":"customer"');
++		expect(EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT).toContain('suggest it only when it matches participantSide');
+ 	});
+ });
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.ts b/src/lib/server/platform/generateExperienceSetupDetails.ts
+index fe97f2b..ba1d207 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.ts
+@@ -1,10 +1,16 @@
+ import {
+-	checkedClothesPicks,
++	checkedWardrobePicks,
+ 	MAX_SUGGESTED_CLOTHES,
+ 	wardrobePromptChoices,
+ 	type CharacterWardrobeChoices
+ } from './characterWardrobeChoices';
+-import { MAX_SUGGESTED_SETS, SET_UNIVERSES, setChoicePromptLines, type SetChoice } from './setSuggestionChoices';
++import {
++	MAX_SUGGESTED_SETS,
++	PARTICIPANT_SIDES,
++	SET_UNIVERSES,
++	setChoicePromptLines,
++	type SetChoice
++} from './setSuggestionChoices';
+ import type { PrismaClient } from '@prisma/client';
+ import { z } from 'zod';
+ import { CONVERSATION_INSTRUCTION_QUALITY } from './conversationInstructionDesign';
+@@ -71,6 +77,7 @@ const generatedDetailsSchema = z
+ 		setName: z.string().trim().max(128),
+ 		setDescription: z.string().trim().max(800),
+ 		setUniverse: z.string().optional(),
++		participantSide: z.string().optional(),
+ 		suggestedSetRefs: z.array(z.number().int()).max(MAX_SUGGESTED_SETS).default([]),
+ 		startingMessage: z.string().trim().max(500),
+ 		systemInstructions: z.string().trim().max(5000)
+@@ -98,6 +105,7 @@ const RESPONSE_SCHEMA = {
+ 		'setName',
+ 		'setDescription',
+ 		'setUniverse',
++		'participantSide',
+ 		'suggestedSetRefs',
+ 		'startingMessage',
+ 		'systemInstructions'
+@@ -123,6 +131,7 @@ const RESPONSE_SCHEMA = {
+ 		setName: { type: 'string', maxLength: 128 },
+ 		setDescription: { type: 'string', maxLength: 800 },
+ 		setUniverse: { type: 'string', enum: [...SET_UNIVERSES] },
++		participantSide: { type: 'string', enum: [...PARTICIPANT_SIDES, 'none'] },
+ 		suggestedSetRefs: { type: 'array', items: { type: 'integer' }, maxItems: MAX_SUGGESTED_SETS },
+ 		startingMessage: { type: 'string', maxLength: 500 },
+ 		systemInstructions: { type: 'string', maxLength: 5000 }
+@@ -133,7 +142,7 @@ export const EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT = `You design a coherent Lif
+ Liforma Experiences are browser-based conversations between one human participant and one animated talking character.
+ 
+ Return ONLY valid JSON with exactly these fields:
+-{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","suggestedClothesIds":["...","..."],"characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","setUniverse":"contemporary","suggestedSetRefs":[17,4],"startingMessage":"...","systemInstructions":"..."}
++{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","suggestedClothesIds":["...","..."],"characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","setUniverse":"contemporary","participantSide":"customer","suggestedSetRefs":[17,4],"startingMessage":"...","systemInstructions":"..."}
+ 
+ Field rules:
+ - title: a clear, appealing title, 1–128 characters.
+@@ -151,7 +160,8 @@ Field rules:
+ - setName: a concise, reusable name for the visual setting where the conversation happens. Name the place, not the activity.
+ - setDescription: a reusable visual description of that setting for backdrop generation. Describe what the place looks like, the time of day, and the weather. Do not include the participant's task, the plot, or character instructions. At most 800 characters.
+ - setUniverse: the world the brief takes place in, exactly one of ${SET_UNIVERSES.map((universe) => `"${universe}"`).join(', ')}. Use "contemporary" for the present day and "historical" for any past period.
+-- suggestedSetRefs: up to three numbers from the supplied publicSets list (each line is "number: set name (universe; collection)") for the listed sets that best fit setName, setDescription, and the brief, best first. Suggest only sets whose universe is setUniverse and that show the same kind of place as the brief; when the list has no such set, return an empty array. Copy numbers exactly. Do not invent numbers.
++- participantSide: the participant's side of a desk or counter conversation. Use "customer" when the participant is the customer, guest, passenger, patient, learner, or candidate and the character serves them; "service-provider" when the participant is the member of staff, clinician, teacher, or interviewer and the character is the customer; "none" when neither applies.
++- suggestedSetRefs: up to three numbers from the supplied publicSets list (each line is "number: set name (universe; collection)") for the listed sets that best fit setName, setDescription, and the brief, best first. Suggest only sets whose universe is setUniverse and that show the same kind of place as the brief; when the list has no such set, return an empty array. A line that ends with "participant: customer" or "participant: service provider" is the view from that side of a desk or counter, with the character on the other side; suggest it only when it matches participantSide. Copy numbers exactly. Do not invent numbers.
+ - startingMessage: the exact first words spoken by the character. This is especially important. Write a natural opening in the character's voice that immediately establishes the situation and gives the participant something meaningful to respond to. Prefer one or two short sentences. Do not use stage directions, narration, quotation marks, labels, placeholders, or a generic "How can I help?" unless that truly fits the scenario. Do not speak for the participant or reveal information meant to remain hidden.
+ - systemInstructions: additional situation-specific instructions the model reads while playing this character. This is especially important. Write in second person ("you", "your") and refer to the human as "the participant". In clear present-tense prose, establish the immediate context, the participant's role, your objective, relevant facts, constraints, desired progression, and how you should respond to likely choices. Preserve participant agency and any deliberate mystery. Include concrete scenario facts needed for a consistent conversation, but do not repeat generic character identity or personality. Do not write in the third person, script the participant, mention prompts or models, or include implementation commentary. Write a detailed runnable brief with compact sections, normally 2,800–4,500 characters. Use the author brief as fixed direction and flesh out unspecified interaction design creatively, without fabricating real-world facts or unsupported capabilities.
+ 
+@@ -266,6 +276,8 @@ export function normalizeGeneratedExperienceSetupDetails(value: unknown): unknow
+ 	row.characterEthnicity = characterEthnicityFromUnknown(row.characterEthnicity);
+ 	const universe = typeof row.setUniverse === 'string' ? row.setUniverse.trim().toLowerCase() : '';
+ 	row.setUniverse = SET_UNIVERSES.includes(universe) ? universe : undefined;
++	const side = typeof row.participantSide === 'string' ? row.participantSide.trim().toLowerCase() : '';
++	row.participantSide = PARTICIPANT_SIDES.includes(side) ? side : undefined;
+ 	row.suggestedSetRefs = Array.isArray(row.suggestedSetRefs)
+ 		? row.suggestedSetRefs
+ 				.map((ref) => (typeof ref === 'string' ? Number(ref.trim()) : ref))
+@@ -413,7 +425,7 @@ export async function generateExperienceSetupDetails(input: {
+ 				'The generated experience details were invalid. Try again.'
+ 			);
+ 		}
+-		return checkedClothesPicks(details, input.wardrobeChoices);
++		return checkedWardrobePicks(details, input.wardrobeChoices);
+ 	} catch (error) {
+ 		if (error instanceof ExperienceSetupDetailsGenerationError) throw error;
+ 		throw new ExperienceSetupDetailsGenerationError();
+diff --git a/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts b/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
+index 5bc6962..fadeb2b 100644
+--- a/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
++++ b/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
+@@ -20,8 +20,12 @@ const publicSet = (setId: string, name: string) => ({
+ 	backdropId: `backdrop_${setId}`
+ });
+ const setChoices = [
+-	{ ref: 1, set: publicSet('set_park', 'Park · Picnic Area · Sitting At Table') },
+-	{ ref: 2, set: publicSet('set_hotel', 'Boutique Hotel · Reception · Looking At Desk') }
++	{ ref: 1, set: publicSet('set_park', 'Park · Picnic Area · Sitting At Table'), participantSides: [] },
++	{
++		ref: 2,
++		set: publicSet('set_hotel', 'Boutique Hotel · Reception · Looking At Desk'),
++		participantSides: ['customer']
++	}
+ ];
+ vi.mock('$lib/server/platform/setSuggestionChoices', async (importOriginal) => ({
+ 	...(await importOriginal<typeof import('$lib/server/platform/setSuggestionChoices')>()),
+@@ -70,6 +74,7 @@ const generatedDetails = {
+ 	characterInstructions: 'Maya protects guest privacy.',
+ 	setName: 'Hotel front desk',
+ 	setUniverse: 'contemporary',
++	participantSide: 'customer',
+ 	suggestedSetRefs: [2],
+ 	startingMessage: 'May I see your booking confirmation?',
+ 	systemInstructions: 'Help the participant resolve a missing reservation.'
+@@ -138,6 +143,7 @@ describe('POST /internal/projects/:projectId/setup-details/generate', () => {
+ 		expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+ 		const body = await response.json();
+ 		expect(body).not.toHaveProperty('suggestedSetRefs');
++		expect(body).not.toHaveProperty('participantSide');
+ 		expect(body).toEqual({
+ 			title: generatedDetails.title,
+ 			description: generatedDetails.description,
+diff --git a/src/lib/server/platform/setSuggestionChoices.test.ts b/src/lib/server/platform/setSuggestionChoices.test.ts
+index ae22d99..7c3a6aa 100644
+--- a/src/lib/server/platform/setSuggestionChoices.test.ts
++++ b/src/lib/server/platform/setSuggestionChoices.test.ts
+@@ -41,26 +41,47 @@ function set(
+ }
+ 
+ const choices: SetChoice[] = [
+-	{ ref: 1, set: set('set_a', 'Boutique Hotel · Reception · Looking At Desk') },
+-	{ ref: 2, set: set('set_b', 'Park · Picnic Area · Sitting At Table') },
+-	{ ref: 3, set: set('set_c', 'Colliseum · Colliseum Entrance', 'ancient_rome', 'historical') },
+-	{ ref: 4, set: set('set_d', 'Station · Platform') },
+-	{ ref: 5, set: set('set_e', 'Library · Reading Room') }
++	{ ref: 1, set: set('set_a', 'Boutique Hotel · Reception · Looking At Desk'), participantSides: ['customer'] },
++	{
++		ref: 2,
++		set: set('set_b', 'Park · Picnic Area · Sitting At Table'),
++		participantSides: ['customer', 'service-provider']
++	},
++	{ ref: 3, set: set('set_c', 'Colliseum · Colliseum Entrance', 'ancient_rome', 'historical'), participantSides: [] },
++	{ ref: 4, set: set('set_d', 'Station · Platform'), participantSides: [] },
++	{ ref: 5, set: set('set_e', 'Library · Reading Room'), participantSides: [] },
++	{
++		ref: 6,
++		set: set('set_f', 'Boutique Hotel · Reception · Standing Behind Desk'),
++		participantSides: ['service-provider']
++	}
+ ];
+ 
+ afterEach(() => vi.restoreAllMocks());
+ 
+ describe('public set suggestions', () => {
+-	it('offers only sets with a universe label, numbered, and logs the rest', async () => {
++	it('offers only sets with a universe label, numbered, with the side each view is drawn from, and logs the rest', async () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+ 		listCatalogueSets.mockResolvedValue({
+ 			sets: [set('set_a', 'Hotel'), set('set_x', 'Unlabelled Hall', 'new_collection', null), set('set_b', 'Park')]
+ 		});
+-		const offered = await loadPublicSetChoices({} as PrismaClient);
+-		expect(offered.map(({ ref, set }) => [ref, set.setId])).toEqual([
+-			[1, 'set_a'],
+-			[2, 'set_b']
++		const findMany = vi.fn(async () => [
++			{
++				locationId: 'backdrop_set_a',
++				studioId: 'abcd1234',
++				interactionJson: { profiles: [{ viewerRole: 'guest', avatarRole: 'hospitality_staff' }] }
++			},
++			{ locationId: 'backdrop_set_b', studioId: 'efgh5678', interactionJson: null }
+ 		]);
++		const offered = await loadPublicSetChoices({ location: { findMany } } as unknown as PrismaClient);
++		expect(offered.map(({ ref, set, participantSides }) => [ref, set.setId, participantSides])).toEqual([
++			[1, 'set_a', ['customer']],
++			[2, 'set_b', []]
++		]);
++		expect(findMany).toHaveBeenCalledWith({
++			where: { locationId: { in: ['backdrop_set_a', 'backdrop_set_b'] } },
++			select: { locationId: true, studioId: true, interactionJson: true }
++		});
+ 		expect(warn).toHaveBeenCalledWith(expect.stringContaining('no universe label'), {
+ 			count: 1,
+ 			examples: ['Unlabelled Hall']
+@@ -73,25 +94,36 @@ describe('public set suggestions', () => {
+ 		]);
+ 	});
+ 
+-	it('turns the model numbers into sets, best first, without repeats', () => {
+-		expect(suggestedSetsFromRefs([2, 1, 2], choices, 'contemporary').map((row) => row.setId)).toEqual([
+-			'set_b',
+-			'set_a'
++	it('names the participant side only for a view drawn from one side of a desk', () => {
++		expect(setChoicePromptLines([choices[0]!, choices[1]!, choices[5]!])).toEqual([
++			'1: Boutique Hotel · Reception · Looking At Desk (contemporary; modern; participant: customer)',
++			'2: Park · Picnic Area · Sitting At Table (contemporary; modern)',
++			'6: Boutique Hotel · Reception · Standing Behind Desk (contemporary; modern; participant: service provider)'
+ 		]);
+ 	});
+ 
++	it('turns the model numbers into sets, best first, without repeats', () => {
++		expect(
++			suggestedSetsFromRefs([2, 1, 2], choices, 'contemporary', undefined).map((row) => row.setId)
++		).toEqual(['set_b', 'set_a']);
++	});
++
+ 	it('drops numbers that are not in the list and says so', () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+-		expect(suggestedSetsFromRefs([99, 1], choices, 'contemporary').map((row) => row.setId)).toEqual(['set_a']);
++		expect(
++			suggestedSetsFromRefs([99, 1], choices, 'contemporary', undefined).map((row) => row.setId)
++		).toEqual(['set_a']);
+ 		expect(warn).toHaveBeenCalledWith(expect.stringContaining('not in the list'), {
+ 			unknown: [99],
+-			offered: 5
++			offered: 6
+ 		});
+ 	});
+ 
+ 	it('drops sets outside the brief universe and says so', () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+-		expect(suggestedSetsFromRefs([3, 1], choices, 'contemporary').map((row) => row.setId)).toEqual(['set_a']);
++		expect(
++			suggestedSetsFromRefs([3, 1], choices, 'contemporary', undefined).map((row) => row.setId)
++		).toEqual(['set_a']);
+ 		expect(warn).toHaveBeenCalledWith(expect.stringContaining('outside the brief universe'), {
+ 			universe: 'contemporary',
+ 			dropped: [{ ref: 3, name: 'Colliseum · Colliseum Entrance', universe: 'historical' }]
+@@ -100,7 +132,7 @@ describe('public set suggestions', () => {
+ 
+ 	it('drops every set when the model named no universe, and says so', () => {
+ 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+-		expect(suggestedSetsFromRefs([1, 2], choices, undefined)).toEqual([]);
++		expect(suggestedSetsFromRefs([1, 2], choices, undefined, undefined)).toEqual([]);
+ 		expect(warn).toHaveBeenCalledWith(expect.stringContaining('outside the brief universe'), {
+ 			universe: null,
+ 			dropped: [
+@@ -110,13 +142,41 @@ describe('public set suggestions', () => {
+ 		});
+ 	});
+ 
++	it('drops a view drawn from the other side of the desk than the participant, and says so', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		// The staff-side view goes; the customer-side view, the open view and the view with no record stay.
++		expect(
++			suggestedSetsFromRefs([6, 1, 2, 4], choices, 'contemporary', 'customer').map((row) => row.setId)
++		).toEqual(['set_a', 'set_b', 'set_d']);
++		expect(warn).toHaveBeenCalledTimes(1);
++		expect(warn).toHaveBeenCalledWith(expect.stringContaining('other side of the desk'), {
++			participantSide: 'customer',
++			dropped: [
++				{ ref: 6, name: 'Boutique Hotel · Reception · Standing Behind Desk', sides: ['service-provider'] }
++			]
++		});
++		expect(
++			suggestedSetsFromRefs([6, 1], choices, 'contemporary', 'service-provider').map((row) => row.setId)
++		).toEqual(['set_f']);
++	});
++
++	it('keeps views from either side when the participant has no side', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(
++			suggestedSetsFromRefs([6, 1], choices, 'contemporary', undefined).map((row) => row.setId)
++		).toEqual(['set_f', 'set_a']);
++		expect(warn).not.toHaveBeenCalled();
++	});
++
+ 	it('keeps at most three suggestions', () => {
+-		expect(suggestedSetsFromRefs([1, 2, 4, 5], choices, 'contemporary')).toHaveLength(MAX_SUGGESTED_SETS);
++		expect(suggestedSetsFromRefs([1, 2, 4, 5], choices, 'contemporary', undefined)).toHaveLength(
++			MAX_SUGGESTED_SETS
++		);
+ 	});
+ 
+-	it('replaces the numbers and the universe with the sets in the reply to the Studio', () => {
++	it('replaces the numbers, the universe and the participant side with the sets in the reply to the Studio', () => {
+ 		const reply = setupDetailsResponse(
+-			{ title: 'Check-in', setUniverse: 'contemporary', suggestedSetRefs: [1] },
++			{ title: 'Check-in', setUniverse: 'contemporary', participantSide: 'customer', suggestedSetRefs: [6, 1] },
+ 			choices
+ 		);
+ 		expect(reply).toEqual({
+@@ -137,5 +197,6 @@ describe('public set suggestions', () => {
+ 		});
+ 		expect(reply).not.toHaveProperty('suggestedSetRefs');
+ 		expect(reply).not.toHaveProperty('setUniverse');
++		expect(reply).not.toHaveProperty('participantSide');
+ 	});
+ });
+diff --git a/src/lib/server/platform/setSuggestionChoices.ts b/src/lib/server/platform/setSuggestionChoices.ts
+index d95c2ea..70e3e63 100644
+--- a/src/lib/server/platform/setSuggestionChoices.ts
++++ b/src/lib/server/platform/setSuggestionChoices.ts
+@@ -4,7 +4,13 @@
+  */
+ import type { PrismaClient } from '@prisma/client';
+ 
++import { locationWhereForRefs } from '$lib/server/locations/locationLookup';
+ import { listCatalogueSets, type CatalogueSetListItem } from '$lib/server/places/listCatalogueSets';
++import { indexLocationAliases } from '$lib/server/places/locationPreview';
++import {
++	mapLocationInteractionToSides,
++	type InteractionSideSlug
++} from '$lib/server/taxonomy/mapLocationInteractionToSides';
+ import { platformTaxonomyValues } from '$lib/server/taxonomy/platformTaxonomyRegistry';
+ 
+ export const MAX_SUGGESTED_SETS = 3;
+@@ -12,8 +18,20 @@ export const MAX_SUGGESTED_SETS = 3;
+ /** The worlds a set can belong to (the platform `universe` labels): contemporary, historical, fantasy, ... */
+ export const SET_UNIVERSES: readonly string[] = platformTaxonomyValues('universe').map((value) => value.slug);
+ 
+-/** One public set, numbered for the model. */
+-export type SetChoice = { readonly ref: number; readonly set: CatalogueSetListItem };
++/** The sides of a desk or counter the participant can be on (the platform `interaction-side` labels). */
++export const PARTICIPANT_SIDES: readonly string[] = platformTaxonomyValues('interaction-side').map(
++	(value) => value.slug
++);
++
++/**
++ * One public set, numbered for the model. `participantSides` is the side of a desk or counter its view is
++ * drawn from (both for an open view); empty when its backdrop has no reviewed record of that.
++ */
++export type SetChoice = {
++	readonly ref: number;
++	readonly set: CatalogueSetListItem;
++	readonly participantSides: readonly InteractionSideSlug[];
++};
+ 
+ /** What the Studio needs to show a suggested set and copy it into the project on Next. */
+ export type SuggestedSet = Pick<
+@@ -39,39 +57,83 @@ export async function loadPublicSetChoices(prisma: PrismaClient): Promise<SetCho
+ 			examples: unlabelled.slice(0, 5).map((set) => set.name)
+ 		});
+ 	}
+-	return sets.filter((set) => set.universe).map((set, index) => ({ ref: index + 1, set }));
++	const offered = sets.filter((set) => set.universe);
++	const sides = await loadParticipantSides(
++		prisma,
++		offered.map((set) => set.backdropId)
++	);
++	return offered.map((set, index) => ({
++		ref: index + 1,
++		set,
++		participantSides: sides.get(set.backdropId) ?? []
++	}));
++}
++
++/** The side of a desk or counter each backdrop's view is drawn from, read from its reviewed interaction record. */
++async function loadParticipantSides(
++	prisma: PrismaClient,
++	backdropIds: readonly string[]
++): Promise<Map<string, InteractionSideSlug[]>> {
++	const where = locationWhereForRefs(backdropIds);
++	if (!where) return new Map();
++	const rows = await prisma.location.findMany({
++		where,
++		select: { locationId: true, studioId: true, interactionJson: true }
++	});
++	const sides = new Map<string, InteractionSideSlug[]>();
++	for (const row of rows) {
++		const rowSides = mapLocationInteractionToSides(row.interactionJson);
++		indexLocationAliases(row.locationId, row.studioId, (key) => sides.set(key, rowSides));
++	}
++	return sides;
+ }
+ 
+-/** Lines the model reads, e.g. `17: Boutique Hotel · Reception · Looking At Desk (contemporary; modern)`. */
++/**
++ * Lines the model reads, e.g. `17: Boutique Hotel · Lobby · Standing In Front Of Reception Desk (contemporary; modern; participant: customer)`.
++ * The participant's side is named only for a view drawn from one side of a desk or counter.
++ */
+ export function setChoicePromptLines(choices: readonly SetChoice[]): string[] {
+-	return choices.map(
+-		({ ref, set }) => `${ref}: ${set.name} (${set.universe}; ${set.collection.replace(/_/g, ' ')})`
+-	);
++	return choices.map(({ ref, set, participantSides }) => {
++		const side = participantSides.length === 1 ? `; participant: ${participantSides[0]!.replace('-', ' ')}` : '';
++		return `${ref}: ${set.name} (${set.universe}; ${set.collection.replace(/_/g, ' ')}${side})`;
++	});
+ }
+ 
+ /**
+  * The model's numbers as sets, best first. Unknown and repeated numbers are dropped, and so is any set
+- * outside the brief's universe (all of them when the model named no valid universe); drops are logged.
++ * outside the brief's universe (all of them when the model named no valid universe) or drawn from the
++ * other side of the desk than the participant's; drops are logged.
+  */
+ export function suggestedSetsFromRefs(
+ 	refs: readonly number[],
+ 	choices: readonly SetChoice[],
+-	universe: string | undefined
++	universe: string | undefined,
++	participantSide: string | undefined
+ ): SuggestedSet[] {
+-	const byRef = new Map(choices.map((choice) => [choice.ref, choice.set]));
++	const byRef = new Map(choices.map((choice) => [choice.ref, choice]));
+ 	const suggested: SuggestedSet[] = [];
+ 	const unknown: number[] = [];
+ 	const otherUniverse: Array<{ ref: number; name: string; universe: string | null }> = [];
++	const otherSide: Array<{ ref: number; name: string; sides: readonly string[] }> = [];
+ 	for (const ref of refs) {
+-		const set = byRef.get(ref);
+-		if (!set) {
++		const choice = byRef.get(ref);
++		if (!choice) {
+ 			unknown.push(ref);
+ 			continue;
+ 		}
++		const { set, participantSides } = choice;
+ 		if (!universe || set.universe !== universe) {
+ 			otherUniverse.push({ ref, name: set.name, universe: set.universe ?? null });
+ 			continue;
+ 		}
++		if (
++			participantSide &&
++			participantSides.length > 0 &&
++			!(participantSides as readonly string[]).includes(participantSide)
++		) {
++			otherSide.push({ ref, name: set.name, sides: participantSides });
++			continue;
++		}
+ 		if (suggested.some((row) => row.setId === set.setId)) continue;
+ 		suggested.push({
+ 			setId: set.setId,
+@@ -98,16 +160,32 @@ export function suggestedSetsFromRefs(
+ 			dropped: otherUniverse
+ 		});
+ 	}
++	if (otherSide.length > 0) {
++		console.warn(
++			'[experience.setup.details] suggested sets drawn from the other side of the desk were dropped',
++			{ participantSide, dropped: otherSide }
++		);
++	}
+ 	return suggested;
+ }
+ 
+-/** The generator's details as the Studio receives them: the set numbers swapped for the sets of the brief's universe. */
++/**
++ * The generator's details as the Studio receives them: the set numbers swapped for the sets of the brief's
++ * universe, seen from the participant's side.
++ */
+ export function setupDetailsResponse<
+-	T extends { readonly suggestedSetRefs: readonly number[]; readonly setUniverse?: string }
++	T extends {
++		readonly suggestedSetRefs: readonly number[];
++		readonly setUniverse?: string;
++		readonly participantSide?: string;
++	}
+ >(
+ 	details: T,
+ 	choices: readonly SetChoice[]
+-): Omit<T, 'suggestedSetRefs' | 'setUniverse'> & { readonly suggestedSets: SuggestedSet[] } {
+-	const { suggestedSetRefs, setUniverse, ...rest } = details;
+-	return { ...rest, suggestedSets: suggestedSetsFromRefs(suggestedSetRefs, choices, setUniverse) };
++): Omit<T, 'suggestedSetRefs' | 'setUniverse' | 'participantSide'> & { readonly suggestedSets: SuggestedSet[] } {
++	const { suggestedSetRefs, setUniverse, participantSide, ...rest } = details;
++	return {
++		...rest,
++		suggestedSets: suggestedSetsFromRefs(suggestedSetRefs, choices, setUniverse, participantSide)
++	};
+ }
+-- 
+2.50.1 (Apple Git-155)
+

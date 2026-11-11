@@ -1,0 +1,136 @@
+From 1c03266b63db444994f2cfb6c7db32d9905c747e Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 17:08:12 +0100
+Subject: [PATCH 5/6] Changing clothes: the stage keeps its look while the new
+ outfit is fitted, and pointing at a tile starts the fitting.
+
+Picking another outfit fits it to the face in the browser at the stage's size (0.5 s at 512, 0.8 s at 1024 when the
+worker is free; longer behind the dialog's own tiles), and the stage stayed empty meanwhile.
+
+- The try-on stage keeps the look it last showed while another outfit is fitted to the same face (a new face still
+  clears it, as before).
+- AppearanceIdPicker reports a pointer (or focus) resting on a tile for 120 ms (onOptionHover); the clothes and whole
+  costume pickers use it to start the stage-size fitting (prepareStageOutfit), so a pointed-at outfit is usually ready
+  by the click.
+
+Checked in the local Studio (East Asian woman): clicked straight away 0.54 s with the old look kept, never empty;
+pointed at first then clicked 0.03 s; with a plate hairstyle on, the same, and the hair stays.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../fields/AppearanceIdPicker.svelte          | 23 ++++++++++++++++++-
+ .../characterEthnicityTryOn.svelte.ts         | 21 +++++++++++++++--
+ .../characters/[charId]/+page.svelte          |  2 ++
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+index a256c11..097db2d 100644
+--- a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
++++ b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+@@ -64,6 +64,8 @@
+ 		previewOverlayFor?: (tier: AvatarPreviewTier) => string | null;
+ 		/** Fired when a tile scrolls into view, so callers can defer image work (with the tile's key, else its id). */
+ 		onOptionVisible?: (key: string) => void;
++		/** Fired when the pointer (or focus) rests on a tile, so callers can prepare what choosing it shows. */
++		onOptionHover?: (id: string) => void;
+ 		onClothesSaved?: (clothesId: string, option: Option) => void;
+ 		onClothesApplied?: (clothesId: string, option: Option) => void;
+ 		onClose?: () => void;
+@@ -99,6 +101,7 @@
+ 		previewImageFor,
+ 		previewOverlayFor,
+ 		onOptionVisible,
++		onOptionHover,
+ 		onClothesSaved,
+ 		onClothesApplied,
+ 		onClose,
+@@ -124,6 +127,17 @@
+ 		return null;
+ 	}
+ 
++	let hoverTimer: ReturnType<typeof setTimeout> | undefined;
++	function hoverStart(id: string) {
++		if (!onOptionHover) return;
++		clearTimeout(hoverTimer);
++		hoverTimer = setTimeout(() => onOptionHover?.(id), 120);
++	}
++	function hoverEnd() {
++		clearTimeout(hoverTimer);
++	}
++	$effect(() => () => clearTimeout(hoverTimer));
++
+ 	function observeTile(node: HTMLElement, key: string) {
+ 		if (!onOptionVisible) return;
+ 		const observer = new IntersectionObserver(
+@@ -483,7 +497,14 @@
+ 						Select
+ 					</button>
+ 				{/snippet}
+-				<div class="tile-watch" use:observeTile={option.key ?? option.id}>
++				<div
++					class="tile-watch"
++					use:observeTile={option.key ?? option.id}
++					onpointerenter={() => hoverStart(option.id)}
++					onpointerleave={hoverEnd}
++					onfocusin={() => hoverStart(option.id)}
++					onfocusout={hoverEnd}
++				>
+ 				<LibraryGridCard
+ 					as="article"
+ 					label={optionLabel}
+diff --git a/src/lib/avatarSetClothes/characterEthnicityTryOn.svelte.ts b/src/lib/avatarSetClothes/characterEthnicityTryOn.svelte.ts
+index d0ba009..513f7b2 100644
+--- a/src/lib/avatarSetClothes/characterEthnicityTryOn.svelte.ts
++++ b/src/lib/avatarSetClothes/characterEthnicityTryOn.svelte.ts
+@@ -267,9 +267,26 @@ export class CharacterEthnicityTryOn {
+ 	/**
+ 	 * With an ethnicity chosen and no outfit, the stage shows that ethnicity's base plate (white tee and blue jeans);
+ 	 * the avatar's own ethnicity keeps its own look. An ethnicity outfit chosen since the last save is not kept yet,
+-	 * so the stage shows it from the browser. While the next face is still being joined the stage stays empty.
++	 * so the stage shows it from the browser. While the next face is still being joined the stage stays empty; while
++	 * another outfit is being fitted to the same face, the stage keeps the look it has (2026-10-22: changing clothes
++	 * left the stage empty for the fitting, about a second).
+ 	 */
+-	shownPreview = $derived(this.#readyStageScene() ?? this.#emptyStage());
++	shownPreview = $derived(this.#stageOrHeld());
++	/** The stage picture last shown, and the face it was on (not reactive: only remembered). */
++	#lastStage: { face: string; scene: PreviewScene } | null = null;
++	#stageOrHeld(): PreviewScene {
++		const ready = this.#readyStageScene();
++		const face = `${this.#host.avatarId}|${this.#plateRace}`;
++		if (ready) {
++			this.#lastStage = { face, scene: ready };
++			return ready;
++		}
++		return this.#lastStage?.face === face ? this.#lastStage.scene : this.#emptyStage();
++	}
++	/** Start fitting an outfit to the face at the stage's size when its tile is pointed at, so choosing it shows sooner. */
++	prepareStageOutfit = (wearId: string) => {
++		if (this.stageMeasured) this.clothesPreviewUrl(wearId, this.stageTier);
++	};
+ 	/** The stage picture once its face is ready, or null while that face is still being joined. */
+ 	#readyStageScene(): PreviewScene | null {
+ 		const host = this.#host;
+diff --git a/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte b/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
+index 629dbc8..ea80760 100644
+--- a/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
++++ b/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
+@@ -1864,6 +1864,7 @@
+ 		previewImageFor={(id, tier) => tryOn.clothesPreviewUrl(id, tier)}
+ 		onSelect={selectClothes}
+ 		onOptionVisible={tryOn.noteClothesTileVisible}
++		onOptionHover={tryOn.prepareStageOutfit}
+ 		onClose={closeClothesPicker}
+ 		createPanel={tryOn.generationAvailable ? newRaceOutfit : undefined}
+ 		onClothesSaved={(id, option) => {
+@@ -1928,6 +1929,7 @@
+ 		}
+ 		onSelect={selectCostume}
+ 		onOptionVisible={tryOn.noteClothesTileVisible}
++		onOptionHover={tryOn.prepareStageOutfit}
+ 		onClose={closeCostumePicker}
+ 		createPanel={tryOn.generationAvailable ? newRaceCostume : undefined}
+ 		onClothesSaved={(id, option) => {
+-- 
+2.50.1 (Apple Git-155)
+

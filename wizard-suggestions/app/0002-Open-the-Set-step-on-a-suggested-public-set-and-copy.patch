@@ -1,0 +1,796 @@
+From 569a328f07c6d3a17ae1137bd97d1cab1c0198e9 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:27:57 +0000
+Subject: [PATCH 2/4] Open the Set step on a suggested public set and copy it
+ into the project on Next
+
+The setup generator now returns up to three public sets. The wizard keeps them in
+the setup draft, opens the Set step on the first one (with the others offered as
+"Or:" swaps), and copies the shown set into the project only when the author
+presses Next, the same way picking it in the set list does. Going back or closing
+leaves it uncopied, and a regeneration never replaces a set the author chose.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../flow/ExperienceSetupWizard.svelte         | 96 ++++++++++++++++---
+ .../flow/SuggestedSetChoices.svelte           | 21 ++++
+ .../flow/SuggestedSetChoices.test.ts          | 63 ++++++++++++
+ packages/experience-studio/src/lib/client.ts  | 15 +++
+ .../src/lib/experienceSetupGeneration.test.ts | 31 ++++++
+ .../src/lib/experienceSetupGeneration.ts      |  5 +-
+ .../src/lib/experienceSetupWizard.test.ts     | 94 +++++++++++++++++-
+ .../src/lib/experienceSetupWizard.ts          | 78 +++++++++++++++
+ .../src/lib/studioCreateDraftStorage.test.ts  | 29 ++++++
+ .../src/lib/studioCreateDraftStorage.ts       | 33 +++++++
+ scripts/hotspot-baselines.json                |  4 +-
+ 11 files changed, 449 insertions(+), 20 deletions(-)
+ create mode 100644 packages/experience-studio/src/components/flow/SuggestedSetChoices.svelte
+ create mode 100644 packages/experience-studio/src/components/flow/SuggestedSetChoices.test.ts
+
+diff --git a/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte b/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte
+index 7b71169..5bfe59c 100644
+--- a/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte
++++ b/packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte
+@@ -14,6 +14,7 @@
+ 	import WizardCharacterLook from './WizardCharacterLook.svelte';
+ 	import PromptStep from './PromptStep.svelte';
+ 	import SetStep from './SetStep.svelte';
++	import SuggestedSetChoices from './SuggestedSetChoices.svelte';
+ 	import StudioPromptField from '../fields/StudioPromptField.svelte';
+ 	import {
+ 		EXPERIENCE_DESCRIPTION_HELP,
+@@ -29,7 +30,8 @@
+ 	} from '../../lib/customisableCharacterCreate.js';
+ 	import type {
+ 		ExperienceStudioClient,
+-		GeneratedExperienceSetupDetails
++		GeneratedExperienceSetupDetails,
++		SuggestedSetupSet
+ 	} from '../../lib/client.js';
+ 	import {
+ 		clearStudioCreateDraft,
+@@ -52,6 +54,10 @@
+ 		initSituationCandidate,
+ 		prevSetupStep,
+ 		primarySetupActionLabel,
++		setCandidateFromSuggestion,
++		suggestedSetToShow,
++		copySuggestedSet,
++		leavesSuggestedSetBehind,
+ 		setupCommitSuccess,
+ 		setupStepIndex,
+ 		shouldAcceptIncomingSetupExperience,
+@@ -180,6 +186,12 @@
+ 
+ 	const initialSeed = untrack(() => seedForStep(step, knownExperience, characters, sets));
+ 	const restoredSetupDraft = untrack(() => readExperienceSetupCreateDraft(knownExperience.id));
++	const initialSuggestedSets = restoredSetupDraft?.suggestedSets ?? [];
++	const initialSetPickedByAuthor = restoredSetupDraft?.setPickedByAuthor ?? false;
++	/** A new experience with no set yet opens the Set step on the first suggested public set. */
++	const suggestionSeed = initialSeed.setCandidate
++		? null
++		: suggestedSetToShow(null, initialSuggestedSets, initialSetPickedByAuthor);
+ 	const characterDraftScope = untrack(() =>
+ 		knownExperience.id ? `experience:${knownExperience.id}` : ''
+ 	);
+@@ -203,7 +215,7 @@
+ 			: initialSeed.detailsCandidate
+ 	);
+ 	let characterCandidate = $state<CharacterSetupCandidate | null>(initialSeed.characterCandidate);
+-	let setCandidate = $state<SetSetupCandidate | null>(initialSeed.setCandidate);
++	let setCandidate = $state<SetSetupCandidate | null>(initialSeed.setCandidate ?? suggestionSeed);
+ 	let situationCandidate = $state<SituationSetupCandidate>({
+ 		startingMessage:
+ 			initialSeed.situationCandidate.startingMessage ||
+@@ -215,11 +227,18 @@
+ 			''
+ 	});
+ 	let characterSubview = $state<CharacterSubview>(initialSeed.characterSubview);
+-	let setSubview = $state<SetSubview>(initialSeed.setSubview);
++	let setSubview = $state<SetSubview>(suggestionSeed ? 'summary' : initialSeed.setSubview);
++	/** Public sets the setup generator suggested, best first. */
++	let suggestedSets = $state<readonly SuggestedSetupSet[]>(initialSuggestedSets);
++	/** The author picked or made a set, so a new suggestion never replaces it. */
++	let setPickedByAuthor = $state(initialSetPickedByAuthor);
++	/** Copying the kept suggestion into the project (on Next). */
++	let keepingSuggestedSet = $state(false);
+ 
+ 	$effect(() => {
+ 		const incoming = createdSet;
+ 		if (!incoming?.setId) return;
++		setPickedByAuthor = true;
+ 		setCandidate = {
+ 			setId: incoming.setId,
+ 			transparentBackground: false,
+@@ -338,7 +357,7 @@
+ 	let persistHadError = false;
+ 	const persistIdleWaiters: Array<() => void> = [];
+ 
+-	const busy = $derived(disabled || finishing || generatingDetails);
++	const busy = $derived(disabled || finishing || generatingDetails || keepingSuggestedSet);
+ 	const showRegenerate = $derived(
+ 		brandNew && !remix && step === 'details' && generatedDetailsAccepted && Boolean(onRegenerate)
+ 	);
+@@ -348,7 +367,9 @@
+ 	const characterDraftReady = $derived(characterSubview === 'create' &&
+ 		createPanelView === 'details' && Boolean(generatedCharacterName.trim() || generatedCharacterRole.trim()));
+ 	/** Back remains available while a panel is incomplete. */
+-	const leaveDisabled = $derived(disabled || selectingCharacter || finishing || generatingDetails);
++	const leaveDisabled = $derived(
++		disabled || selectingCharacter || finishing || generatingDetails || keepingSuggestedSet
++	);
+ 	const primaryDisabled = $derived(leaveDisabled || Boolean(setupNavigationBlockedReason(
+ 		step, currentStepIndex === SETUP_STEPS.length - 1 ? { kind: 'finish' } : { kind: 'step', step: SETUP_STEPS[currentStepIndex + 1] },
+ 		currentCandidates(), characterDraftReady
+@@ -409,7 +430,9 @@
+ 			setNameTouched,
+ 			setDescriptionTouched,
+ 			startingMessageTouched,
+-			systemInstructionsTouched
++			systemInstructionsTouched,
++			suggestedSets,
++			setPickedByAuthor
+ 		});
+ 	}
+ 
+@@ -569,9 +592,13 @@
+ 		if (current === seededStep) return;
+ 		seededStep = current;
+ 		const seed = untrack(() => seedForStep(current, knownExperience, characters, sets));
++		// A suggestion is not saved on the experience until Next, so keep it (or the first one) across steps.
++		const keptSuggestion = untrack(() =>
++			seed.setCandidate ? null : suggestedSetToShow(setCandidate, suggestedSets, setPickedByAuthor)
++		);
+ 		detailsCandidate = seed.detailsCandidate;
+ 		characterCandidate = seed.characterCandidate;
+-		setCandidate = seed.setCandidate;
++		setCandidate = seed.setCandidate ?? keptSuggestion;
+ 		situationCandidate = {
+ 			startingMessage:
+ 				seed.situationCandidate.startingMessage ||
+@@ -581,7 +608,7 @@
+ 				(!systemInstructionsTouched ? generatedSystemInstructions : '')
+ 		};
+ 		characterSubview = characterCreatePending ? 'create' : seed.characterSubview;
+-		setSubview = seed.setSubview;
++		setSubview = keptSuggestion ? 'summary' : seed.setSubview;
+ 		if (!characterCreateHadError) errorMessage = null;
+ 		characterFiltersOpen = false;
+ 		const seededCharId = seed.characterCandidate?.characterId?.trim();
+@@ -676,7 +703,8 @@
+ 			characterSubview = characterCandidate ? 'summary' : 'pick';
+ 			characterFiltersOpen = false;
+ 		}
+-		if (step !== 'details' || detailsCandidateValid(detailsCandidate)) {
++		const unkeptSuggestion = step === 'set' && Boolean(setCandidate?.suggested);
++		if (!unkeptSuggestion && (step !== 'details' || detailsCandidateValid(detailsCandidate))) {
+ 			const { experience: optimistic, patch } = applySetupStepOptimistic(
+ 				knownExperience,
+ 				step,
+@@ -789,6 +817,11 @@
+ 		}
+ 		if (!setNameTouched) generatedSetName = generated.setName;
+ 		if (!setDescriptionTouched) generatedSetDescription = generated.setDescription ?? '';
++		suggestedSets = generated.suggestedSets ?? [];
++		if (!setPickedByAuthor && (!setCandidate || setCandidate.suggested)) {
++			setCandidate = suggestedSets[0] ? setCandidateFromSuggestion(suggestedSets[0]) : null;
++			setSubview = setCandidate ? 'summary' : 'pick';
++		}
+ 		if (!startingMessageTouched) {
+ 			generatedStartingMessage = generated.startingMessage;
+ 			situationCandidate = {
+@@ -859,8 +892,28 @@
+ 		onFinished(experience);
+ 	}
+ 
++	/** Copy the kept public set suggestion into the project, the same way picking it in the list does. */
++	async function keepSuggestedSet(): Promise<boolean> {
++		if (!setCandidate?.suggested) return true;
++		keepingSuggestedSet = true;
++		try {
++			setCandidate = await copySuggestedSet(setCandidate, ensurePlace, experienceStyle);
++			setPickedByAuthor = true;
++			return true;
++		} catch (error) {
++			console.error('Could not add the suggested set to the project', error);
++			errorMessage =
++				error instanceof Error && error.message.trim()
++					? error.message
++					: 'Could not add the suggested set. Try again or pick another set.';
++			return false;
++		} finally {
++			keepingSuggestedSet = false;
++		}
++	}
++
+ 	async function leaveCurrentStep(destination: SetupLeaveDestination) {
+-		if (disabled || selectingCharacter || finishing || generatingDetails) return;
++		if (disabled || selectingCharacter || finishing || generatingDetails || keepingSuggestedSet) return;
+ 		const blocked = setupNavigationBlockedReason(step, destination, currentCandidates(), characterDraftReady);
+ 		if (blocked) { errorMessage = blocked; return; }
+ 		if (
+@@ -879,16 +932,20 @@
+ 		}
+ 		errorMessage = null;
+ 
++		// A suggested public set is copied into the project only when the author moves on with it.
++		const suggestionGoingBack = leavesSuggestedSetBehind(step, setCandidate, destination);
++		if (step === 'set' && setCandidate?.suggested && !suggestionGoingBack && !(await keepSuggestedSet())) {
++			return;
++		}
++
+ 		const leaveStep = step;
+ 		if (leaveStep === 'situation') {
+ 			startingMessageTouched = true;
+ 			systemInstructionsTouched = true;
+ 		}
+-		const { experience: optimistic, patch } = applySetupStepOptimistic(
+-			knownExperience,
+-			leaveStep,
+-			currentCandidates()
+-		);
++		const { experience: optimistic, patch } = suggestionGoingBack
++			? { experience: knownExperience, patch: null }
++			: applySetupStepOptimistic(knownExperience, leaveStep, currentCandidates());
+ 		if (patch) {
+ 			knownExperience = optimistic;
+ 			onExperienceUpdated?.(optimistic);
+@@ -1107,6 +1164,7 @@
+ 	) {
+ 		const setId = patch.setId?.trim();
+ 		if (!setId) return;
++		setPickedByAuthor = true;
+ 		const card = meta?.catalogueSet;
+ 		const fromLibrary = sets.find((row) => row.setId === setId);
+ 		setCandidate = {
+@@ -1441,6 +1499,14 @@
+ 								</div>
+ 							{/if}
+ 						</div>
++						{#if setCandidate.suggested}
++							<SuggestedSetChoices
++								suggestions={suggestedSets}
++								currentSetId={setCandidate.setId}
++								disabled={busy}
++								onpick={(other) => (setCandidate = setCandidateFromSuggestion(other))}
++							/>
++						{/if}
+ 					</div>
+ 				{:else}
+ 					<SetStep
+diff --git a/packages/experience-studio/src/components/flow/SuggestedSetChoices.svelte b/packages/experience-studio/src/components/flow/SuggestedSetChoices.svelte
+new file mode 100644
+index 0000000..471bf08
+--- /dev/null
++++ b/packages/experience-studio/src/components/flow/SuggestedSetChoices.svelte
+@@ -0,0 +1,21 @@
++<script lang="ts">
++	import type { SuggestedSetupSet } from '../../lib/client.js';
++	/** Shown under a suggested public set on the Set step: what Next does, and the other suggestions. */
++	let { suggestions, currentSetId, disabled = false, onpick }: {
++		suggestions: readonly SuggestedSetupSet[]; currentSetId: string; disabled?: boolean; onpick: (suggestion: SuggestedSetupSet) => void;
++	} = $props();
++	const others = $derived(suggestions.filter((row) => row.setId !== currentSetId));
++</script>
++<p class="note">Suggested for this experience. It is added to your project when you press Next.</p>
++{#if others.length > 0}
++	<div class="others" role="group" aria-label="Other suggested sets">
++		<span>Or:</span>
++		{#each others as other (other.setId)}
++			<button type="button" class="studio-btn secondary" {disabled} onclick={() => onpick(other)}>{other.name}</button>
++		{/each}
++	</div>
++{/if}
++<style>
++	.note { margin: 0.75rem 0 0; color: var(--text-muted, #667085); font-size: 0.875rem; }
++	.others { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.875rem; }
++</style>
+diff --git a/packages/experience-studio/src/components/flow/SuggestedSetChoices.test.ts b/packages/experience-studio/src/components/flow/SuggestedSetChoices.test.ts
+new file mode 100644
+index 0000000..5a7fc20
+--- /dev/null
++++ b/packages/experience-studio/src/components/flow/SuggestedSetChoices.test.ts
+@@ -0,0 +1,63 @@
++/** @vitest-environment happy-dom */
++import { describe, expect, it, vi } from 'vitest';
++import { flushSync, mount, unmount } from 'svelte';
++import SuggestedSetChoices from './SuggestedSetChoices.svelte';
++
++const set = (setId: string, name: string) => ({
++	setId,
++	name,
++	thumbnailUrl: null,
++	backgroundImage: null,
++	foregroundImage: null,
++	backdropId: `loc_${setId}`,
++	collection: 'modern',
++	venue: 'boutique_hotel',
++	setting: 'interior'
++});
++
++function render(props: { suggestions: ReturnType<typeof set>[]; currentSetId: string; disabled?: boolean }) {
++	const target = document.createElement('div');
++	document.body.append(target);
++	const onpick = vi.fn();
++	const component = mount(SuggestedSetChoices, { target, props: { ...props, onpick } });
++	flushSync();
++	return {
++		target,
++		onpick,
++		buttons: () => Array.from(target.querySelectorAll('button')),
++		cleanup: async () => {
++			await unmount(component);
++			target.remove();
++		}
++	};
++}
++
++describe('suggested set choices', () => {
++	it('says when the set is added and offers the other suggestions', async () => {
++		const lobby = set('set_lobby', 'Hotel · Lobby');
++		const lounge = set('set_lounge', 'Hotel · Lounge');
++		const view = render({ suggestions: [lobby, lounge], currentSetId: 'set_lobby' });
++		try {
++			expect(view.target.textContent).toContain('It is added to your project when you press Next.');
++			expect(view.buttons().map((button) => button.textContent?.trim())).toEqual(['Hotel · Lounge']);
++			view.buttons()[0]!.click();
++			expect(view.onpick).toHaveBeenCalledWith(lounge);
++		} finally {
++			await view.cleanup();
++		}
++	});
++
++	it('shows no other choices when there is one suggestion, and blocks them while busy', async () => {
++		const lobby = set('set_lobby', 'Hotel · Lobby');
++		const single = render({ suggestions: [lobby], currentSetId: 'set_lobby' });
++		const busy = render({ suggestions: [lobby, set('set_bar', 'Hotel · Bar')], currentSetId: 'set_lobby', disabled: true });
++		try {
++			expect(single.target.textContent).not.toContain('Or:');
++			expect(single.buttons()).toHaveLength(0);
++			expect(busy.buttons()[0]!.disabled).toBe(true);
++		} finally {
++			await single.cleanup();
++			await busy.cleanup();
++		}
++	});
++});
+diff --git a/packages/experience-studio/src/lib/client.ts b/packages/experience-studio/src/lib/client.ts
+index c1cb433..9f11dc2 100644
+--- a/packages/experience-studio/src/lib/client.ts
++++ b/packages/experience-studio/src/lib/client.ts
+@@ -9,6 +9,19 @@ import type {
+ 	VoiceSummary
+ } from './types.js';
+ 
++/** A public set the setup generator suggests; copied into the project only when the author keeps it. */
++export type SuggestedSetupSet = {
++	readonly setId: string;
++	readonly name: string;
++	readonly thumbnailUrl: string | null;
++	readonly backgroundImage: string | null;
++	readonly foregroundImage: string | null;
++	readonly backdropId: string;
++	readonly collection: string;
++	readonly venue: string;
++	readonly setting: string;
++};
++
+ export type GeneratedExperienceSetupDetails = {
+ 	readonly title: string;
+ 	readonly description: string;
+@@ -24,6 +37,8 @@ export type GeneratedExperienceSetupDetails = {
+ 	readonly characterInstructions: string;
+ 	readonly setName: string;
+ 	readonly setDescription: string;
++	/** Up to three public sets that fit, best first (empty when none fits). */
++	readonly suggestedSets?: readonly SuggestedSetupSet[];
+ 	readonly startingMessage: string;
+ 	readonly systemInstructions: string;
+ };
+diff --git a/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts b/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts
+index d31de5b..26a1f68 100644
+--- a/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts
++++ b/packages/experience-studio/src/lib/experienceSetupGeneration.test.ts
+@@ -60,4 +60,35 @@ describe('mergeGeneratedExperienceSetupDraft', () => {
+ 		expect(next.characterName).toBe('Custom name');
+ 		expect(next.setName).toBe('Custom set');
+ 	});
++
++	it('carries the suggested sets and keeps a set the author picked', () => {
++		const hotel = {
++			setId: 'set_hotel',
++			name: 'Boutique Hotel · Reception · Looking At Desk',
++			thumbnailUrl: null,
++			backgroundImage: 'https://cdn.example.test/hotel.webp',
++			foregroundImage: null,
++			backdropId: 'loc_hotel',
++			collection: 'modern',
++			venue: 'boutique_hotel',
++			setting: 'interior'
++		};
++		const first = mergeGeneratedExperienceSetupDraft(null, 'Hotel roleplay', {
++			...generated,
++			suggestedSets: [hotel]
++		});
++		expect(first.suggestedSets).toEqual([hotel]);
++		expect(first.setPickedByAuthor).toBe(false);
++
++		const picked: ExperienceSetupCreateDraft = {
++			...first,
++			kind: 'experienceSetup',
++			setPickedByAuthor: true,
++			updatedAt: Date.now()
++		};
++		const next = mergeGeneratedExperienceSetupDraft(picked, 'Hotel roleplay', generated);
++		expect(next.suggestedSets).toEqual([]);
++		expect(next.setPickedByAuthor).toBe(true);
++	});
+ });
++
+diff --git a/packages/experience-studio/src/lib/experienceSetupGeneration.ts b/packages/experience-studio/src/lib/experienceSetupGeneration.ts
+index e86ec7e..842f850 100644
+--- a/packages/experience-studio/src/lib/experienceSetupGeneration.ts
++++ b/packages/experience-studio/src/lib/experienceSetupGeneration.ts
+@@ -35,7 +35,9 @@ const EMPTY_SETUP_DRAFT: SetupDraftInput = {
+ 	setNameTouched: false,
+ 	setDescriptionTouched: false,
+ 	startingMessageTouched: false,
+-	systemInstructionsTouched: false
++	systemInstructionsTouched: false,
++	suggestedSets: [],
++	setPickedByAuthor: false
+ };
+ 
+ export function mergeGeneratedExperienceSetupDraft(
+@@ -75,6 +77,7 @@ export function mergeGeneratedExperienceSetupDraft(
+ 		setDescription: current.setDescriptionTouched
+ 			? current.setDescription
+ 			: (generated.setDescription ?? ''),
++		suggestedSets: generated.suggestedSets ?? [],
+ 		startingMessage: current.startingMessageTouched
+ 			? current.startingMessage
+ 			: generated.startingMessage,
+diff --git a/packages/experience-studio/src/lib/experienceSetupWizard.test.ts b/packages/experience-studio/src/lib/experienceSetupWizard.test.ts
+index 9317360..986f08d 100644
+--- a/packages/experience-studio/src/lib/experienceSetupWizard.test.ts
++++ b/packages/experience-studio/src/lib/experienceSetupWizard.test.ts
+@@ -1,5 +1,6 @@
+-import { describe, expect, it } from 'vitest';
++import { describe, expect, it, vi } from 'vitest';
+ 
++import { HOUSE_STYLE_LABEL } from './catalogueSetTree.js';
+ import {
+ 	buildCharacterCommitPatch,
+ 	buildDetailsPatch,
+@@ -38,7 +39,11 @@ import {
+ 	bumpSetupUpdatedAt,
+ 	buildSetupReconcilePatch,
+ 	SETUP_STEPS,
+-	wizardPrimaryExcludedIds
++	wizardPrimaryExcludedIds,
++	setCandidateFromSuggestion,
++	suggestedSetToShow,
++	copySuggestedSet,
++	leavesSuggestedSetBehind
+ } from './experienceSetupWizard.js';
+ 
+ describe('generated setup suggestions', () => {
+@@ -681,3 +686,88 @@ describe('experienceSetupWizard candidates and patches', () => {
+ 		expect(candidate?.characterId).toBe('char_1');
+ 	});
+ });
++
++describe('suggested public sets', () => {
++	const suggestion = {
++		setId: 'set_hotel',
++		name: 'Boutique Hotel · Reception · Looking At Desk',
++		thumbnailUrl: 'https://cdn.example.test/thumb.webp',
++		backgroundImage: 'https://cdn.example.test/hotel.webp',
++		foregroundImage: null,
++		backdropId: 'loc_hotel',
++		collection: 'modern',
++		venue: 'boutique_hotel',
++		setting: 'interior'
++	};
++	const lounge = { ...suggestion, setId: 'set_lounge', name: 'Boutique Hotel · Lounge', backdropId: 'loc_lounge' };
++
++	it('shows the suggested public set and marks it as not copied yet', () => {
++		expect(setCandidateFromSuggestion(suggestion)).toEqual({
++			setId: 'set_hotel',
++			transparentBackground: false,
++			suggested: suggestion,
++			preview: {
++				name: suggestion.name,
++				backdropId: 'loc_hotel',
++				thumbnailUrl: suggestion.thumbnailUrl,
++				backgroundImage: suggestion.backgroundImage,
++				foregroundImage: null,
++				backdropTitle: suggestion.name
++			}
++		});
++	});
++
++	it('keeps the suggestion on show, else shows the first, and never once the author chose a set', () => {
++		const shown = setCandidateFromSuggestion(lounge);
++		expect(suggestedSetToShow(shown, [suggestion, lounge], false)).toBe(shown);
++		expect(suggestedSetToShow(null, [suggestion, lounge], false)?.setId).toBe('set_hotel');
++		expect(suggestedSetToShow(shown, [suggestion], true)).toBeNull();
++		expect(suggestedSetToShow(null, [], false)).toBeNull();
++	});
++
++	it('copies the suggestion into the project and saves the copy, not the public set', async () => {
++		const ensurePlace = vi.fn(async () => 'set_project_copy');
++		const saved = await copySuggestedSet(setCandidateFromSuggestion(suggestion), ensurePlace, null);
++		expect(ensurePlace).toHaveBeenCalledWith({
++			backdropId: 'loc_hotel',
++			title: suggestion.name,
++			thumbnailUrl: suggestion.thumbnailUrl,
++			backgroundImage: suggestion.backgroundImage,
++			foregroundImage: null,
++			collection: 'modern',
++			venue: 'boutique_hotel',
++			setting: 'interior',
++			style: HOUSE_STYLE_LABEL
++		});
++		expect(saved.setId).toBe('set_project_copy');
++		expect(saved.suggested).toBeUndefined();
++		expect(saved.preview?.name).toBe(suggestion.name);
++	});
++
++	it('passes the experience style and lets a failed copy throw', async () => {
++		const ensurePlace = vi.fn(async () => {
++			throw new Error('Set limit reached');
++		});
++		await expect(copySuggestedSet(setCandidateFromSuggestion(suggestion), ensurePlace, 'noir')).rejects.toThrow(
++			'Set limit reached'
++		);
++		expect(ensurePlace).toHaveBeenCalledWith(expect.objectContaining({ style: 'noir' }));
++	});
++
++	it('leaves a set that is not a suggestion as it is', async () => {
++		const own = { setId: 'set_own', transparentBackground: false as const };
++		const ensurePlace = vi.fn(async () => 'unused');
++		expect(await copySuggestedSet(own, ensurePlace, null)).toBe(own);
++		expect(ensurePlace).not.toHaveBeenCalled();
++	});
++
++	it('only going back from the Set step leaves the suggestion uncopied', () => {
++		const shown = setCandidateFromSuggestion(suggestion);
++		expect(leavesSuggestedSetBehind('set', shown, { kind: 'step', step: 'situation' })).toBe(true);
++		expect(leavesSuggestedSetBehind('set', shown, { kind: 'step', step: 'details' })).toBe(false);
++		expect(leavesSuggestedSetBehind('set', shown, { kind: 'finish' })).toBe(false);
++		expect(
++			leavesSuggestedSetBehind('set', { setId: 'set_own', transparentBackground: false }, { kind: 'step', step: 'situation' })
++		).toBe(false);
++	});
++});
+diff --git a/packages/experience-studio/src/lib/experienceSetupWizard.ts b/packages/experience-studio/src/lib/experienceSetupWizard.ts
+index e41cb67..38289bd 100644
+--- a/packages/experience-studio/src/lib/experienceSetupWizard.ts
++++ b/packages/experience-studio/src/lib/experienceSetupWizard.ts
+@@ -1,6 +1,9 @@
++import { HOUSE_STYLE_LABEL } from './catalogueSetTree.js';
+ import { formatCharacterLabel } from './characterLabel.js';
++import type { SuggestedSetupSet } from './client.js';
+ import { applyOrderedCast, replaceCastMember, resolveAuthoredCast } from './experienceCast.js';
+ import type {
++	BackdropSummary,
+ 	CharacterLibrarySummary,
+ 	ExperienceDefinitionDraft,
+ 	ExperienceDraft,
+@@ -35,6 +38,8 @@ export type CharacterSetupCandidate = {
+ export type SetSetupCandidate = {
+ 	readonly setId: string;
+ 	readonly transparentBackground: false;
++	/** Set while the candidate is a public set suggestion that has not been copied into the project yet. */
++	readonly suggested?: SuggestedSetupSet;
+ 	/** Local preview plate metadata from the catalogue/picker — not persisted. */
+ 	readonly preview?: {
+ 		readonly name: string;
+@@ -46,6 +51,79 @@ export type SetSetupCandidate = {
+ 	};
+ };
+ 
++/** A set candidate for a suggested public set; it is copied into the project only when the author keeps it. */
++export function setCandidateFromSuggestion(suggestion: SuggestedSetupSet): SetSetupCandidate {
++	return {
++		setId: suggestion.setId,
++		transparentBackground: false,
++		suggested: suggestion,
++		preview: {
++			name: suggestion.name,
++			backdropId: suggestion.backdropId,
++			thumbnailUrl: suggestion.thumbnailUrl,
++			backgroundImage: suggestion.backgroundImage,
++			foregroundImage: suggestion.foregroundImage,
++			backdropTitle: suggestion.name
++		}
++	};
++}
++
++/** The suggestion the Set step shows: the one already shown, else the first. None once the author chose a set. */
++export function suggestedSetToShow(
++	current: SetSetupCandidate | null,
++	suggestedSets: readonly SuggestedSetupSet[],
++	pickedByAuthor: boolean
++): SetSetupCandidate | null {
++	if (pickedByAuthor) return null;
++	if (current?.suggested) return current;
++	return suggestedSets[0] ? setCandidateFromSuggestion(suggestedSets[0]) : null;
++}
++
++/**
++ * Copies a kept suggestion into the project the way picking it in the set list does (SetStep),
++ * and returns the candidate to save. Without ensurePlace the public set id stays, as in SetStep.
++ */
++export async function copySuggestedSet(
++	candidate: SetSetupCandidate,
++	ensurePlace: ((backdrop: BackdropSummary) => Promise<string>) | undefined,
++	experienceStyle: string | null
++): Promise<SetSetupCandidate> {
++	const suggestion = candidate.suggested;
++	if (!suggestion) return candidate;
++	const placeId = ensurePlace
++		? await ensurePlace({
++				backdropId: suggestion.backdropId,
++				title: suggestion.name,
++				thumbnailUrl: suggestion.thumbnailUrl,
++				backgroundImage: suggestion.backgroundImage,
++				foregroundImage: suggestion.foregroundImage,
++				collection: suggestion.collection,
++				venue: suggestion.venue,
++				setting: suggestion.setting,
++				style: experienceStyle ?? HOUSE_STYLE_LABEL
++			})
++		: '';
++	return {
++		setId: placeId || candidate.setId,
++		transparentBackground: false,
++		...(candidate.preview ? { preview: candidate.preview } : {})
++	};
++}
++
++/** Going back from the Set step leaves a suggested set uncopied and unsaved. */
++export function leavesSuggestedSetBehind(
++	step: SetupStep,
++	candidate: SetSetupCandidate | null,
++	destination: SetupLeaveDestination
++): boolean {
++	return (
++		step === 'set' &&
++		Boolean(candidate?.suggested) &&
++		destination.kind === 'step' &&
++		setupStepIndex(destination.step) < setupStepIndex(step)
++	);
++}
++
+ export type SituationSetupCandidate = {
+ 	readonly startingMessage: string;
+ 	readonly systemInstructions: string;
+diff --git a/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts b/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts
+index 3616514..e15769d 100644
+--- a/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts
++++ b/packages/experience-studio/src/lib/studioCreateDraftStorage.test.ts
+@@ -158,3 +158,32 @@ describe('parse + round-trip', () => {
+  });
+ 
+ });
++
++describe('experience setup draft suggested sets', () => {
++	it('keeps up to three well-formed suggested sets and the author pick flag', () => {
++		const set = (setId: string) => ({
++			setId,
++			name: `Set ${setId}`,
++			thumbnailUrl: null,
++			backgroundImage: `https://cdn.example.test/${setId}.webp`,
++			foregroundImage: null,
++			backdropId: `loc_${setId}`,
++			collection: 'modern',
++			venue: 'park',
++			setting: 'exterior'
++		});
++		const parsed = parseExperienceSetupCreateDraft({
++			creationBrief: 'Park picnic',
++			title: 'Picnic',
++			description: '',
++			introduction: '',
++			suggestedSets: [set('a'), { setId: 'broken' }, 'nope', set('b'), set('c'), set('d')],
++			setPickedByAuthor: true,
++			updatedAt: Date.now()
++		});
++		expect(parsed?.suggestedSets?.map((row) => row.setId)).toEqual(['a', 'b', 'c']);
++		expect(parsed?.setPickedByAuthor).toBe(true);
++		expect(parseExperienceSetupCreateDraft({ creationBrief: 'x', updatedAt: Date.now() })?.suggestedSets).toEqual([]);
++	});
++});
++
+diff --git a/packages/experience-studio/src/lib/studioCreateDraftStorage.ts b/packages/experience-studio/src/lib/studioCreateDraftStorage.ts
+index d01eddc..4472dbf 100644
+--- a/packages/experience-studio/src/lib/studioCreateDraftStorage.ts
++++ b/packages/experience-studio/src/lib/studioCreateDraftStorage.ts
+@@ -4,6 +4,8 @@
+  * IndexedDB is unnecessary for these small text payloads.
+  */
+ 
++import type { SuggestedSetupSet } from './client.js';
++
+ export const STUDIO_CREATE_DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+ 
+ const PREFIX = 'liforma.studio.createDraft.';
+@@ -42,6 +44,10 @@ export type ExperienceSetupCreateDraft = {
+ 	readonly setDescriptionTouched: boolean;
+ 	readonly startingMessageTouched: boolean;
+ 	readonly systemInstructionsTouched: boolean;
++	/** Public sets the generator suggested, best first. */
++	readonly suggestedSets?: readonly SuggestedSetupSet[];
++	/** The author picked or made a set, so a new suggestion never replaces it. */
++	readonly setPickedByAuthor?: boolean;
+ 	readonly updatedAt: number;
+ };
+ 
+@@ -95,6 +101,29 @@ export function setCreateDraftKey(projectId: string): string {
+ 	return id ? `${PREFIX}set.${id}` : '';
+ }
+ 
++function suggestedSetsFrom(value: unknown): SuggestedSetupSet[] {
++	if (!Array.isArray(value)) return [];
++	const text = (row: Record<string, unknown>, key: string, max: number) =>
++		typeof row[key] === 'string' ? clip(row[key] as string, max) : '';
++	const url = (row: Record<string, unknown>, key: string) =>
++		typeof row[key] === 'string' && row[key] ? clip(row[key] as string, 2000) : null;
++	return value
++		.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
++		.map((row) => ({
++			setId: text(row, 'setId', 128),
++			name: text(row, 'name', 256),
++			thumbnailUrl: url(row, 'thumbnailUrl'),
++			backgroundImage: url(row, 'backgroundImage'),
++			foregroundImage: url(row, 'foregroundImage'),
++			backdropId: text(row, 'backdropId', 256),
++			collection: text(row, 'collection', 64),
++			venue: text(row, 'venue', 128),
++			setting: text(row, 'setting', 32)
++		}))
++		.filter((row) => row.setId && row.name && row.backdropId)
++		.slice(0, 3);
++}
++
+ function isFresh(updatedAt: number, now = Date.now()): boolean {
+ 	return Number.isFinite(updatedAt) && now - updatedAt <= STUDIO_CREATE_DRAFT_TTL_MS;
+ }
+@@ -150,6 +179,8 @@ export function parseExperienceSetupCreateDraft(value: unknown): ExperienceSetup
+ 		setDescriptionTouched: row.setDescriptionTouched === true,
+ 		startingMessageTouched: row.startingMessageTouched === true,
+ 		systemInstructionsTouched: row.systemInstructionsTouched === true,
++		suggestedSets: suggestedSetsFrom(row.suggestedSets),
++		setPickedByAuthor: row.setPickedByAuthor === true,
+ 		updatedAt
+ 	};
+ }
+@@ -307,6 +338,8 @@ export function writeExperienceSetupCreateDraft(
+ 		setDescriptionTouched: draft.setDescriptionTouched === true,
+ 		startingMessageTouched: draft.startingMessageTouched === true,
+ 		systemInstructionsTouched: draft.systemInstructionsTouched === true,
++		suggestedSets: suggestedSetsFrom(draft.suggestedSets),
++		setPickedByAuthor: draft.setPickedByAuthor === true,
+ 		updatedAt: draft.updatedAt ?? Date.now()
+ 	};
+ 	const empty =
+diff --git a/scripts/hotspot-baselines.json b/scripts/hotspot-baselines.json
+index b214c78..77b77c0 100644
+--- a/scripts/hotspot-baselines.json
++++ b/scripts/hotspot-baselines.json
+@@ -5,8 +5,8 @@
+ 			"reason": "Unified workspace coordinator as of 2026-09-29: scope selection, Scene Flow session, and the Experience/Phase section layout. Further field editors should move into scope components before this file grows again."
+ 		},
+ 		"packages/experience-studio/src/components/flow/ExperienceSetupWizard.svelte": {
+-			"baselineLines": 1959,
+-			"reason": "Initial setup-wizard baseline from 2026-09-18. Navigation, persistence, and character-create flows should extract behind tested helpers before growing further. 2026-10-13: grew by wiring generated gender, age, and ethnicity into character create; pack selection stays in avatarLooks.ts and the age bands stay in persona.ts."
++			"baselineLines": 2049,
++			"reason": "Initial setup-wizard baseline from 2026-09-18. Navigation, persistence, and character-create flows should extract behind tested helpers before growing further. 2026-10-13: grew by wiring generated gender, age, and ethnicity into character create; pack selection stays in avatarLooks.ts and the age bands stay in persona.ts. 2026-11-10: grew by wiring the suggested public set into the Set step (kept in the setup draft, copied into the project only on Next); the rules live in experienceSetupWizard.ts (suggestedSetToShow, copySuggestedSet, leavesSuggestedSetBehind) and the note with the other suggestions in SuggestedSetChoices.svelte."
+ 		},
+ 		"src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte": {
+ 			"baselineLines": 2294,
+-- 
+2.50.1 (Apple Git-155)
+

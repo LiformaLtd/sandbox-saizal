@@ -1,0 +1,416 @@
+From 8c3ed28335b8973ca167664e2e26b1d9b3b88009 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:35:48 +0000
+Subject: [PATCH 2/5] Give the setup generator labelled outfits and check the
+ outfit ids it returns
+
+Each published outfit now reaches the setup generator as "id: name (role; outfit;
+formality)" from its public catalogue rows, so it can match clothes to the
+character's role. It also returns up to three more outfit ids for a "Suggested"
+row in the Studio. Every returned outfit id is checked against the chosen
+gender's published list; an unknown id is logged and dropped, never swapped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/characterWardrobeChoices.test.ts |  94 ++++++++++++++
+ .../platform/characterWardrobeChoices.ts      | 116 +++++++++++++++++-
+ .../generateExperienceSetupDetails.test.ts    |  10 +-
+ .../generateExperienceSetupDetails.ts         |  29 ++++-
+ .../setup-details/generate/+server.ts         |   2 +-
+ .../setup-details/generate/+server.ts         |   2 +-
+ 6 files changed, 242 insertions(+), 11 deletions(-)
+ create mode 100644 src/lib/server/platform/characterWardrobeChoices.test.ts
+
+diff --git a/src/lib/server/platform/characterWardrobeChoices.test.ts b/src/lib/server/platform/characterWardrobeChoices.test.ts
+new file mode 100644
+index 0000000..bed5d94
+--- /dev/null
++++ b/src/lib/server/platform/characterWardrobeChoices.test.ts
+@@ -0,0 +1,94 @@
++import type { PrismaClient } from '@prisma/client';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++vi.mock('$lib/server/catalog/avatars', () => ({
++	listPublishedAvatars: async () => [
++		{ id: 'anna', gender: 'female', supportsCostumes: true, clothesIds: ['barista', 'business_woman_in_suit.7'], hairIds: ['bob'] },
++		{ id: 'caleb', gender: 'male', supportsCostumes: true, clothesIds: ['barista', 'chef'], hairIds: ['crew'] },
++		{ id: 'sofia', gender: 'female', supportsCostumes: false, clothesIds: ['ballgown'], hairIds: [] }
++	]
++}));
++
++import {
++	checkedClothesPicks,
++	clothesChoiceLine,
++	loadCharacterWardrobeChoices,
++	type CharacterWardrobeChoices
++} from './characterWardrobeChoices';
++
++const label = (dimension: string, value: string) => ({ dimension, value: { label: value } });
++
++afterEach(() => {
++	vi.restoreAllMocks();
++});
++
++describe('loadCharacterWardrobeChoices', () => {
++	it('describes each published outfit with its catalogue name and merged labels', async () => {
++		const findMany = vi.fn(async () => [
++			{ catalogueKey: 'barista', name: 'Barista Apron Outfit', taxonomyAssignments: [label('role', 'Barista'), label('outfit-type', 'Uniform')] },
++			{ catalogueKey: 'barista', name: 'Barista Apron Outfit', taxonomyAssignments: [label('outfit-type', 'Uniform'), label('formality', 'Casual')] },
++			{ catalogueKey: 'chef', name: 'Chef Whites', taxonomyAssignments: [] }
++		]);
++		const choices = await loadCharacterWardrobeChoices({ clothes: { findMany } } as unknown as PrismaClient);
++
++		expect(findMany).toHaveBeenCalledWith(
++			expect.objectContaining({
++				where: {
++					visibility: 'public',
++					source: 'catalogue',
++					deletedAt: null,
++					catalogueKey: { in: ['barista', 'business_woman_in_suit.7', 'chef'] }
++				}
++			})
++		);
++		expect(choices.female).toEqual({
++			clothes: [
++				{ id: 'barista', name: 'Barista Apron Outfit', role: ['Barista'], outfitType: ['Uniform'], formality: ['Casual'] },
++				{ id: 'business_woman_in_suit.7', name: '', role: [], outfitType: [], formality: [] }
++			],
++			hair: ['bob']
++		});
++		expect(choices.male.clothes.map(clothesChoiceLine)).toEqual([
++			'barista: Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)',
++			'chef: Chef Whites'
++		]);
++	});
++});
++
++describe('checkedClothesPicks', () => {
++	const choices: CharacterWardrobeChoices = {
++		female: {
++			clothes: ['barista', 'waitress', 'chef'].map((id) => ({ id, name: '', role: [], outfitType: [], formality: [] })),
++			hair: []
++		},
++		male: { clothes: [], hair: [] }
++	};
++
++	it('keeps listed ids and drops a repeat of the starting outfit', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(
++			checkedClothesPicks(
++				{ characterGender: 'female', characterClothesId: 'barista', suggestedClothesIds: ['waitress', 'barista', 'chef'] },
++				choices
++			)
++		).toEqual({ characterGender: 'female', characterClothesId: 'barista', suggestedClothesIds: ['waitress', 'chef'] });
++		expect(checkedClothesPicks({ characterGender: 'female', characterClothesId: '', suggestedClothesIds: [] }, choices))
++			.toEqual({ characterGender: 'female', characterClothesId: '', suggestedClothesIds: [] });
++		expect(warn).not.toHaveBeenCalled();
++	});
++
++	it('logs and drops ids that are not in the list for that gender', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(
++			checkedClothesPicks(
++				{ characterGender: 'male', characterClothesId: 'barista', suggestedClothesIds: ['invented_coat'] },
++				choices
++			)
++		).toEqual({ characterGender: 'male', characterClothesId: '', suggestedClothesIds: [] });
++		expect(warn).toHaveBeenCalledWith('[experience.setup.details] outfit ids are not in the published list', {
++			gender: 'male',
++			unknown: ['barista', 'invented_coat'],
++			offered: 0
++		});
++	});
++});
+diff --git a/src/lib/server/platform/characterWardrobeChoices.ts b/src/lib/server/platform/characterWardrobeChoices.ts
+index 32e6665..03868ff 100644
+--- a/src/lib/server/platform/characterWardrobeChoices.ts
++++ b/src/lib/server/platform/characterWardrobeChoices.ts
+@@ -1,11 +1,121 @@
++import type { PrismaClient } from '@prisma/client';
++
+ import { listPublishedAvatars } from '$lib/server/catalog/avatars';
+-export type CharacterWardrobeChoices = Record<'female' | 'male', { clothes: string[]; hair: string[] }>;
++
++export const MAX_SUGGESTED_CLOTHES = 3;
++
++/** One published outfit as the setup generator reads it: the catalogue row's name and labels, when it has them. */
++export type ClothesChoice = {
++	readonly id: string;
++	readonly name: string;
++	readonly role: readonly string[];
++	readonly outfitType: readonly string[];
++	readonly formality: readonly string[];
++};
++export type CharacterWardrobeChoices = Record<'female' | 'male', { clothes: ClothesChoice[]; hair: string[] }>;
++
++const LABEL_DIMENSIONS = { role: 'role', 'outfit-type': 'outfitType', formality: 'formality' } as const;
++type LabelField = (typeof LABEL_DIMENSIONS)[keyof typeof LABEL_DIMENSIONS];
++
+ /** Only published wardrobe ids are supplied to the initial experience generator. */
+-export async function loadCharacterWardrobeChoices(): Promise<CharacterWardrobeChoices> {
++export async function loadCharacterWardrobeChoices(prisma: PrismaClient): Promise<CharacterWardrobeChoices> {
+ 	const avatars = await listPublishedAvatars();
+ 	const forGender = (gender: string) => {
+ 		const rows = avatars.filter(avatar => avatar.gender === gender && avatar.supportsCostumes);
+ 		return { clothes: [...new Set(rows.flatMap(row => row.clothesIds ?? []))], hair: [...new Set(rows.flatMap(row => row.hairIds ?? []))] };
+ 	};
+-	return { female: forGender('female'), male: forGender('male') };
++	const female = forGender('female');
++	const male = forGender('male');
++	const described = await describeCatalogueClothes(prisma, [...female.clothes, ...male.clothes]);
++	const describe = (id: string): ClothesChoice => ({
++		id,
++		...(described.get(id.toLowerCase()) ?? { name: '', role: [], outfitType: [], formality: [] })
++	});
++	return {
++		female: { clothes: female.clothes.map(describe), hair: female.hair },
++		male: { clothes: male.clothes.map(describe), hair: male.hair }
++	};
++}
++
++/** Name and labels of the public catalogue rows for these outfit ids. Each avatar has its own row, so labels are merged. */
++async function describeCatalogueClothes(
++	prisma: PrismaClient,
++	ids: readonly string[]
++): Promise<Map<string, Omit<ClothesChoice, 'id'>>> {
++	const rows = await prisma.clothes.findMany({
++		where: {
++			visibility: 'public',
++			source: 'catalogue',
++			deletedAt: null,
++			catalogueKey: { in: [...new Set(ids.map(id => id.toLowerCase()))] }
++		},
++		select: {
++			catalogueKey: true,
++			name: true,
++			taxonomyAssignments: {
++				where: { dimension: { in: Object.keys(LABEL_DIMENSIONS) } },
++				select: { dimension: true, value: { select: { label: true } } }
++			}
++		}
++	});
++	const byKey = new Map<string, { name: string } & Record<LabelField, string[]>>();
++	for (const row of rows) {
++		const key = row.catalogueKey?.toLowerCase();
++		if (!key) continue;
++		const entry = byKey.get(key) ?? { name: '', role: [], outfitType: [], formality: [] };
++		if (!entry.name) entry.name = row.name.trim();
++		for (const { dimension, value } of row.taxonomyAssignments) {
++			const field = LABEL_DIMENSIONS[dimension as keyof typeof LABEL_DIMENSIONS];
++			if (field && !entry[field].includes(value.label)) entry[field].push(value.label);
++		}
++		byKey.set(key, entry);
++	}
++	return byKey;
++}
++
++/** e.g. `barista: Barista Apron Outfit (role: Barista; outfit: Uniform; formality: Casual)`. */
++export function clothesChoiceLine(choice: ClothesChoice): string {
++	const labels = [
++		choice.role.length > 0 ? `role: ${choice.role.join(', ')}` : '',
++		choice.outfitType.length > 0 ? `outfit: ${choice.outfitType.join(', ')}` : '',
++		choice.formality.length > 0 ? `formality: ${choice.formality.join(', ')}` : ''
++	].filter(Boolean);
++	const name = choice.name.trim();
++	return `${choice.id}${name ? `: ${name}` : ''}${labels.length > 0 ? ` (${labels.join('; ')})` : ''}`;
++}
++
++/** The wardrobe as the generator reads it: one line per outfit, bare hair ids. */
++export function wardrobePromptChoices(choices: CharacterWardrobeChoices) {
++	return {
++		female: { clothes: choices.female.clothes.map(clothesChoiceLine), hair: choices.female.hair },
++		male: { clothes: choices.male.clothes.map(clothesChoiceLine), hair: choices.male.hair }
++	};
++}
++
++/** Keeps only outfit ids in the chosen gender's published list; any other id is logged and dropped, never swapped. */
++export function checkedClothesPicks<
++	T extends {
++		readonly characterGender: string;
++		readonly characterClothesId: string;
++		readonly suggestedClothesIds: readonly string[];
++	}
++>(details: T, choices: CharacterWardrobeChoices | undefined): T {
++	const gender = details.characterGender;
++	const offered = new Set(
++		(gender === 'female' || gender === 'male' ? (choices?.[gender].clothes ?? []) : []).map(choice => choice.id)
++	);
++	const picked = [details.characterClothesId, ...details.suggestedClothesIds].map(id => id.trim()).filter(Boolean);
++	const unknown = picked.filter(id => !offered.has(id));
++	if (unknown.length > 0) {
++		console.warn('[experience.setup.details] outfit ids are not in the published list', {
++			gender,
++			unknown,
++			offered: offered.size
++		});
++	}
++	const characterClothesId = offered.has(details.characterClothesId.trim()) ? details.characterClothesId.trim() : '';
++	const suggestedClothesIds = [...new Set(details.suggestedClothesIds.map(id => id.trim()))]
++		.filter(id => offered.has(id) && id !== characterClothesId)
++		.slice(0, MAX_SUGGESTED_CLOTHES);
++	return { ...details, characterClothesId, suggestedClothesIds };
+ }
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.test.ts b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+index 96ceb9b..74d0783 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.test.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+@@ -40,6 +40,7 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 			characterAge: 35,
+ 			characterEthnicity: 'east-asian',
+  characterClothesId: '', characterHairId: '',
++			suggestedClothesIds: [],
+ 			characterPersonality: 'Calm, observant, and warmly professional.',
+ 			characterInstructions:
+ 				'Maya is an experienced hotel receptionist who protects guest privacy.',
+@@ -68,6 +69,7 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 			characterAge: 25,
+ 			characterEthnicity: 'european',
+  characterClothesId: '', characterHairId: '',
++			suggestedClothesIds: [],
+ 			characterPersonality: 'Reserved, perceptive, and deliberate.',
+ 			characterInstructions:
+ 				'Elena values discretion and never makes claims she cannot support.',
+@@ -161,7 +163,7 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 		});
+ 	});
+ 
+-	it('reads suggested set numbers even when the model sends them as text, keeping at most three', () => {
++	it('reads suggested set numbers and outfit ids even when the model sends odd values, keeping at most three', () => {
+ 		const base = {
+ 			title: 'Valid',
+ 			description: 'ok',
+@@ -180,6 +182,12 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 				?.suggestedSetRefs
+ 		).toEqual([12, 4, 7]);
+ 		expect(parseGeneratedExperienceSetupDetails(JSON.stringify(base))?.suggestedSetRefs).toEqual([]);
++		expect(
++			parseGeneratedExperienceSetupDetails(
++				JSON.stringify({ ...base, suggestedClothesIds: [' barista ', 7, '', 'bartender', 'chef', 'waiter'] })
++			)?.suggestedClothesIds
++		).toEqual(['barista', 'bartender', 'chef']);
++		expect(parseGeneratedExperienceSetupDetails(JSON.stringify(base))?.suggestedClothesIds).toEqual([]);
+ 	});
+ 
+ 	it('snaps a nearby age and a spaced ethnicity onto the character form values', () => {
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.ts b/src/lib/server/platform/generateExperienceSetupDetails.ts
+index 369ae03..62985c8 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.ts
+@@ -1,4 +1,9 @@
+-import type { CharacterWardrobeChoices } from './characterWardrobeChoices';
++import {
++	checkedClothesPicks,
++	MAX_SUGGESTED_CLOTHES,
++	wardrobePromptChoices,
++	type CharacterWardrobeChoices
++} from './characterWardrobeChoices';
+ import { MAX_SUGGESTED_SETS, setChoicePromptLines, type SetChoice } from './setSuggestionChoices';
+ import type { PrismaClient } from '@prisma/client';
+ import { z } from 'zod';
+@@ -59,6 +64,7 @@ const generatedDetailsSchema = z
+ 		characterAge: characterAgeSchema,
+ 		characterEthnicity: characterEthnicitySchema,
+  characterClothesId: z.string().max(200).default(''),
++		suggestedClothesIds: z.array(z.string().max(200)).max(MAX_SUGGESTED_CLOTHES).default([]),
+  characterHairId: z.string().max(200).default(''),
+ 		characterPersonality: z.string().trim().max(2500),
+ 		characterInstructions: z.string().trim().max(5000),
+@@ -84,6 +90,7 @@ const RESPONSE_SCHEMA = {
+ 		'characterAge',
+ 		'characterEthnicity',
+  'characterClothesId',
++		'suggestedClothesIds',
+  'characterHairId',
+ 		'characterPersonality',
+ 		'characterInstructions',
+@@ -103,6 +110,11 @@ const RESPONSE_SCHEMA = {
+ 		characterAge: { type: 'string', enum: CHARACTER_LOOK_AGES.map(String) },
+ 		characterEthnicity: { type: 'string', enum: [...CHARACTER_LOOK_ETHNICITIES] },
+  characterClothesId: { type: 'string', maxLength: 200 },
++		suggestedClothesIds: {
++			type: 'array',
++			items: { type: 'string', maxLength: 200 },
++			maxItems: MAX_SUGGESTED_CLOTHES
++		},
+  characterHairId: { type: 'string', maxLength: 200 },
+ 		characterPersonality: { type: 'string', maxLength: 2500 },
+ 		characterInstructions: { type: 'string', maxLength: 5000 },
+@@ -118,7 +130,7 @@ export const EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT = `You design a coherent Lif
+ Liforma Experiences are browser-based conversations between one human participant and one animated talking character.
+ 
+ Return ONLY valid JSON with exactly these fields:
+-{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","suggestedSetRefs":[17,4],"startingMessage":"...","systemInstructions":"..."}
++{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","suggestedClothesIds":["...","..."],"characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","suggestedSetRefs":[17,4],"startingMessage":"...","systemInstructions":"..."}
+ 
+ Field rules:
+ - title: a clear, appealing title, 1–128 characters.
+@@ -129,7 +141,8 @@ Field rules:
+ - characterGender: choose the male or female visual avatar that best fits the brief. This selects an appearance, not a restriction on the character identity.
+ - characterAge: use 35 (adult). The currently available male and female avatar sets are adults.
+ - characterEthnicity: exactly one of "african", "east-asian", "european", "indigenous", "mediterranean", "middle-eastern", "north-african", "pacific-islander", "south-asian", "southeast-asian". Choose the closest facial appearance. Do not return "mixed".
+-- characterClothesId and characterHairId: choose suitable defaults from the supplied published wardrobe for the selected gender. Copy exact ids only; use an empty string for the standard white T-shirt or default brown hair when no better option is appropriate. Do not invent ids. Appearance choices are editable suggestions for the author to confirm.
++- characterClothesId and characterHairId: choose suitable defaults from the supplied published wardrobe for the selected gender. Each clothes line is "id: name (role; outfit; formality)", with labels only where they are known; choose clothes that fit characterRole and the setting. Copy exact ids only (the part before the colon); use an empty string for the standard white T-shirt or default brown hair when no better option is appropriate. Do not invent ids. Appearance choices are editable suggestions for the author to confirm.
++- suggestedClothesIds: up to three other clothes ids from the same gender's list that would also suit the character, best first. Do not repeat characterClothesId. Return an empty array when nothing else fits.
+ - characterPersonality: instructions the model reads while playing this character. Write in second person and start with "You are". Describe stable tone, traits, mannerisms, and speaking style that should follow this character between experiences. Example: "You are cheerful, attentive, and gently humorous. You speak with a soft, melodic tone and often use polite honorifics. You listen closely and make people feel welcome." Do not write a third-person biography, and do not use the character's name or she/he/they as the subject. Do not include the current scenario, participant task, set details, or situation-specific objectives.
+ - characterInstructions: instructions the model reads while playing this character. Write in second person ("you", "your"). Cover reusable identity, background, expertise, persistent relationships, rules, and boundaries that should follow this character between experiences. Example: "You have worked at your family's restaurant for years and know the menu by heart. You are proud of your heritage and the food you serve. Stay professional yet warm. Share a short anecdote about the restaurant or the neighborhood only when asked. Avoid over-familiarity, and treat regular customers like old friends." Do not narrate in the third person. Do not include facts, goals, events, or constraints that apply only to this experience or set.
+ - setName: a concise, reusable name for the visual setting where the conversation happens. Name the place, not the activity.
+@@ -253,6 +266,12 @@ export function normalizeGeneratedExperienceSetupDetails(value: unknown): unknow
+ 				.filter((ref): ref is number => Number.isInteger(ref))
+ 				.slice(0, MAX_SUGGESTED_SETS)
+ 		: [];
++	row.suggestedClothesIds = Array.isArray(row.suggestedClothesIds)
++		? row.suggestedClothesIds
++				.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
++				.map((id) => id.trim())
++				.slice(0, MAX_SUGGESTED_CLOTHES)
++		: [];
+ 	return row;
+ }
+ 
+@@ -315,7 +334,7 @@ export async function generateExperienceSetupDetails(input: {
+ 				role: 'user',
+ 				content: JSON.stringify({
+ 					brief: input.prompt.trim(),
+-					publishedWardrobe: input.wardrobeChoices ?? {},
++					publishedWardrobe: input.wardrobeChoices ? wardrobePromptChoices(input.wardrobeChoices) : {},
+ 					publicSets: setChoicePromptLines(input.setChoices ?? [])
+ 				})
+ 			}
+@@ -388,7 +407,7 @@ export async function generateExperienceSetupDetails(input: {
+ 				'The generated experience details were invalid. Try again.'
+ 			);
+ 		}
+-		return details;
++		return checkedClothesPicks(details, input.wardrobeChoices);
+ 	} catch (error) {
+ 		if (error instanceof ExperienceSetupDetailsGenerationError) throw error;
+ 		throw new ExperienceSetupDetailsGenerationError();
+diff --git a/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts b/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts
+index a9ddc83..6d52963 100644
+--- a/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts
++++ b/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts
+@@ -72,7 +72,7 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
+ 	try {
+ 		await admitAppGeneration(prisma, user.id, project.organizationId);
+ 		const [wardrobeChoices, setChoices] = await Promise.all([
+-			loadCharacterWardrobeChoices(),
++			loadCharacterWardrobeChoices(prisma),
+ 			loadPublicSetChoices(prisma)
+ 		]);
+ 		const details = await generateExperienceSetupDetails({
+diff --git a/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts b/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts
+index ce90c85..78d12d9 100644
+--- a/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts
++++ b/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts
+@@ -64,7 +64,7 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
+ 	try {
+ 		await admitAppGeneration(prisma, user.id, project.organizationId);
+ 		const [wardrobeChoices, setChoices] = await Promise.all([
+-			loadCharacterWardrobeChoices(),
++			loadCharacterWardrobeChoices(prisma),
+ 			loadPublicSetChoices(prisma)
+ 		]);
+ 		const details = await generateExperienceSetupDetails({
+-- 
+2.50.1 (Apple Git-155)
+

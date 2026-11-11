@@ -1,0 +1,40 @@
+From 9ce203b52d65b1ed03f65c523d8b965b2e9fb8b9 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:53:14 +0100
+Subject: [PATCH 4/6] Change Clothes with Show hair: the tiles' plate hair is
+ the 256 picture, the full-screen preview keeps 1024.
+
+The outfit tiles drew a plate hairstyle at 1024 (catalogue hair is a 256 tile picture there), and the contact shadow under
+the hair is worked out at the hair picture's size: 37 ms of main-thread work per tile instead of 3 ms (measured), for every
+outfit tile as it scrolls into view. The tiles now get the 256 picture; the full-screen preview of a tile asks for the 1024
+one (previewOverlayFor), so it stays sharp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../(portal)/studio/(library)/characters/[charId]/+page.svelte | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte b/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
+index 12c71a7..629dbc8 100644
+--- a/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
++++ b/src/routes/(portal)/studio/(library)/characters/[charId]/+page.svelte
+@@ -867,7 +867,7 @@
+ 	});
+ 	const selectedHairImage = $derived(
+ 		clothesPickerHairId && !isBaldHair(clothesPickerHairId)
+-			? (plateHair.imageFor(editAvatarId, clothesPickerHairId, 1024) ?? hairOptionUrl(cdnBaseUrl, editAvatarId, clothesPickerHairId))
++			? (plateHair.imageFor(editAvatarId, clothesPickerHairId, 256) ?? hairOptionUrl(cdnBaseUrl, editAvatarId, clothesPickerHairId))
+ 			: ''
+ 	);
+ 	const catalogueScene = $derived(
+@@ -1857,6 +1857,7 @@
+ 		projectId={project?.id}
+ 		avatarId={editAvatarId}
+ 		hairOverlayImage={showHairOnClothes ? selectedHairImage : ''}
++		previewOverlayFor={() => (showHairOnClothes ? plateHair.imageFor(editAvatarId, clothesPickerHairId, 1024) ?? selectedHairImage : '')}
+ 		cdnBaseUrl={cdnBaseUrl}
+ 		bind:viewMode={clothesViewMode}
+ 		bind:labelsEditorOpen={clothesLabelsEditorOpen}
+-- 
+2.50.1 (Apple Git-155)
+

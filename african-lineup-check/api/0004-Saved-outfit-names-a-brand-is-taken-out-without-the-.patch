@@ -1,0 +1,70 @@
+From 3d6c27851ec1499e1cb0c4bf83f7d31744c11243 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:59:49 +0000
+Subject: [PATCH 4/5] Saved outfit names: a brand is taken out without the
+ image model's "no logos" note
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/lib/server/catalog/setOutfitLabels.test.ts     |  7 +++++++
+ .../server/clothesGeneration/outfitPromptCheck.ts  | 14 ++++++++++----
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/src/lib/server/catalog/setOutfitLabels.test.ts b/src/lib/server/catalog/setOutfitLabels.test.ts
+index e353081..780bc9e 100644
+--- a/src/lib/server/catalog/setOutfitLabels.test.ts
++++ b/src/lib/server/catalog/setOutfitLabels.test.ts
+@@ -142,6 +142,13 @@ describe('labels for a new avatar-set outfit', () => {
+ 			'clothes.labels name cleaned',
+ 			expect.objectContaining({ from: 'Spider-Man hoodie', to: labelled.name })
+ 		);
++		// a brand goes too, without the "no logos" note that is only for the image model
++		clothes.findFirst.mockResolvedValue(null);
++		const plate = await withSetOutfitLabels(
++			prisma,
++			outfit('avatar-set-outfit:dd80126a:nike_tracksuit_ab12cd--middle-eastern', 'Nike tracksuit (Middle Eastern)')
++		);
++		expect(plate.name).toBe('Tracksuit (Middle Eastern)');
+ 	});
+ 
+ 	it('still saves the outfit, and logs why, when the reads give nothing or the picture cannot be loaded', async () => {
+diff --git a/src/lib/server/clothesGeneration/outfitPromptCheck.ts b/src/lib/server/clothesGeneration/outfitPromptCheck.ts
+index b80ed71..0986e3d 100644
+--- a/src/lib/server/clothesGeneration/outfitPromptCheck.ts
++++ b/src/lib/server/clothesGeneration/outfitPromptCheck.ts
+@@ -231,14 +231,18 @@ export function checkOutfitWords(
+ 	if (NUDITY.test(text) || (wearer !== 'male' && BARE_CHEST.test(text))) {
+ 		throw new AuthoringError(422, 'OUTFIT_NUDITY', OUTFIT_NUDITY_MESSAGE);
+ 	}
+-	return outfitWordsWithoutNames(text);
++	return outfitWordsWithoutNames(text, { sayNoLogos: true });
+ }
+ 
+ /**
+  * The word list's name rules on their own, with no nudity refusal: for words whose picture has already been drawn
+- * and checked (an outfit's saved name).
++ * and checked (an outfit's saved name). `sayNoLogos` adds the note an image model needs after a brand name; a saved
++ * name leaves it out.
+  */
+-export function outfitWordsWithoutNames(description: string): { readonly words: string; readonly removed: readonly string[] } {
++export function outfitWordsWithoutNames(
++	description: string,
++	options: { readonly sayNoLogos?: boolean } = {}
++): { readonly words: string; readonly removed: readonly string[] } {
+ 	const text = description.trim();
+ 	const removed: string[] = [];
+ 	let words = text;
+@@ -257,7 +261,9 @@ export function outfitWordsWithoutNames(description: string): { readonly words:
+ 	});
+ 	if (removed.length === 0) return { words: text, removed };
+ 	words = tidy(fixArticles(tidy(words)));
+-	if (brands && !words.toLowerCase().includes(NO_LOGOS)) words = `${words.replace(/[.!]$/, '')}, ${NO_LOGOS}`;
++	if (options.sayNoLogos && brands && !words.toLowerCase().includes(NO_LOGOS)) {
++		words = `${words.replace(/[.!]$/, '')}, ${NO_LOGOS}`;
++	}
+ 	return { words, removed };
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

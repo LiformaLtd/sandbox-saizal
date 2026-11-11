@@ -1,0 +1,881 @@
+From 1ad17f86ed23b0ee9073083dd8a5b38226df5665 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:57:14 +0000
+Subject: [PATCH 3/5] One setting picks the image models for clothes, costumes
+ and race outfits
+
+IMAGE_MODELS_CLOTHES lists the models in order: first choice, then its backups.
+With no setting the list is the one the code had (four GPT Image models, then
+Krea 2), so nothing changes for users. Each job keeps the list it started with:
+a costume row stores it, a race outfit ticket carries it, and the try rule and
+billing read the job's own list. A costume row whose first provider is no longer
+the first in the code still runs (it was left waiting before). A wrong setting
+stops a job from starting and names the bad id; the default is never used in
+its place without saying so. Backdrops are not part of this change.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .env.example                                  |  6 ++
+ .../clothesGeneration/lifecycle.test.ts       | 47 ++++++++++++
+ src/lib/server/clothesGeneration/lifecycle.ts | 41 +++++++---
+ .../clothesGeneration/raceOutfitSteps.test.ts | 53 +++++++++++--
+ .../clothesGeneration/raceOutfitSteps.ts      | 32 +++++---
+ .../clothesGeneration/raceOutfitTicket.ts     | 15 +++-
+ .../imageProviders/imageModelChoice.test.ts   | 59 +++++++++++++++
+ .../server/imageProviders/imageModelChoice.ts | 71 ++++++++++++++++++
+ .../studioClothesImageEdit.test.ts            | 63 ++++++++++++++++
+ .../imageProviders/studioClothesImageEdit.ts  | 75 +++++++++++--------
+ 10 files changed, 405 insertions(+), 57 deletions(-)
+ create mode 100644 src/lib/server/imageProviders/imageModelChoice.test.ts
+ create mode 100644 src/lib/server/imageProviders/imageModelChoice.ts
+
+diff --git a/.env.example b/.env.example
+index 171c352..96237ac 100644
+--- a/.env.example
++++ b/.env.example
+@@ -21,6 +21,12 @@ OPEN_AI_API_KEY=
+ # Endpoint example: https://<resource>.cognitiveservices.azure.com
+ # AZURE_OPENAI_API_KEY=
+ # AZURE_OPENAI_ENDPOINT=
++# Image models for Studio clothes, costumes and avatar-set race outfits: a comma-separated list of model ids, first
++# choice first, then its backups in order (imageModelChoice.ts). Unset = the list in the code. Each job keeps the list
++# it started with. Krea 2 (huggingface/charlesatliforma/krea2-identity-edit) can only be last. On Vercel a changed
++# value applies after a Redeploy. Example, OpenRouter first:
++# IMAGE_MODELS_CLOTHES=openrouter/gpt-image-2.5-sunburst/low/image-to-image,azure/gpt-image-2.5-sunburst/low/image-to-image,huggingface/charlesatliforma/krea2-identity-edit
++# IMAGE_MODELS_CLOTHES=
+ # Alibaba Model Studio, OpenAI-compatible. Base URL should end in /compatible-mode/v1.
+ # Same model id, two workspaces. Speech turns use Frankfurt.
+ # Singapore / International (ALIBABA_API_URL): $0.10 / 1M input, $0.40 / 1M output.
+diff --git a/src/lib/server/clothesGeneration/lifecycle.test.ts b/src/lib/server/clothesGeneration/lifecycle.test.ts
+index b32ebc8..f4ed9c7 100644
+--- a/src/lib/server/clothesGeneration/lifecycle.test.ts
++++ b/src/lib/server/clothesGeneration/lifecycle.test.ts
+@@ -127,6 +127,29 @@ describe('starting a Studio clothes generation', () => {
+ 		expect(create).not.toHaveBeenCalled();
+ 		expect(billing.admit).not.toHaveBeenCalled();
+ 	});
++
++	it('does not start when the image models setting is wrong, and says which id', async () => {
++		const { startClothesGeneration } = await import('./lifecycle');
++		vi.spyOn(console, 'error').mockImplementation(() => {});
++		vi.stubEnv('IMAGE_MODELS_CLOTHES', 'azure/not-a-model');
++		const create = vi.fn();
++		const prisma = { clothesGeneration: { create } } as unknown as PrismaClient;
++		await expect(
++			startClothesGeneration(prisma, {
++				organizationId: 'org_1',
++				projectId: 'proj_1',
++				actorLiformaUserId: 'user_1',
++				avatarId: 'anna',
++				prompt: 'a navy jumper'
++			})
++		).rejects.toMatchObject({
++			code: 'IMAGE_MODELS_SETTING_INVALID',
++			message: expect.stringContaining('"azure/not-a-model" is not an image model this server knows')
++		});
++		vi.unstubAllEnvs();
++		expect(create).not.toHaveBeenCalled();
++		expect(billing.admit).not.toHaveBeenCalled();
++	});
+ });
+ 
+ describe('studio clothes generation re-tries', () => {
+@@ -212,6 +235,30 @@ describe('studio clothes generation re-tries', () => {
+ 		});
+ 	});
+ 
++	it('runs a row that started with OpenRouter first as a Studio edit, on its own list', async () => {
++		const { pollClothesGeneration } = await import('./lifecycle');
++		// The row's first provider is no longer the first one in the code: it must still be run, not left waiting.
++		const store = fakePrisma({
++			...QUEUED,
++			inferenceMetadataJson: { imageProvider: 'openrouter', targetKind: 'clothes', imageModels: [OPENROUTER, AZURE] }
++		} as unknown as ClothesGeneration);
++		studioEdit.edit.mockRejectedValueOnce(busy()).mockRejectedValueOnce(busy());
++		billing.admit
++			.mockResolvedValueOnce({ operationId: 'op_1', attemptId: 'att_1', attemptNo: 1 })
++			.mockResolvedValueOnce({ operationId: 'op_2', attemptId: 'att_az', attemptNo: 1 });
++		expect(await pollClothesGeneration(store.prisma, { projectId: 'proj_1', generationId: 'cgen_1' })).toMatchObject({
++			status: 'failed',
++			error: { code: 'IMAGE_EDIT_BUSY' }
++		});
++		// OpenRouter, then Azure as its backup; this list has no Krea 2, so the job stops there
++		expect(studioEdit.edit.mock.calls.map(([call]) => (call as { modelId?: string }).modelId)).toEqual([OPENROUTER, AZURE]);
++		expect(billing.admit).toHaveBeenNthCalledWith(1, expect.objectContaining({ invocationId: 'cgen_1', provider: 'openrouter' }));
++		expect(billing.admit).toHaveBeenNthCalledWith(
++			2,
++			expect.objectContaining({ invocationId: 'cgen_1-azure-sunburst', provider: 'azure' })
++		);
++	});
++
+ 	it('waits 3 s once all four models have said busy, then runs Krea 2; a poll during the wait does not knock again', async () => {
+ 		const { pollClothesGeneration } = await import('./lifecycle');
+ 		const store = fakePrisma(QUEUED);
+diff --git a/src/lib/server/clothesGeneration/lifecycle.ts b/src/lib/server/clothesGeneration/lifecycle.ts
+index cd70d29..04abcc0 100644
+--- a/src/lib/server/clothesGeneration/lifecycle.ts
++++ b/src/lib/server/clothesGeneration/lifecycle.ts
+@@ -22,18 +22,22 @@ import { publishedCdnBaseUrl } from '$lib/server/cdnUrls';
+ import { puppetForWardrobeAvatar, writePuppetTorsoFromPlate } from '$lib/server/composite/puppetTorsoFromPlate';
+ import {
+ 	editStudioClothesImage,
+-	FIRST_STUDIO_CLOTHES_TRY,
++	firstStudioClothesTry,
+ 	measureOriginalFace,
+ 	nextStudioClothesTry,
+ 	refusedPaidPicture,
+ 	SAME_REQUEST_HOP_MS,
+-	STUDIO_CLOTHES_KREA_MODEL_ID,
+ 	STUDIO_CLOTHES_MAX_TRIES,
+ 	storedTryExtras,
+ 	studioClothesEditAttribution,
+ 	studioClothesNextMessage,
+ 	type StudioClothesTry
+ } from '$lib/server/imageProviders/studioClothesImageEdit';
++import {
++	clothesImageModels,
++	DEFAULT_CLOTHES_MODELS,
++	STUDIO_CLOTHES_KREA_MODEL_ID
++} from '$lib/server/imageProviders/imageModelChoice';
+ import { requireKreaRoom } from '$lib/server/imageProviders/kreaGuardrail';
+ import {
+ 	HUGGINGFACE_PROVIDER_ID,
+@@ -182,15 +186,29 @@ function readGpuAccounting(row: ClothesGeneration): GpuAccountingState | null {
+ 	};
+ }
+ 
++/**
++ * A row made by the shared Studio edit: it stored its own model list. A row made before the list was stored says so
++ * with its first provider, which was Azure, or Hugging Face under the local Krea-only patch.
++ */
+ function usesStudioImageEdit(row: ClothesGeneration): boolean {
+-	const provider = readMeta(row).imageProvider;
+-	return provider === STUDIO_IDENTITY_EDIT_PROVIDER_ID || provider === HUGGINGFACE_PROVIDER_ID;
++	const meta = readMeta(row);
++	if (Array.isArray(meta.imageModels)) return true;
++	return meta.imageProvider === STUDIO_IDENTITY_EDIT_PROVIDER_ID || meta.imageProvider === HUGGINGFACE_PROVIDER_ID;
++}
++
++/** The image models this row started with, in order; the code's own list for a row made before they were stored. */
++function rowImageModels(row: ClothesGeneration): readonly string[] {
++	const stored = readMeta(row).imageModels;
++	return Array.isArray(stored) && stored.length > 0 && stored.every((id) => typeof id === 'string')
++		? (stored as string[])
++		: DEFAULT_CLOTHES_MODELS;
+ }
+ 
+ /** The Studio attempt this row is on (`nextStudioClothesTry`); a row with none stored is on its first. */
+ function readStudioTry(row: ClothesGeneration): StudioClothesTry {
+ 	const stored = readMeta(row).studioTry;
+-	if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return FIRST_STUDIO_CLOTHES_TRY;
++	const first = firstStudioClothesTry(rowImageModels(row));
++	if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return first;
+ 	const t = stored as Record<string, unknown>;
+ 	return typeof t.tryNo === 'number' && typeof t.modelId === 'string'
+ 		? {
+@@ -199,7 +217,7 @@ function readStudioTry(row: ClothesGeneration): StudioClothesTry {
+ 				down: Array.isArray(t.down) ? t.down.filter((id): id is string => typeof id === 'string') : [],
+ 				...storedTryExtras(t)
+ 			}
+-		: FIRST_STUDIO_CLOTHES_TRY;
++		: first;
+ }
+ 
+ function clothesGpuAttribution(row: ClothesGeneration): AccountingAttribution {
+@@ -211,7 +229,8 @@ function clothesGpuAttribution(row: ClothesGeneration): AccountingAttribution {
+ 			actorLiformaUserId: row.actorLiformaUserId,
+ 			resourceId: row.generationId,
+ 			callSite: 'studio_clothes_generator',
+-			modelId: readStudioTry(row).modelId
++			modelId: readStudioTry(row).modelId,
++			firstModelId: rowImageModels(row)[0]
+ 		});
+ 	}
+ 	return {
+@@ -339,6 +358,8 @@ export async function startClothesGeneration(
+ 		? parseClothesLabels(input.userOverrides)
+ 		: EMPTY_CLOTHES_LABELS;
+ 
++	// A wrong model setting stops the job here, before anything is read, saved or billed.
++	const imageModels = clothesImageModels();
+ 	// Checked before anything is saved or billed: nudity is refused, and a named franchise, character or brand
+ 	// becomes a plain description of the look (outfitPromptCheck.ts). The wearer is not known here, so a bare
+ 	// chest counts as nudity.
+@@ -381,7 +402,9 @@ export async function startClothesGeneration(
+ 		userOverrideDimensions,
+ 		mergeVersion: CLOTHES_LABEL_MERGE_VERSION,
+ 		workingPlateSource: plateSource,
+-		imageProvider: STUDIO_IDENTITY_EDIT_PROVIDER_ID
++		imageProvider: STUDIO_IDENTITY_EDIT_PROVIDER_ID,
++		// The job keeps the list it starts with: a changed setting only reaches new jobs.
++		imageModels
+ 	};
+ 
+ 	// Persist first so a later submit failure still has a generation row to mark failed.
+@@ -795,7 +818,7 @@ async function editClothesOnHuggingFace(
+ 			}
+ 			// A picture a check refused was still paid for: book the provider's answer, not nothing.
+ 			const usage = paid?.usage ?? { outcome: 'failed', errorCode: code, errorMessage: message, usageJson: { images: 0 } };
+-			const decision = nextStudioClothesTry(attempt, error);
++			const decision = nextStudioClothesTry(attempt, error, Date.now(), rowImageModels(current));
+ 			if (decision.kind !== 'stop') {
+ 				// Book this attempt, then hand the edit on: to the next model in this poll (a hop), or to a later poll.
+ 				await finalizeGpuAccounting(prisma, current, usage);
+diff --git a/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts b/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
+index d81eebc..dd70501 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitSteps.test.ts
+@@ -493,7 +493,7 @@ describe('automatic re-tries', () => {
+ 		billing.admit.mockResolvedValueOnce({ operationId: 'op_2', attemptId: 'att_or', attemptNo: 1 });
+ 		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
+ 		// one request: Azure said busy and OpenRouter drew it; the original face was measured once, for both
+-		expect(modelsCalled()).toEqual([undefined, OPENROUTER]);
++		expect(modelsCalled()).toEqual([AZURE, OPENROUTER]);
+ 		expect(console.info).toHaveBeenCalledWith('clothes.edit drawn', {
+ 			invocationId: step.invocationId,
+ 			step: 'european',
+@@ -564,7 +564,7 @@ describe('automatic re-tries', () => {
+ 			jobStatus: 'retrying',
+ 			message: 'The image models are busy. Trying the backup model in 3 s'
+ 		});
+-		expect(modelsCalled()).toEqual([undefined, OPENROUTER, FLARE, OPENAI]);
++		expect(modelsCalled()).toEqual([AZURE, OPENROUTER, FLARE, OPENAI]);
+ 		expect(billing.admit).toHaveBeenLastCalledWith(
+ 			expect.objectContaining({ invocationId: `${step.invocationId}-openai-sunburst`, provider: 'openai' })
+ 		);
+@@ -576,7 +576,7 @@ describe('automatic re-tries', () => {
+ 		// after it, Krea 2 on the same try (the step's own seed), without measuring the face again
+ 		vi.setSystemTime(new Date('2026-11-10T12:00:04Z'));
+ 		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
+-		expect(modelsCalled()).toEqual([undefined, OPENROUTER, FLARE, OPENAI, KREA]);
++		expect(modelsCalled()).toEqual([AZURE, OPENROUTER, FLARE, OPENAI, KREA]);
+ 		expect(studioEdit.edit).toHaveBeenLastCalledWith(expect.objectContaining({ krea: { seed: step.seed } }));
+ 		expect(console.info).toHaveBeenCalledWith(
+ 			'clothes.edit drawn',
+@@ -613,7 +613,7 @@ describe('automatic re-tries', () => {
+ 		// after the wait Krea is full, so Azure again in the same poll, and this time it draws it
+ 		vi.setSystemTime(new Date('2026-11-10T12:00:04Z'));
+ 		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
+-		expect(modelsCalled()).toEqual([undefined, OPENROUTER, FLARE, OPENAI, AZURE]);
++		expect(modelsCalled()).toEqual([AZURE, OPENROUTER, FLARE, OPENAI, AZURE]);
+ 		expect(kreaAttempts.count).toHaveBeenCalled();
+ 		// Krea was neither billed nor sent
+ 		expect(billing.admit).not.toHaveBeenCalledWith(expect.objectContaining({ provider: 'huggingface' }));
+@@ -666,7 +666,7 @@ describe('automatic re-tries', () => {
+ 			message: 'Trying the backup image model'
+ 		});
+ 		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
+-		expect(modelsCalled()).toEqual([undefined, OPENROUTER, FLARE, KREA]);
++		expect(modelsCalled()).toEqual([AZURE, OPENROUTER, FLARE, KREA]);
+ 		// try 4: the step's seed + 3
+ 		expect(studioEdit.edit).toHaveBeenLastCalledWith(expect.objectContaining({ krea: { seed: step.seed + 3 } }));
+ 		expect(billing.admit).toHaveBeenLastCalledWith(
+@@ -691,7 +691,7 @@ describe('automatic re-tries', () => {
+ 		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ message: 'Trying again (2 of 3)' });
+ 		// Flare and OpenAI fail (hops) and Krea draws it, in that same poll
+ 		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
+-		expect(modelsCalled()).toEqual([undefined, OPENROUTER, FLARE, OPENAI, KREA]);
++		expect(modelsCalled()).toEqual([AZURE, OPENROUTER, FLARE, OPENAI, KREA]);
+ 		// Krea's room was checked before its attempt was billed
+ 		expect(kreaAttempts.count).toHaveBeenCalled();
+ 		// a new seed for each try (the step's seed + 1 on try 2); the European step has no second picture, so no fidelity
+@@ -909,6 +909,47 @@ describe('automatic re-tries', () => {
+ 		expect(console.error).not.toHaveBeenCalledWith('clothes.lineup kept closest', expect.anything());
+ 	});
+ 
++	it('keeps the model list a step started with when the setting changes, and bills its first model on the plain id', async () => {
++		const { pollRaceOutfitStep, raceOutfitTicketKey } = await import('./raceOutfitSteps');
++		const { readRaceOutfitTicket } = await import('./raceOutfitTicket');
++		vi.stubEnv('IMAGE_MODELS_CLOTHES', `${OPENROUTER},${AZURE}`);
++		const step = await startCoat();
++		expect(readRaceOutfitTicket(step.token, raceOutfitTicketKey())?.imageModels).toEqual([OPENROUTER, AZURE]);
++		expect(billing.admit).toHaveBeenLastCalledWith(
++			expect.objectContaining({ invocationId: step.invocationId, provider: 'openrouter' })
++		);
++		// the setting changes while the step is running
++		vi.stubEnv('IMAGE_MODELS_CLOTHES', KREA);
++		studioEdit.edit.mockRejectedValueOnce(await modelError('busy'));
++		billing.admit.mockResolvedValueOnce({ operationId: 'op_2', attemptId: 'att_az', attemptNo: 1 });
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
++		expect(modelsCalled()).toEqual([OPENROUTER, AZURE]);
++		expect(billing.admit).toHaveBeenLastCalledWith(
++			expect.objectContaining({ invocationId: `${step.invocationId}-azure-sunburst`, provider: 'azure' })
++		);
++		vi.unstubAllEnvs();
++	});
++
++	it('runs a Krea-only list on Krea 2 from the first try, checking its room before billing opens', async () => {
++		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
++		vi.stubEnv('IMAGE_MODELS_CLOTHES', KREA);
++		const step = await startCoat();
++		expect(kreaAttempts.count).toHaveBeenCalled();
++		expect(billing.admit).toHaveBeenLastCalledWith(
++			expect.objectContaining({ invocationId: step.invocationId, provider: 'huggingface' })
++		);
++		expect(await pollRaceOutfitStep(prisma, 'proj_1', step.token)).toMatchObject({ status: 'ready' });
++		expect(modelsCalled()).toEqual([KREA]);
++		vi.unstubAllEnvs();
++	});
++
++	it('does not start a step when the setting names a model this server does not know', async () => {
++		vi.stubEnv('IMAGE_MODELS_CLOTHES', 'azure/not-a-model');
++		await expect(startCoat()).rejects.toMatchObject({ code: 'IMAGE_MODELS_SETTING_INVALID' });
++		expect(billing.admit).not.toHaveBeenCalled();
++		vi.unstubAllEnvs();
++	});
++
+ 	it('does not try again after a safety refusal', async () => {
+ 		const { pollRaceOutfitStep } = await import('./raceOutfitSteps');
+ 		const { GptImageError } = await import('$lib/server/imageProviders/gptImageClient');
+diff --git a/src/lib/server/clothesGeneration/raceOutfitSteps.ts b/src/lib/server/clothesGeneration/raceOutfitSteps.ts
+index 12d9a4a..ebdb185 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitSteps.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitSteps.ts
+@@ -46,13 +46,11 @@ import { PASTED_FACE_HEAD_LIMITS } from './faceGeometry';
+ import { editIdentityOnHuggingFace, identityEditUsageFacts } from './huggingfaceIdentityEdit';
+ import {
+ 	editStudioClothesImage,
+-	FIRST_STUDIO_CLOTHES_TRY,
+ 	measureOriginalFace,
+ 	nextStudioClothesTry,
+ 	notLinedUpPicture,
+ 	refusedPaidPicture,
+ 	SAME_REQUEST_HOP_MS,
+-	STUDIO_CLOTHES_KREA_MODEL_ID,
+ 	STUDIO_CLOTHES_MAX_TRIES,
+ 	studioClothesEditAttribution,
+ 	studioClothesNextMessage,
+@@ -61,6 +59,7 @@ import {
+ 	type StudioClothesTry
+ } from '$lib/server/imageProviders/studioClothesImageEdit';
+ import { hasTransparentAlpha } from '$lib/server/imageProviders/gptImageFollowUp';
++import { clothesImageModels, STUDIO_CLOTHES_KREA_MODEL_ID } from '$lib/server/imageProviders/imageModelChoice';
+ import { requireKreaRoom } from '$lib/server/imageProviders/kreaGuardrail';
+ import { studioClothesStatusMessage } from './lifecycle';
+ import {
+@@ -272,10 +271,19 @@ async function finishedJob(jobId: string): Promise<OrchestratorJobPollResponse>
+ 	return polled.job;
+ }
+ 
++/**
++ * The image models a Studio step runs on, in order: the list its ticket was issued with. A ticket issued before the
++ * list was kept uses this server's list (`clothesImageModels` logs which).
++ */
++function stepImageModels(t: Pick<RaceOutfitTicket, 'imageModels'>): readonly string[] {
++	return t.imageModels ?? clothesImageModels();
++}
++
+ /** `modelId`: the Studio model of this try, when it is not the first one. */
+ function attribution(t: BillingFor, modelId?: string | null): AccountingAttribution {
+ 	if (t.provider === 'studio') {
+ 		return studioClothesEditAttribution({
++			firstModelId: stepImageModels(t)[0],
+ 			organizationId: t.organizationId,
+ 			projectId: t.projectId,
+ 			invocationId: t.invocationId,
+@@ -307,7 +315,7 @@ function attribution(t: BillingFor, modelId?: string | null): AccountingAttribut
+ type BillingAttempt = NonNullable<RaceOutfitTicket['accounting']>;
+ type BillingFor = Pick<
+ 	RaceOutfitTicket,
+-	'organizationId' | 'projectId' | 'invocationId' | 'actorUserId' | 'step' | 'set' | 'provider'
++	'organizationId' | 'projectId' | 'invocationId' | 'actorUserId' | 'step' | 'set' | 'provider' | 'imageModels'
+ >;
+ 
+ async function closeBilling(
+@@ -478,7 +486,7 @@ async function editRaceOutfitPlate(
+ 			// The Studio pastes each avatar's own face over these plates: only the head's place and size are checked.
+ 			headLimits: PASTED_FACE_HEAD_LIMITS,
+ 			...(lineUpWith ? { lineUpWith } : {}),
+-			...(attempt.modelId ? { modelId: attempt.modelId } : {}),
++			modelId: attempt.modelId ?? stepImageModels(ticket)[0],
+ 			...(attempt.original ? { original: attempt.original } : {}),
+ 			// Only the Krea 2 backup uses these. The seed moves on with each try: a repeated seed draws the same
+ 			// picture again (9 Nov test: tries 2 and 3 came back byte for byte the same). For the African step,
+@@ -561,7 +569,7 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 				step: ticket.step,
+ 				model:
+ 					ticket.provider === 'studio'
+-						? (attempt.modelId ?? FIRST_STUDIO_CLOTHES_TRY.modelId)
++						? (attempt.modelId ?? stepImageModels(ticket)[0])
+ 						: STUDIO_CLOTHES_KREA_MODEL_ID,
+ 				tryNo: attempt.tryNo,
+ 				hops: attempt.hops ?? 0
+@@ -589,10 +597,11 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ 			}
+ 			// A picture a check refused was still paid for: book the provider's answer, not nothing.
+ 			const usage = paid?.usage ?? { outcome: 'failed', errorCode: code, errorMessage: message, usageJson: { images: 0 } };
+-			const failed: StudioClothesTry = { ...attempt, modelId: attempt.modelId ?? FIRST_STUDIO_CLOTHES_TRY.modelId };
++			const models = ticket.provider === 'studio' ? stepImageModels(ticket) : [STUDIO_CLOTHES_KREA_MODEL_ID];
++			const failed: StudioClothesTry = { ...attempt, modelId: attempt.modelId ?? models[0]! };
+ 			const lineUpTries = await withLineUpTry(ticket, attempt, error);
+ 			const decision: StudioClothesNext =
+-				ticket.provider === 'studio' ? nextStudioClothesTry(failed, error) : { kind: 'stop' };
++				ticket.provider === 'studio' ? nextStudioClothesTry(failed, error, Date.now(), models) : { kind: 'stop' };
+ 			if (decision.kind !== 'stop') {
+ 				// Billing first: the next attempt can be opened as soon as the edit is handed on.
+ 				await closeBilling(prisma, ticket, billing, usage, attempt.modelId);
+@@ -657,7 +666,7 @@ async function settleHuggingFacePoll(prisma: PrismaClient, ticket: RaceOutfitTic
+ function logLineUp(ticket: RaceOutfitTicket, attempt: RaceOutfitTry, lineUp: PlateLineUp): void {
+ 	console.info('clothes.lineup', {
+ 		invocationId: ticket.invocationId,
+-		model: attempt.modelId ?? FIRST_STUDIO_CLOTHES_TRY.modelId,
++		model: attempt.modelId ?? stepImageModels(ticket)[0],
+ 		tryNo: attempt.tryNo,
+ 		...lineUp
+ 	});
+@@ -715,6 +724,10 @@ async function startStoredPlate(
+ 		sceneInvocationId = first.invocationId;
+ 		seed = input.retry ? randomClothesI2iSeed() : pair.firstSeed;
+ 	}
++	// A Studio step keeps the list it starts with. A wrong setting stops it here, before billing opens.
++	const imageModels = provider === 'studio' ? clothesImageModels() : undefined;
++	// Krea 2 as the first model: its room is checked before the first try is billed, as before every later Krea try.
++	if (imageModels?.[0] === STUDIO_CLOTHES_KREA_MODEL_ID) await requireKreaRoom(prisma);
+ 	const who: BillingFor = {
+ 		organizationId: input.organizationId,
+ 		projectId: input.projectId,
+@@ -722,7 +735,8 @@ async function startStoredPlate(
+ 		invocationId: newInvocationId(),
+ 		step: input.step,
+ 		set: input.set,
+-		provider
++		provider,
++		...(imageModels ? { imageModels } : {})
+ 	};
+ 	const store = new PrismaAccountingStore(prisma);
+ 	try {
+diff --git a/src/lib/server/clothesGeneration/raceOutfitTicket.ts b/src/lib/server/clothesGeneration/raceOutfitTicket.ts
+index 1fda4b7..917ec68 100644
+--- a/src/lib/server/clothesGeneration/raceOutfitTicket.ts
++++ b/src/lib/server/clothesGeneration/raceOutfitTicket.ts
+@@ -27,6 +27,11 @@ export type RaceOutfitTicket = {
+ 	readonly sceneInvocationId?: string;
+ 	/** African Hugging Face step: fidelity of the first picture. */
+ 	readonly refBoostA?: number;
++	/**
++	 * A Studio step: the image models it started with, in order (`clothesImageModels`). Absent on a ticket issued
++	 * before the list was kept; that step uses the list of the server that runs it.
++	 */
++	readonly imageModels?: readonly string[];
+ 	readonly step: RaceOutfitStep;
+ 	/** Prompt recipe from the seed avatar's gender tag. Not a property of the set. */
+ 	readonly set: RaceOutfitSet;
+@@ -112,6 +117,12 @@ export function readRaceOutfitTicket(
+ 			: typeof t.refBoostA === 'number' && Number.isFinite(t.refBoostA) && t.refBoostA >= 0 && t.refBoostA <= 16
+ 				? t.refBoostA
+ 				: null;
++	const imageModels =
++		t.imageModels === undefined
++			? undefined
++			: Array.isArray(t.imageModels) && t.imageModels.length > 0 && t.imageModels.every((id) => isText(id))
++				? (t.imageModels as string[])
++				: null;
+ 	if (
+ 		t.v !== 1 ||
+ 		!isText(t.projectId) ||
+@@ -129,6 +140,7 @@ export function readRaceOutfitTicket(
+ 		instruction === null ||
+ 		sceneInvocationId === null ||
+ 		refBoostA === null ||
++		imageModels === null ||
+ 		((provider === 'huggingface' || provider === 'studio') && !instruction) ||
+ 		((provider === 'huggingface' || provider === 'studio') && t.step === 'african' && !sceneInvocationId)
+ 	) {
+@@ -151,6 +163,7 @@ export function readRaceOutfitTicket(
+ 		...(provider ? { provider } : {}),
+ 		...(instruction ? { instruction } : {}),
+ 		...(sceneInvocationId ? { sceneInvocationId } : {}),
+-		...(refBoostA !== undefined ? { refBoostA } : {})
++		...(refBoostA !== undefined ? { refBoostA } : {}),
++		...(imageModels ? { imageModels } : {})
+ 	};
+ }
+diff --git a/src/lib/server/imageProviders/imageModelChoice.test.ts b/src/lib/server/imageProviders/imageModelChoice.test.ts
+new file mode 100644
+index 0000000..cd05816
+--- /dev/null
++++ b/src/lib/server/imageProviders/imageModelChoice.test.ts
+@@ -0,0 +1,59 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++import { CLOTHES_MODELS_SETTING, clothesImageModels, DEFAULT_CLOTHES_MODELS } from './imageModelChoice';
++
++const AZURE = 'azure/gpt-image-2.5-sunburst/low/image-to-image';
++const OPENROUTER = 'openrouter/gpt-image-2.5-sunburst/low/image-to-image';
++const KREA = 'huggingface/charlesatliforma/krea2-identity-edit';
++
++describe('the clothes image models setting', () => {
++	beforeEach(() => {
++		vi.spyOn(console, 'info').mockImplementation(() => {});
++		vi.spyOn(console, 'error').mockImplementation(() => {});
++	});
++	afterEach(() => vi.restoreAllMocks());
++
++	it('is the list the code had when the setting is not set: the four GPT Image models, then Krea 2', () => {
++		expect(clothesImageModels({})).toEqual([
++			AZURE,
++			OPENROUTER,
++			'openrouter/gpt-image-2.5-flare/low/image-to-image',
++			'openai/gpt-image-2.5-sunburst/low/image-to-image',
++			KREA
++		]);
++		expect(clothesImageModels({ [CLOTHES_MODELS_SETTING]: '  ' })).toBe(DEFAULT_CLOTHES_MODELS);
++	});
++
++	it('reads the models in the order the setting lists them, and says once which list is in use', () => {
++		const env = { [CLOTHES_MODELS_SETTING]: ` ${OPENROUTER}, ${AZURE} ,${KREA}` };
++		expect(clothesImageModels(env)).toEqual([OPENROUTER, AZURE, KREA]);
++		expect(clothesImageModels(env)).toEqual([OPENROUTER, AZURE, KREA]);
++		expect(clothesImageModels({ [CLOTHES_MODELS_SETTING]: KREA })).toEqual([KREA]);
++		expect(vi.mocked(console.info).mock.calls.filter(([, said]) => said.models[0] === OPENROUTER)).toEqual([
++			['image models', { job: 'clothes', setting: 'IMAGE_MODELS_CLOTHES', from: 'setting', models: [OPENROUTER, AZURE, KREA] }]
++		]);
++	});
++
++	it.each([
++		['azure/gpt-image-9/low/image-to-image', '"azure/gpt-image-9/low/image-to-image" is not an image model this server knows'],
++		[
++			'azure/gpt-image-2.5-sunburst/low/text-to-image',
++			'"azure/gpt-image-2.5-sunburst/low/text-to-image" makes pictures from words only, and clothes need a model that edits a picture'
++		],
++		[`${AZURE},${AZURE}`, `"${AZURE}" is listed twice`],
++		[`${KREA},${AZURE}`, `Krea 2 ("${KREA}") can only be the last model in the list`],
++		[' , ', 'it lists no model']
++	])('stops the job and names what is wrong in %s', (value, why) => {
++		expect(() => clothesImageModels({ [CLOTHES_MODELS_SETTING]: value })).toThrow(
++			expect.objectContaining({
++				status: 503,
++				code: 'IMAGE_MODELS_SETTING_INVALID',
++				message: `New pictures cannot be made: the IMAGE_MODELS_CLOTHES setting is wrong (${why}).`
++			})
++		);
++		expect(console.error).toHaveBeenCalledWith(
++			'image models setting is wrong',
++			expect.objectContaining({ setting: 'IMAGE_MODELS_CLOTHES', value: value.trim(), why })
++		);
++	});
++});
+diff --git a/src/lib/server/imageProviders/imageModelChoice.ts b/src/lib/server/imageProviders/imageModelChoice.ts
+new file mode 100644
+index 0000000..6232a21
+--- /dev/null
++++ b/src/lib/server/imageProviders/imageModelChoice.ts
+@@ -0,0 +1,71 @@
++/**
++ * Which image models a picture job uses, and in what order: one setting per job type, so the models change without a
++ * code change (on Vercel: change the value, then Redeploy). The first model is the first choice and the rest are its
++ * backups, in order. With no setting the lists are the ones the code had before.
++ *
++ * Each job keeps the list it started with (a costume row, a race outfit ticket), so a changed setting only reaches
++ * new jobs. A wrong setting stops a job from starting and says which id is wrong; the default is never used in its
++ * place without saying so. `clothesImageModels` is the one place a clothes job gets its list, so Model Manager can
++ * supply it later.
++ */
++import { AuthoringError } from '../authoring/authoringHttp';
++import { getGptImage25Model, STUDIO_CLOTHES_I2I_MODELS } from './gptImageRegistry';
++import { HUGGINGFACE_IDENTITY_EDIT_MODEL_ID, HUGGINGFACE_PROVIDER_ID } from './registry';
++
++/** Krea 2 identity edit on Charles's Hugging Face Space: the last backup, and the one model that is not GPT Image. */
++export const STUDIO_CLOTHES_KREA_MODEL_ID = `${HUGGINGFACE_PROVIDER_ID}/${HUGGINGFACE_IDENTITY_EDIT_MODEL_ID}`;
++
++/** Studio clothes and costumes, and avatar-set race outfits: a comma-separated list of model ids. */
++export const CLOTHES_MODELS_SETTING = 'IMAGE_MODELS_CLOTHES';
++
++/** The clothes list when the setting is not set: the GPT Image models in their order, then Krea 2. */
++export const DEFAULT_CLOTHES_MODELS: readonly string[] = [
++	...STUDIO_CLOTHES_I2I_MODELS.map((model) => model.id),
++	STUDIO_CLOTHES_KREA_MODEL_ID
++];
++
++const logged = new Set<string>();
++
++/** The clothes models for a job that is starting now. Throws, and logs why, when the setting is wrong. */
++export function clothesImageModels(env: Record<string, string | undefined> = process.env): readonly string[] {
++	const raw = env[CLOTHES_MODELS_SETTING]?.trim();
++	const models = raw
++		? raw
++				.split(',')
++				.map((id) => id.trim())
++				.filter(Boolean)
++		: DEFAULT_CLOTHES_MODELS;
++	const problem = raw ? clothesModelsProblem(models) : null;
++	if (problem) {
++		console.error('image models setting is wrong', { setting: CLOTHES_MODELS_SETTING, value: raw, ...problem });
++		throw new AuthoringError(
++			503,
++			'IMAGE_MODELS_SETTING_INVALID',
++			`New pictures cannot be made: the ${CLOTHES_MODELS_SETTING} setting is wrong (${problem.why}).`
++		);
++	}
++	const key = models.join(',');
++	if (!logged.has(key)) {
++		logged.add(key);
++		console.info('image models', { job: 'clothes', setting: CLOTHES_MODELS_SETTING, from: raw ? 'setting' : 'default', models });
++	}
++	return models;
++}
++
++function clothesModelsProblem(models: readonly string[]): { readonly id?: string; readonly why: string } | null {
++	if (models.length === 0) return { why: 'it lists no model' };
++	for (const [at, id] of models.entries()) {
++		if (models.indexOf(id) !== at) return { id, why: `"${id}" is listed twice` };
++		if (id === STUDIO_CLOTHES_KREA_MODEL_ID) {
++			// The try rule uses Krea 2 once the GPT Image models are busy or down, so it has no place before them.
++			if (at !== models.length - 1) return { id, why: `Krea 2 ("${id}") can only be the last model in the list` };
++			continue;
++		}
++		const model = getGptImage25Model(id);
++		if (!model) return { id, why: `"${id}" is not an image model this server knows` };
++		if (model.modality !== 'image-to-image') {
++			return { id, why: `"${id}" makes pictures from words only, and clothes need a model that edits a picture` };
++		}
++	}
++	return null;
++}
+diff --git a/src/lib/server/imageProviders/studioClothesImageEdit.test.ts b/src/lib/server/imageProviders/studioClothesImageEdit.test.ts
+index 37ecb2d..db6ece2 100644
+--- a/src/lib/server/imageProviders/studioClothesImageEdit.test.ts
++++ b/src/lib/server/imageProviders/studioClothesImageEdit.test.ts
+@@ -700,6 +700,69 @@ describe('next try of a studio clothes edit', () => {
+ 		});
+ 	});
+ 
++	it('follows the list the job started with: OpenRouter first, and a list with fewer models', () => {
++		const models = [OPENROUTER, AZURE, KREA];
++		const after = (failed: StudioClothesTry, kind: GptImageFailureKind) =>
++			nextStudioClothesTry(failed, new GptImageError(kind, kind, { status: 502, code: 'IMAGE_EDIT_FAILED' }), 1_000, models);
++		// OpenRouter down: Azure is its backup, in the same request
++		expect(after({ tryNo: 1, modelId: OPENROUTER }, 'server')).toMatchObject({
++			kind: 'hop',
++			next: { tryNo: 1, modelId: AZURE, down: [OPENROUTER] }
++		});
++		// both GPT Image models down: Krea 2 at once
++		expect(after({ tryNo: 1, modelId: AZURE, down: [OPENROUTER] }, 'network')).toMatchObject({
++			kind: 'hop',
++			next: { modelId: KREA, down: [OPENROUTER, AZURE] }
++		});
++		// both only busy: the 3 s wait, then Krea 2
++		expect(after({ tryNo: 1, modelId: AZURE, busy: [OPENROUTER] }, 'busy')).toMatchObject({
++			kind: 'wait',
++			next: { modelId: KREA, notBeforeMs: 4_000 }
++		});
++		// Flare and OpenAI are not in this list, so they are never used
++		expect(after({ tryNo: 1, modelId: AZURE }, 'busy')).toMatchObject({ kind: 'hop', next: { modelId: OPENROUTER } });
++	});
++
++	it('stops where the rule says Krea 2 and the list has none, and when Krea 2 is the only model', () => {
++		const failure = (kind: GptImageFailureKind) => new GptImageError(kind, kind, { status: 502, code: 'IMAGE_EDIT_FAILED' });
++		const gptOnly = [AZURE, OPENROUTER];
++		expect(nextStudioClothesTry({ tryNo: 1, modelId: AZURE }, failure('busy'), 0, gptOnly)).toMatchObject({
++			kind: 'hop',
++			next: { modelId: OPENROUTER }
++		});
++		expect(nextStudioClothesTry({ tryNo: 1, modelId: OPENROUTER, busy: [AZURE] }, failure('busy'), 0, gptOnly)).toEqual({
++			kind: 'stop'
++		});
++		expect(nextStudioClothesTry({ tryNo: 1, modelId: OPENROUTER, down: [AZURE] }, failure('server'), 0, gptOnly)).toEqual({
++			kind: 'stop'
++		});
++		expect(nextStudioClothesTry({ tryNo: 1, modelId: KREA }, failure('server'), 0, [KREA])).toEqual({ kind: 'stop' });
++		// a refused Krea picture is still drawn again by Krea
++		const refused = Object.assign(new AuthoringError(502, 'IMAGE_EDIT_BAD_CUTOUT', 'zoomed out'), {
++			paidPicture: { png: Buffer.alloc(1), usage: { outcome: 'completed' } }
++		});
++		expect(nextStudioClothesTry({ tryNo: 1, modelId: KREA }, refused, 0, [KREA])).toMatchObject({
++			kind: 'try',
++			next: { tryNo: 2, modelId: KREA }
++		});
++	});
++
++	it("bills the job's own first model on the plain id, and every other model as its own operation", () => {
++		const who = { organizationId: 'org_1', projectId: 'proj_1', invocationId: 'inv_1', actorLiformaUserId: null, resourceId: 'inv_1', callSite: 'studio.race_outfit.generate' };
++		expect(studioClothesEditAttribution({ ...who, firstModelId: OPENROUTER })).toMatchObject({
++			invocationId: 'inv_1',
++			provider: 'openrouter'
++		});
++		expect(studioClothesEditAttribution({ ...who, firstModelId: OPENROUTER, modelId: AZURE })).toMatchObject({
++			invocationId: 'inv_1-azure-sunburst',
++			provider: 'azure'
++		});
++		expect(studioClothesEditAttribution({ ...who, firstModelId: KREA })).toMatchObject({
++			invocationId: 'inv_1',
++			provider: 'huggingface'
++		});
++	});
++
+ 	it('tells the Studio what is happening', () => {
+ 		expect(studioClothesNextMessage({ kind: 'hop', reason: 'model_failed', next: { tryNo: 1, modelId: OPENROUTER } })).toBe(
+ 			'Trying another image model'
+diff --git a/src/lib/server/imageProviders/studioClothesImageEdit.ts b/src/lib/server/imageProviders/studioClothesImageEdit.ts
+index de09556..a01b132 100644
+--- a/src/lib/server/imageProviders/studioClothesImageEdit.ts
++++ b/src/lib/server/imageProviders/studioClothesImageEdit.ts
+@@ -1,6 +1,7 @@
+ /**
+  * The one image edit for Studio clothes, costumes, and avatar-set outfit plates.
+- * The first try uses `STUDIO_CLOTHES_I2I_MODEL`; `nextStudioClothesTry` picks the model after each failed attempt.
++ * A job's models come from `clothesImageModels` (imageModelChoice.ts) when it starts. The first try uses the first of
++ * them; `nextStudioClothesTry` picks the model after each failed attempt.
+  */
+ 
+ import sharp from 'sharp';
+@@ -31,12 +32,8 @@ import {
+ 	startVisionWarmup,
+ 	visionWarmupEnabled
+ } from './gptImageFollowUp';
+-import {
+-	requireGptImage25Model,
+-	STUDIO_CLOTHES_I2I_MODEL,
+-	STUDIO_CLOTHES_I2I_MODELS,
+-	type GptImage25Model
+-} from './gptImageRegistry';
++import { requireGptImage25Model, type GptImage25Model } from './gptImageRegistry';
++import { DEFAULT_CLOTHES_MODELS, STUDIO_CLOTHES_KREA_MODEL_ID } from './imageModelChoice';
+ import { kreaHasNoRoom } from './kreaGuardrail';
+ import { HUGGINGFACE_IDENTITY_EDIT_MODEL_ID, HUGGINGFACE_PROVIDER_ID, IDENTITY_EDIT_PUBLIC_MODEL_ID } from './registry';
+ 
+@@ -69,12 +66,6 @@ type EditDeps = {
+ 	readonly kreaConnect?: NonNullable<Parameters<typeof editIdentityOnHuggingFace>[1]>['connect'];
+ };
+ 
+-/** Krea 2 identity edit on Charles's Hugging Face Space: the last backup, and the one model that is not GPT Image. */
+-export const STUDIO_CLOTHES_KREA_MODEL_ID = `${HUGGINGFACE_PROVIDER_ID}/${HUGGINGFACE_IDENTITY_EDIT_MODEL_ID}`;
+-
+-/** The GPT Image models, in the order a job moves through them. Krea 2 comes after all of them. */
+-const GPT_MODEL_IDS: readonly string[] = STUDIO_CLOTHES_I2I_MODELS.map((model) => model.id);
+-
+ /** The longest wait for the Krea 2 Space, as for GPT Image (it holds a GPU 45 s for one picture, 120 s for two). */
+ const KREA_TIMEOUT_MS = 150_000;
+ 
+@@ -130,7 +121,10 @@ export type StudioClothesTry = {
+ 	readonly original?: FaceGeometryMetrics;
+ };
+ 
+-export const FIRST_STUDIO_CLOTHES_TRY: StudioClothesTry = { tryNo: 1, modelId: STUDIO_CLOTHES_I2I_MODEL.id };
++/** The first try of a job with these models (`clothesImageModels`). */
++export function firstStudioClothesTry(models: readonly string[] = DEFAULT_CLOTHES_MODELS): StudioClothesTry {
++	return { tryNo: 1, modelId: models[0]! };
++}
+ 
+ /**
+  * What a job does after a failed attempt:
+@@ -155,11 +149,12 @@ const DOWN_FAILURES: ReadonlySet<string> = new Set(['server', 'timeout', 'networ
+ const STOP: StudioClothesNext = { kind: 'stop' };
+ 
+ /**
+- * What a job does after a failed attempt (`StudioClothesNext`):
++ * What a job does after a failed attempt (`StudioClothesNext`). `models` is the job's own list, in order: its GPT Image
++ * models, then Krea 2 when it is listed.
+  *
+  * - The model was busy, failed or could not be reached, so nothing was drawn: a hop to the next GPT Image model in the
+- *   list (Azure Sunburst, OpenRouter Sunburst, OpenRouter Flare, OpenAI Sunburst) that has neither failed for real in
+- *   this job nor said busy on this try. A model whose key is not set counts as failed for real.
++ *   list (by default Azure Sunburst, OpenRouter Sunburst, OpenRouter Flare, OpenAI Sunburst) that has neither failed
++ *   for real in this job nor said busy on this try. A model whose key is not set counts as failed for real.
+  * - Every GPT Image model left said busy: one 3 s wait, then Krea 2 (the user's 10 Nov choice).
+  * - Krea 2 is full too (4 at once or 20 a day): back round the GPT Image models still working, the same way, for up
+  *   to KREA_FULL_LIMIT_MS from when Krea was first found full; then it stops (the user's 10 Nov choice).
+@@ -171,15 +166,22 @@ const STOP: StudioClothesNext = { kind: 'stop' };
+  * - A check refused the picture the model drew (zoomed, head moved, cut-out, size, no face, not lined up): the same
+  *   model again, as a new try.
+  * - Anything else (a safety refusal, a rejected request, our own face service or settings) would fail the same way.
++ * - Where the rule says Krea 2 and the list has no Krea 2, the job stops.
+  */
+-export function nextStudioClothesTry(failed: StudioClothesTry, error: unknown, nowMs = Date.now()): StudioClothesNext {
++export function nextStudioClothesTry(
++	failed: StudioClothesTry,
++	error: unknown,
++	nowMs = Date.now(),
++	models: readonly string[] = DEFAULT_CLOTHES_MODELS
++): StudioClothesNext {
++	const krea = models.includes(STUDIO_CLOTHES_KREA_MODEL_ID) ? STUDIO_CLOTHES_KREA_MODEL_ID : null;
+ 	const down = failed.down ?? [];
+ 	// Kept for the rest of the job; the busy records start again on each try.
+ 	const kept = { hops: failed.hops ?? 0, ...(failed.original ? { original: failed.original } : {}) };
+ 	if (kreaHasNoRoom(error)) {
+ 		const busySinceMs = failed.busySinceMs ?? nowMs;
+-		const modelId = modelAfter(failed.modelId, down);
+-		if (modelId === STUDIO_CLOTHES_KREA_MODEL_ID || nowMs - busySinceMs >= KREA_FULL_LIMIT_MS) return STOP;
++		const modelId = modelAfter(failed.modelId, down, models);
++		if (!modelId || modelId === krea || nowMs - busySinceMs >= KREA_FULL_LIMIT_MS) return STOP;
+ 		return {
+ 			kind: 'hop',
+ 			reason: 'model_failed',
+@@ -195,16 +197,18 @@ export function nextStudioClothesTry(failed: StudioClothesTry, error: unknown, n
+ 			// with one left (three timeouts end on Krea); after refused pictures the job stops, as before.
+ 			const lastTry = failed.tryNo >= STUDIO_CLOTHES_MAX_TRIES;
+ 			if (lastTry && nowDown.length < STUDIO_CLOTHES_MAX_TRIES) return STOP;
+-			const modelId = lastTry ? STUDIO_CLOTHES_KREA_MODEL_ID : modelAfter(failed.modelId, nowDown);
++			const modelId = lastTry ? krea : modelAfter(failed.modelId, nowDown, models);
++			if (!modelId) return STOP;
+ 			return { kind: 'try', reason: 'model_failed', next: { ...kept, tryNo: failed.tryNo + 1, modelId, down: nowDown } };
+ 		}
+ 		const busyBefore = failed.busy ?? [];
+ 		const busy =
+ 			error.kind === 'busy' && !busyBefore.includes(failed.modelId) ? [...busyBefore, failed.modelId] : busyBefore;
+-		const modelId = modelAfter(failed.modelId, [...nowDown, ...busy]);
++		const modelId = modelAfter(failed.modelId, [...nowDown, ...busy], models);
++		if (!modelId) return STOP;
+ 		const since = failed.busySinceMs === undefined ? {} : { busySinceMs: failed.busySinceMs };
+ 		const hop = { ...kept, ...since, tryNo: failed.tryNo, modelId, down: nowDown, hops: kept.hops + 1, busy };
+-		if (modelId === STUDIO_CLOTHES_KREA_MODEL_ID && GPT_MODEL_IDS.some((id) => !nowDown.includes(id))) {
++		if (modelId === krea && models.some((id) => id !== krea && !nowDown.includes(id))) {
+ 			return { kind: 'wait', reason: 'model_failed', next: { ...hop, notBeforeMs: nowMs + KREA_WAIT_MS } };
+ 		}
+ 		return { kind: 'hop', reason: 'model_failed', next: hop };
+@@ -274,14 +278,18 @@ function faceMetricsFrom(value: unknown): FaceGeometryMetrics | undefined {
+ 	};
+ }
+ 
+-/** The next GPT Image model after this one that is not ruled out; Krea 2 when none is left. */
+-function modelAfter(modelId: string, ruledOut: readonly string[]): string {
+-	const at = GPT_MODEL_IDS.indexOf(modelId);
+-	for (let step = 1; step <= GPT_MODEL_IDS.length; step += 1) {
+-		const candidate = GPT_MODEL_IDS[(at + step) % GPT_MODEL_IDS.length]!;
++/**
++ * The next GPT Image model of the job's list after this one that is not ruled out; Krea 2 when none is left and the
++ * list has it; else null.
++ */
++function modelAfter(modelId: string, ruledOut: readonly string[], models: readonly string[]): string | null {
++	const gptIds = models.filter((id) => id !== STUDIO_CLOTHES_KREA_MODEL_ID);
++	const at = gptIds.indexOf(modelId);
++	for (let step = 1; step <= gptIds.length; step += 1) {
++		const candidate = gptIds[(at + step) % gptIds.length]!;
+ 		if (!ruledOut.includes(candidate)) return candidate;
+ 	}
+-	return STUDIO_CLOTHES_KREA_MODEL_ID;
++	return gptIds.length < models.length ? STUDIO_CLOTHES_KREA_MODEL_ID : null;
+ }
+ 
+ export function studioClothesEditUsage(result: GptImageResult, model: GptImage25Model): ProviderUsageFacts {
+@@ -317,13 +325,16 @@ export function studioClothesEditAttribution(input: {
+ 	readonly callSite: string;
+ 	/** The model of this try. A billing operation names one provider, so a backup model is billed as its own one. */
+ 	readonly modelId?: string;
++	/** The first model of the job's list: its tries are billed on the plain invocation id. */
++	readonly firstModelId?: string;
+ }): AccountingAttribution {
+-	const modelId = input.modelId ?? STUDIO_CLOTHES_I2I_MODEL.id;
++	const firstModelId = input.firstModelId ?? DEFAULT_CLOTHES_MODELS[0]!;
++	const modelId = input.modelId ?? firstModelId;
+ 	const billed = billedModel(modelId);
+ 	return {
+ 		organizationId: input.organizationId,
+ 		projectId: input.projectId,
+-		invocationId: modelId === STUDIO_CLOTHES_I2I_MODEL.id ? input.invocationId : `${input.invocationId}-${billed.suffix}`,
++		invocationId: modelId === firstModelId ? input.invocationId : `${input.invocationId}-${billed.suffix}`,
+ 		actorLiformaUserId: input.actorLiformaUserId,
+ 		resourceKind: 'clothes_generation',
+ 		resourceId: input.resourceId,
+@@ -357,7 +368,7 @@ export async function editStudioClothesImage(
+ 	},
+ 	deps: EditDeps = {}
+ ): Promise<StudioClothesImageEdit> {
+-	const modelId = input.modelId ?? STUDIO_CLOTHES_I2I_MODEL.id;
++	const modelId = input.modelId ?? DEFAULT_CLOTHES_MODELS[0]!;
+ 	const model = modelId === STUDIO_CLOTHES_KREA_MODEL_ID ? null : requireGptImage25Model(modelId);
+ 	const source = input.images[0];
+ 	if (!source) throw new AuthoringError(400, 'INVALID_BODY', 'Image edit requires a source image.');
+-- 
+2.50.1 (Apple Git-155)
+

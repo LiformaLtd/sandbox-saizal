@@ -1,0 +1,256 @@
+From 30cf355d50d17ae6b3a5e7c17e7d91ba0b6f438a Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:44:41 +0100
+Subject: [PATCH 3/6] Change Hair dialog: a colour change re-colours each tile
+ once, without reloading the outfit.
+
+Choosing a colour gave every tile a new hair id (wavy-lob-black -> wavy-lob-copper), and the tiles were keyed on that id: all
+of them were thrown away and built again, the outfit picture included. A plate style's tile then had no hair while its new
+colour was made, and the contact-shadow drawing showed nothing while it worked.
+
+- hairTiles gives each tile a key that is the same in every colour (style:<group>); the picker keeps tiles by it, and
+  remembers the tiles already seen by it, so a re-coloured tile is made straight away.
+- While a tile's new colour is being made it keeps its last picture.
+- HairContactShadow keeps the picture it showed until the next one is made and decoded (all tiles that draw it).
+
+Checked in the local Studio: on Chestnut -> Copper all 39 tiles stay, and each tile on screen changes once, never empty.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/components/HairContactShadow.svelte   | 54 ++++++++++++++-----
+ .../fields/AppearanceIdPicker.svelte          | 14 ++---
+ .../components/fields/HairStylePicker.svelte  | 20 ++++---
+ .../src/lib/hairStyles.test.ts                | 11 ++++
+ .../experience-studio/src/lib/hairStyles.ts   | 11 +++-
+ 5 files changed, 83 insertions(+), 27 deletions(-)
+
+diff --git a/packages/experience-studio/src/components/HairContactShadow.svelte b/packages/experience-studio/src/components/HairContactShadow.svelte
+index 65b6560..fcabe6a 100644
+--- a/packages/experience-studio/src/components/HairContactShadow.svelte
++++ b/packages/experience-studio/src/components/HairContactShadow.svelte
+@@ -31,9 +31,50 @@
+ 		if (composited) return composited;
+ 		return (layer === 'hair' ? hairUrl : clothesUrl).trim();
+ 	}
++
++	/**
++	 * The finished picture this layer last showed. When the hair or outfit changes, it stays until the next one is made and
++	 * decoded, so a tile never empties in between (2026-10-22).
++	 */
++	let held = $state('');
++	const ready = $derived(
++		clothesUrl.trim() && hairUrl.trim() ? peekHairContactPlates(clothesUrl, hairUrl) : null
++	);
++	const src = $derived(ready ? shownSrc(ready) : held);
++	$effect(() => {
++		const clothes = clothesUrl.trim();
++		const hair = hairUrl.trim();
++		if (!clothes || !hair) {
++			held = '';
++			return;
++		}
++		if (ready) {
++			held = shownSrc(ready);
++			return;
++		}
++		let cancelled = false;
++		void hairContactPlates(clothes, hair).then(async (plates) => {
++			if (cancelled) return;
++			const next = shownSrc(plates);
++			await decodedImage(next);
++			if (!cancelled) held = next;
++		});
++		return () => {
++			cancelled = true;
++		};
++	});
++
++	/** Loads and decodes a picture off screen, so the image that takes it next draws it in the same frame. Never rejects. */
++	function decodedImage(url: string): Promise<void> {
++		const image = new Image();
++		const crossOrigin = plateImageCrossOrigin(url);
++		if (crossOrigin) image.crossOrigin = crossOrigin;
++		image.src = url;
++		return image.decode().catch(() => undefined);
++	}
+ </script>
+ 
+-{#snippet plate(src: string)}
++{#if src}
+ 	<img
+ 		{src}
+ 		crossorigin={plateImageCrossOrigin(src)}
+@@ -44,15 +85,4 @@
+ 		decoding="async"
+ 		{onerror}
+ 	/>
+-{/snippet}
+-
+-{#if clothesUrl.trim() && hairUrl.trim()}
+-	{@const ready = peekHairContactPlates(clothesUrl, hairUrl)}
+-	{#if ready}
+-		{@render plate(shownSrc(ready))}
+-	{:else}
+-		{#await hairContactPlates(clothesUrl, hairUrl) then plates}
+-			{@render plate(shownSrc(plates))}
+-		{/await}
+-	{/if}
+ {/if}
+diff --git a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+index 0014d4f..a256c11 100644
+--- a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
++++ b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+@@ -32,6 +32,8 @@
+ 		readonly name?: string;
+ 		readonly pending?: boolean;
+ 		readonly error?: boolean;
++		/** Keeps the tile across an id change (a hair style re-coloured is the same tile); defaults to the id. */
++		readonly key?: string;
+ 	};
+ 
+ 	type Props = {
+@@ -60,8 +62,8 @@
+ 		previewImageFor?: (optionId: string, tier: AvatarPreviewTier) => string | null;
+ 		/** Larger plate for the overlay in the full-screen view. */
+ 		previewOverlayFor?: (tier: AvatarPreviewTier) => string | null;
+-		/** Fired when a tile scrolls into view, so callers can defer image work. */
+-		onOptionVisible?: (id: string) => void;
++		/** Fired when a tile scrolls into view, so callers can defer image work (with the tile's key, else its id). */
++		onOptionVisible?: (key: string) => void;
+ 		onClothesSaved?: (clothesId: string, option: Option) => void;
+ 		onClothesApplied?: (clothesId: string, option: Option) => void;
+ 		onClose?: () => void;
+@@ -122,11 +124,11 @@
+ 		return null;
+ 	}
+ 
+-	function observeTile(node: HTMLElement, id: string) {
++	function observeTile(node: HTMLElement, key: string) {
+ 		if (!onOptionVisible) return;
+ 		const observer = new IntersectionObserver(
+ 			(entries) => {
+-				if (entries.some((entry) => entry.isIntersecting)) onOptionVisible(id);
++				if (entries.some((entry) => entry.isIntersecting)) onOptionVisible(key);
+ 			},
+ 			{ root: scrollBox(node), rootMargin: '240px' }
+ 		);
+@@ -442,7 +444,7 @@
+ 					{/snippet}
+ 				</LibraryGridCard>
+ 			{/if}
+-			{#each options as option (option.id)}
++			{#each options as option (option.key ?? option.id)}
+ 				{@const optionLabel = labelFor(option)}
+ 				{@const optionImage = tileWebp(gridImage(option.id, option.image ?? ''))}
+ 				{@const overlaySized = overlayActive ? tileWebp(overlayImage) : ''}
+@@ -481,7 +483,7 @@
+ 						Select
+ 					</button>
+ 				{/snippet}
+-				<div class="tile-watch" use:observeTile={option.id}>
++				<div class="tile-watch" use:observeTile={option.key ?? option.id}>
+ 				<LibraryGridCard
+ 					as="article"
+ 					label={optionLabel}
+diff --git a/packages/experience-studio/src/components/fields/HairStylePicker.svelte b/packages/experience-studio/src/components/fields/HairStylePicker.svelte
+index bca3ebd..ed315ba 100644
+--- a/packages/experience-studio/src/components/fields/HairStylePicker.svelte
++++ b/packages/experience-studio/src/components/fields/HairStylePicker.svelte
+@@ -86,10 +86,13 @@
+ 		madeOnSight
+ 	}: Props = $props();
+ 
+-	/** tiles that have come near the screen (AppearanceIdPicker onOptionVisible) */
++	/** tiles that have come near the screen (AppearanceIdPicker onOptionVisible), by tile key: a re-coloured tile stays seen */
+ 	const seen = new SvelteSet<string>();
+-	const imageOf = (id: string) =>
+-		madeOnSight?.(id) && !seen.has(id) ? '' : (hairImage?.(id) ?? hairOptionUrl(cdnBaseUrl, avatarId, id));
++	/** Each made tile's last picture. While the tile's new colour is being made it keeps this one, so changing the colour swaps
++	 * each tile once instead of emptying it first (2026-10-22). Not reactive: only remembered. */
++	const lastMade: Record<string, string> = {};
++	const imageOf = (id: string, key = id) =>
++		madeOnSight?.(id) && !seen.has(key) ? '' : (hairImage?.(id) ?? hairOptionUrl(cdnBaseUrl, avatarId, id));
+ 
+ 	const groups = $derived(groupHairStyles(hairIds.filter((id) => !isBaldHair(id))));
+ 	const palette = $derived(paletteColours(groups));
+@@ -104,9 +107,12 @@
+ 	const options = $derived.by(() => {
+ 		const tiles = hairTiles(groups, chosen, (style) => appearanceOptionLabel(style));
+ 		// a picture made in the browser that is not there yet (not near the screen, or being made) shows a picture-sized waiting card
+-		const out: { id: string; image: string; name?: string; pending?: boolean }[] = tiles.map((t) => {
+-			const image = imageOf(t.id);
+-			return { id: t.id, image, name: t.name, ...(!image && madeOnSight?.(t.id) ? { pending: true } : {}) };
++		const out: { id: string; key?: string; image: string; name?: string; pending?: boolean }[] = tiles.map((t) => {
++			const made = imageOf(t.id, t.key);
++			const kept = `${avatarId}|${t.key}`;
++			if (made) lastMade[kept] = made;
++			const image = made || (madeOnSight?.(t.id) ? (lastMade[kept] ?? '') : '');
++			return { id: t.id, key: t.key, image, name: t.name, ...(!image && madeOnSight?.(t.id) ? { pending: true } : {}) };
+ 		});
+ 		// hair worn that is not on offer (another ethnicity's fit, a hidden style) stays visible at the front
+ 		if (wornId && !isBaldHair(wornId) && !hairStyleGroupFor(groups, wornId)) {
+@@ -192,7 +198,7 @@
+ 			overlayFallbackImage={clothesShown ? overlayFallbackImage : ''}
+ 			{overlayPlacement}
+ 			previewOverlayFor={clothesShown ? previewOverlayFor : undefined}
+-			onOptionVisible={madeOnSight ? (id) => seen.add(id) : undefined}
++			onOptionVisible={madeOnSight ? (key) => seen.add(key) : undefined}
+ 			{onSelect}
+ 			{onClose}
+ 		/>
+diff --git a/packages/experience-studio/src/lib/hairStyles.test.ts b/packages/experience-studio/src/lib/hairStyles.test.ts
+index 1b4108d..5bfb6e9 100644
+--- a/packages/experience-studio/src/lib/hairStyles.test.ts
++++ b/packages/experience-studio/src/lib/hairStyles.test.ts
+@@ -38,6 +38,17 @@ describe('the hair picker with the palette at the side', () => {
+ 		]);
+ 		expect(hairTiles(g, 'copper', label)[0].name).toBe('bob brown.1');
+ 	});
++	it('keeps a style tile the same tile in every colour, and apart from the other styles', () => {
++		const g = groupHairStyles(EA);
++		const copper = hairTiles(g, 'copper', label).map((t) => t.key);
++		expect(hairTiles(g, 'chestnut', label).map((t) => t.key)).toEqual(copper);
++		expect(new Set(copper).size).toBe(copper.length);
++		expect(hairTiles(groupHairStyles(ADAM), 'honeyblonde', label).map((t) => t.key)).toEqual([
++			'cap_beige',
++			'cap_plaid',
++			'style:fringe'
++		]);
++	});
+ 	it('gives a style without the five (a cap) one tile per its own colour', () => {
+ 		const tiles = hairTiles(groupHairStyles(ADAM), 'honeyblonde', label);
+ 		expect(tiles.map((t) => t.id)).toEqual(['cap_beige', 'cap_plaid', 'fringe_honeyblonde']);
+diff --git a/packages/experience-studio/src/lib/hairStyles.ts b/packages/experience-studio/src/lib/hairStyles.ts
+index 79dad1b..f728c88 100644
+--- a/packages/experience-studio/src/lib/hairStyles.ts
++++ b/packages/experience-studio/src/lib/hairStyles.ts
+@@ -259,17 +259,24 @@ export type HairTile = {
+ 	/** the label under the tile: the style (its colour is in the palette); a cap names its own colour */
+ 	readonly name: string;
+ 	readonly group: HairStyleGroup;
++	/** the same for a style in every palette colour, so a re-coloured tile stays the same tile (2026-10-22) */
++	readonly key: string;
+ };
+ 
+ /** One tile per style in the chosen colour (grey and blue included, where the style comes in it), plus a tile for each blue-tipped
+  * look it keeps;
+  * a style without the five (a cap) gives one tile per own colour. */
+ export function hairTiles(groups: readonly HairStyleGroup[], colour: string, label: (style: string) => string): HairTile[] {
+-	const own = (group: HairStyleGroup, c: HairColourChoice) => ({ id: c.id, name: `${label(group.style)} (${c.label.toLowerCase()})`, group });
++	const own = (group: HairStyleGroup, c: HairColourChoice) => ({
++		id: c.id,
++		name: `${label(group.style)} (${c.label.toLowerCase()})`,
++		group,
++		key: c.id
++	});
+ 	return groups.flatMap((group) =>
+ 		hasHouseColours(group)
+ 			? [
+-					{ id: styleInColour(group, colour).id, name: label(group.style), group },
++					{ id: styleInColour(group, colour).id, name: label(group.style), group, key: `style:${group.key}` },
+ 					...group.choices.filter((c) => OWN_TILE.has(c.colour)).map((c) => own(group, c))
+ 				]
+ 			: group.choices.map((c) => own(group, c))
+-- 
+2.50.1 (Apple Git-155)
+

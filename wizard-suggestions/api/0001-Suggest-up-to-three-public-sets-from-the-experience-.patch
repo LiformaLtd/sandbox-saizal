@@ -1,0 +1,506 @@
+From 9d6fb6db5ef0ea76c61607be004d9c331c23e8e3 Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:08:45 +0000
+Subject: [PATCH 1/5] Suggest up to three public sets from the experience setup
+ step
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The setup AI call now also sees the public sets as short numbered lines
+("17: Boutique Hotel · Reception · Looking At Desk (modern)") and returns
+suggestedSetRefs: up to three numbers, best first, or none. The routes
+swap the numbers for the sets (id, name, pictures, backdrop, collection,
+venue, setting) and reply with suggestedSets; unknown or repeated numbers
+are dropped and logged. Still one AI call; the list adds about 6k input
+tokens (329 public sets locally, built in about 0.4 s).
+
+Public sets carry almost no use-case labels (1 of 329 locally), so the
+model picks from the set names, which name the place (venue · space · view).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../generateExperienceSetupDetails.test.ts    | 23 +++++
+ .../generateExperienceSetupDetails.ts         | 24 +++++-
+ ...jectSetupDetailsGenerationEndpoint.test.ts | 55 +++++++++++-
+ .../platform/setSuggestionChoices.test.ts     | 85 +++++++++++++++++++
+ .../server/platform/setSuggestionChoices.ts   | 82 ++++++++++++++++++
+ .../setup-details/generate/+server.ts         |  9 +-
+ .../setup-details/generate/+server.ts         |  9 +-
+ 7 files changed, 280 insertions(+), 7 deletions(-)
+ create mode 100644 src/lib/server/platform/setSuggestionChoices.test.ts
+ create mode 100644 src/lib/server/platform/setSuggestionChoices.ts
+
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.test.ts b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+index 54588d5..96ceb9b 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.test.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.test.ts
+@@ -45,6 +45,7 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 				'Maya is an experienced hotel receptionist who protects guest privacy.',
+ 			setName: 'Hotel front desk',
+ 			setDescription: 'A bright hotel reception desk with a daytime window.',
++			suggestedSetRefs: [],
+ 			startingMessage:
+ 				'I am afraid your reservation is not appearing in our system. May I see your confirmation?',
+ 			systemInstructions:
+@@ -72,6 +73,7 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 				'Elena values discretion and never makes claims she cannot support.',
+ 			setName: 'Quiet drawing room',
+ 			setDescription: 'A quiet drawing room in the evening, clear weather.',
++			suggestedSetRefs: [],
+ 			startingMessage: 'You were not expecting me, but I believe we need to talk.',
+ 			systemInstructions:
+ 				'Elena knows why she came but reveals it only in response to thoughtful questions.'
+@@ -159,6 +161,27 @@ describe('parseGeneratedExperienceSetupDetails', () => {
+ 		});
+ 	});
+ 
++	it('reads suggested set numbers even when the model sends them as text, keeping at most three', () => {
++		const base = {
++			title: 'Valid',
++			description: 'ok',
++			introduction: '',
++			characterName: 'Ada',
++			characterRole: 'Tutor',
++			characterPersonality: '',
++			characterInstructions: '',
++			setName: 'Room',
++			setDescription: 'A bright room in the daytime.',
++			startingMessage: 'Hello.',
++			systemInstructions: 'Help the participant practise.'
++		};
++		expect(
++			parseGeneratedExperienceSetupDetails(JSON.stringify({ ...base, suggestedSetRefs: ['12', 4, 'x', 2.5, 7, 9] }))
++				?.suggestedSetRefs
++		).toEqual([12, 4, 7]);
++		expect(parseGeneratedExperienceSetupDetails(JSON.stringify(base))?.suggestedSetRefs).toEqual([]);
++	});
++
+ 	it('snaps a nearby age and a spaced ethnicity onto the character form values', () => {
+ 		expect(
+ 			parseGeneratedExperienceSetupDetails(
+diff --git a/src/lib/server/platform/generateExperienceSetupDetails.ts b/src/lib/server/platform/generateExperienceSetupDetails.ts
+index 5084ab6..369ae03 100644
+--- a/src/lib/server/platform/generateExperienceSetupDetails.ts
++++ b/src/lib/server/platform/generateExperienceSetupDetails.ts
+@@ -1,4 +1,5 @@
+ import type { CharacterWardrobeChoices } from './characterWardrobeChoices';
++import { MAX_SUGGESTED_SETS, setChoicePromptLines, type SetChoice } from './setSuggestionChoices';
+ import type { PrismaClient } from '@prisma/client';
+ import { z } from 'zod';
+ import { CONVERSATION_INSTRUCTION_QUALITY } from './conversationInstructionDesign';
+@@ -63,6 +64,7 @@ const generatedDetailsSchema = z
+ 		characterInstructions: z.string().trim().max(5000),
+ 		setName: z.string().trim().max(128),
+ 		setDescription: z.string().trim().max(800),
++		suggestedSetRefs: z.array(z.number().int()).max(MAX_SUGGESTED_SETS).default([]),
+ 		startingMessage: z.string().trim().max(500),
+ 		systemInstructions: z.string().trim().max(5000)
+ 	});
+@@ -87,6 +89,7 @@ const RESPONSE_SCHEMA = {
+ 		'characterInstructions',
+ 		'setName',
+ 		'setDescription',
++		'suggestedSetRefs',
+ 		'startingMessage',
+ 		'systemInstructions'
+ 	],
+@@ -105,6 +108,7 @@ const RESPONSE_SCHEMA = {
+ 		characterInstructions: { type: 'string', maxLength: 5000 },
+ 		setName: { type: 'string', maxLength: 128 },
+ 		setDescription: { type: 'string', maxLength: 800 },
++		suggestedSetRefs: { type: 'array', items: { type: 'integer' }, maxItems: MAX_SUGGESTED_SETS },
+ 		startingMessage: { type: 'string', maxLength: 500 },
+ 		systemInstructions: { type: 'string', maxLength: 5000 }
+ 	}
+@@ -114,7 +118,7 @@ export const EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT = `You design a coherent Lif
+ Liforma Experiences are browser-based conversations between one human participant and one animated talking character.
+ 
+ Return ONLY valid JSON with exactly these fields:
+-{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","startingMessage":"...","systemInstructions":"..."}
++{"title":"...","description":"...","introduction":"...","characterName":"...","characterRole":"...","characterGender":"female","characterAge":35,"characterEthnicity":"european","characterClothesId":"...","characterHairId":"...","characterPersonality":"...","characterInstructions":"...","setName":"...","setDescription":"...","suggestedSetRefs":[17,4],"startingMessage":"...","systemInstructions":"..."}
+ 
+ Field rules:
+ - title: a clear, appealing title, 1–128 characters.
+@@ -130,6 +134,7 @@ Field rules:
+ - characterInstructions: instructions the model reads while playing this character. Write in second person ("you", "your"). Cover reusable identity, background, expertise, persistent relationships, rules, and boundaries that should follow this character between experiences. Example: "You have worked at your family's restaurant for years and know the menu by heart. You are proud of your heritage and the food you serve. Stay professional yet warm. Share a short anecdote about the restaurant or the neighborhood only when asked. Avoid over-familiarity, and treat regular customers like old friends." Do not narrate in the third person. Do not include facts, goals, events, or constraints that apply only to this experience or set.
+ - setName: a concise, reusable name for the visual setting where the conversation happens. Name the place, not the activity.
+ - setDescription: a reusable visual description of that setting for backdrop generation. Describe what the place looks like, the time of day, and the weather. Do not include the participant's task, the plot, or character instructions. At most 800 characters.
++- suggestedSetRefs: up to three numbers from the supplied publicSets list (each line is "number: set name (collection)") for the listed sets that best fit setName, setDescription, and the brief, best first. Prefer the same kind of place and the same world or period (modern, historical, fantasy, science fiction). Copy numbers exactly; return an empty array when no listed set fits well. Do not invent numbers.
+ - startingMessage: the exact first words spoken by the character. This is especially important. Write a natural opening in the character's voice that immediately establishes the situation and gives the participant something meaningful to respond to. Prefer one or two short sentences. Do not use stage directions, narration, quotation marks, labels, placeholders, or a generic "How can I help?" unless that truly fits the scenario. Do not speak for the participant or reveal information meant to remain hidden.
+ - systemInstructions: additional situation-specific instructions the model reads while playing this character. This is especially important. Write in second person ("you", "your") and refer to the human as "the participant". In clear present-tense prose, establish the immediate context, the participant's role, your objective, relevant facts, constraints, desired progression, and how you should respond to likely choices. Preserve participant agency and any deliberate mystery. Include concrete scenario facts needed for a consistent conversation, but do not repeat generic character identity or personality. Do not write in the third person, script the participant, mention prompts or models, or include implementation commentary. Write a detailed runnable brief with compact sections, normally 2,800–4,500 characters. Use the author brief as fixed direction and flesh out unspecified interaction design creatively, without fabricating real-world facts or unsupported capabilities.
+ 
+@@ -242,6 +247,12 @@ export function normalizeGeneratedExperienceSetupDetails(value: unknown): unknow
+ 	row.characterGender = characterGenderFromUnknown(row.characterGender);
+ 	row.characterAge = characterAgeFromUnknown(row.characterAge);
+ 	row.characterEthnicity = characterEthnicityFromUnknown(row.characterEthnicity);
++	row.suggestedSetRefs = Array.isArray(row.suggestedSetRefs)
++		? row.suggestedSetRefs
++				.map((ref) => (typeof ref === 'string' ? Number(ref.trim()) : ref))
++				.filter((ref): ref is number => Number.isInteger(ref))
++				.slice(0, MAX_SUGGESTED_SETS)
++		: [];
+ 	return row;
+ }
+ 
+@@ -292,13 +303,22 @@ export async function generateExperienceSetupDetails(input: {
+ 	readonly experienceId?: string | null;
+ 	readonly actorUserId: string;
+  readonly wardrobeChoices?: CharacterWardrobeChoices;
++	/** Public sets the generator may suggest, numbered (see setSuggestionChoices). */
++	readonly setChoices?: readonly SetChoice[];
+ 	readonly signal?: AbortSignal;
+ }): Promise<GeneratedExperienceSetupDetails> {
+ 	const body: OpenRouterChatPostBody = {
+ 		model: OPENROUTER_GEMINI_3_FLASH_PREVIEW_MODEL_ID,
+ 		messages: [
+ 			{ role: 'system', content: EXPERIENCE_SETUP_DETAILS_SYSTEM_PROMPT },
+-			{ role: 'user', content: JSON.stringify({ brief: input.prompt.trim(), publishedWardrobe: input.wardrobeChoices ?? {} }) }
++			{
++				role: 'user',
++				content: JSON.stringify({
++					brief: input.prompt.trim(),
++					publishedWardrobe: input.wardrobeChoices ?? {},
++					publicSets: setChoicePromptLines(input.setChoices ?? [])
++				})
++			}
+ 		],
+ 		temperature: 0.4,
+ 		max_tokens: 4096,
+diff --git a/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts b/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
+index dda993a..14e3d17 100644
+--- a/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
++++ b/src/lib/server/platform/projectSetupDetailsGenerationEndpoint.test.ts
+@@ -2,6 +2,31 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
+ 
+ vi.mock('$lib/server/platform/characterWardrobeChoices', () => ({ loadCharacterWardrobeChoices: async () => ({ female: { clothes: [], hair: [] }, male: { clothes: [], hair: [] } }) }));
+ 
++const publicSet = (setId: string, name: string) => ({
++	setId,
++	name,
++	thumbnailUrl: `https://cdn.example.test/${setId}.webp`,
++	backgroundImage: null,
++	foregroundImage: null,
++	collection: 'modern',
++	area: 'city',
++	venue: 'boutique_hotel',
++	setting: 'interior',
++	space: 'reception',
++	userPosition: 'front',
++	availableStyles: [],
++	variantCounts: { daytime: 1, evening: 0, night: 0, rainy: 0 },
++	backdropId: `backdrop_${setId}`
++});
++const setChoices = [
++	{ ref: 1, set: publicSet('set_park', 'Park · Picnic Area · Sitting At Table') },
++	{ ref: 2, set: publicSet('set_hotel', 'Boutique Hotel · Reception · Looking At Desk') }
++];
++vi.mock('$lib/server/platform/setSuggestionChoices', async (importOriginal) => ({
++	...(await importOriginal<typeof import('$lib/server/platform/setSuggestionChoices')>()),
++	loadPublicSetChoices: async () => setChoices
++}));
++
+ const mocks = vi.hoisted(() => ({
+ 	admitAppGeneration: vi.fn(),
+ 	generateExperienceSetupDetails: vi.fn(),
+@@ -43,6 +68,7 @@ const generatedDetails = {
+ 	characterPersonality: 'Calm and observant.',
+ 	characterInstructions: 'Maya protects guest privacy.',
+ 	setName: 'Hotel front desk',
++	suggestedSetRefs: [2],
+ 	startingMessage: 'May I see your booking confirmation?',
+ 	systemInstructions: 'Help the participant resolve a missing reservation.'
+ };
+@@ -100,6 +126,7 @@ describe('POST /internal/projects/:projectId/setup-details/generate', () => {
+ 			prisma,
+ 			apiKey: 'test-openrouter-key',
+  wardrobeChoices: { female: { clothes: [], hair: [] }, male: { clothes: [], hair: [] } },
++			setChoices,
+ 			prompt: 'Build a hotel roleplay.',
+ 			organizationId: 'org_1',
+ 			projectId: 'project_1',
+@@ -107,7 +134,33 @@ describe('POST /internal/projects/:projectId/setup-details/generate', () => {
+ 			signal: expect.any(AbortSignal)
+ 		});
+ 		expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+-		expect(await response.json()).toEqual(generatedDetails);
++		const body = await response.json();
++		expect(body).not.toHaveProperty('suggestedSetRefs');
++		expect(body).toEqual({
++			title: generatedDetails.title,
++			description: generatedDetails.description,
++			introduction: generatedDetails.introduction,
++			characterName: generatedDetails.characterName,
++			characterRole: generatedDetails.characterRole,
++			characterPersonality: generatedDetails.characterPersonality,
++			characterInstructions: generatedDetails.characterInstructions,
++			setName: generatedDetails.setName,
++			startingMessage: generatedDetails.startingMessage,
++			systemInstructions: generatedDetails.systemInstructions,
++			suggestedSets: [
++				{
++					setId: 'set_hotel',
++					name: 'Boutique Hotel · Reception · Looking At Desk',
++					thumbnailUrl: 'https://cdn.example.test/set_hotel.webp',
++					backgroundImage: null,
++					foregroundImage: null,
++					backdropId: 'backdrop_set_hotel',
++					collection: 'modern',
++					venue: 'boutique_hotel',
++					setting: 'interior'
++				}
++			]
++		});
+ 	});
+ 
+ 	it.each([{ prompt: '' }, { prompt: 'x'.repeat(2001) }, { prompt: 'valid', extra: true }])(
+diff --git a/src/lib/server/platform/setSuggestionChoices.test.ts b/src/lib/server/platform/setSuggestionChoices.test.ts
+new file mode 100644
+index 0000000..f1f6fcb
+--- /dev/null
++++ b/src/lib/server/platform/setSuggestionChoices.test.ts
+@@ -0,0 +1,85 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import type { CatalogueSetListItem } from '$lib/server/places/listCatalogueSets';
++
++import {
++	MAX_SUGGESTED_SETS,
++	setChoicePromptLines,
++	setupDetailsResponse,
++	suggestedSetsFromRefs,
++	type SetChoice
++} from './setSuggestionChoices';
++
++function set(setId: string, name: string, collection = 'modern'): CatalogueSetListItem {
++	return {
++		setId,
++		name,
++		thumbnailUrl: null,
++		backgroundImage: `https://cdn.example.test/${setId}.webp`,
++		foregroundImage: null,
++		collection,
++		area: 'city',
++		venue: 'venue',
++		setting: 'interior',
++		space: 'main',
++		userPosition: 'front',
++		availableStyles: [],
++		variantCounts: { daytime: 1, evening: 0, night: 0, rainy: 0 },
++		backdropId: `backdrop_${setId}`
++	};
++}
++
++const choices: SetChoice[] = [
++	{ ref: 1, set: set('set_a', 'Boutique Hotel · Reception · Looking At Desk') },
++	{ ref: 2, set: set('set_b', 'Park · Picnic Area · Sitting At Table') },
++	{ ref: 3, set: set('set_c', 'Colliseum · Colliseum Entrance', 'ancient_rome') },
++	{ ref: 4, set: set('set_d', 'Station · Platform') }
++];
++
++afterEach(() => vi.restoreAllMocks());
++
++describe('public set suggestions', () => {
++	it('numbers each set with its collection for the model', () => {
++		expect(setChoicePromptLines(choices.slice(2, 3))).toEqual([
++			'3: Colliseum · Colliseum Entrance (ancient rome)'
++		]);
++	});
++
++	it('turns the model numbers into sets, best first, without repeats', () => {
++		expect(suggestedSetsFromRefs([2, 1, 2], choices).map((row) => row.setId)).toEqual(['set_b', 'set_a']);
++	});
++
++	it('drops numbers that are not in the list and says so', () => {
++		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
++		expect(suggestedSetsFromRefs([99, 1], choices).map((row) => row.setId)).toEqual(['set_a']);
++		expect(warn).toHaveBeenCalledWith(expect.stringContaining('not in the list'), {
++			unknown: [99],
++			offered: 4
++		});
++	});
++
++	it('keeps at most three suggestions', () => {
++		expect(suggestedSetsFromRefs([1, 2, 3, 4], choices)).toHaveLength(MAX_SUGGESTED_SETS);
++	});
++
++	it('replaces the numbers with the sets in the reply to the Studio', () => {
++		const reply = setupDetailsResponse({ title: 'Check-in', suggestedSetRefs: [1] }, choices);
++		expect(reply).toEqual({
++			title: 'Check-in',
++			suggestedSets: [
++				{
++					setId: 'set_a',
++					name: 'Boutique Hotel · Reception · Looking At Desk',
++					thumbnailUrl: null,
++					backgroundImage: 'https://cdn.example.test/set_a.webp',
++					foregroundImage: null,
++					backdropId: 'backdrop_set_a',
++					collection: 'modern',
++					venue: 'venue',
++					setting: 'interior'
++				}
++			]
++		});
++		expect(reply).not.toHaveProperty('suggestedSetRefs');
++	});
++});
+diff --git a/src/lib/server/platform/setSuggestionChoices.ts b/src/lib/server/platform/setSuggestionChoices.ts
+new file mode 100644
+index 0000000..49492c1
+--- /dev/null
++++ b/src/lib/server/platform/setSuggestionChoices.ts
+@@ -0,0 +1,82 @@
++/**
++ * Public sets offered to the experience setup generator, and the sets it suggests back.
++ * The model sees short numbered lines and returns numbers, so it never has to copy long ids.
++ */
++import type { PrismaClient } from '@prisma/client';
++
++import { listCatalogueSets, type CatalogueSetListItem } from '$lib/server/places/listCatalogueSets';
++
++export const MAX_SUGGESTED_SETS = 3;
++
++/** One public set, numbered for the model. */
++export type SetChoice = { readonly ref: number; readonly set: CatalogueSetListItem };
++
++/** What the Studio needs to show a suggested set and copy it into the project on Next. */
++export type SuggestedSet = Pick<
++	CatalogueSetListItem,
++	| 'setId'
++	| 'name'
++	| 'thumbnailUrl'
++	| 'backgroundImage'
++	| 'foregroundImage'
++	| 'backdropId'
++	| 'collection'
++	| 'venue'
++	| 'setting'
++>;
++
++export async function loadPublicSetChoices(prisma: PrismaClient): Promise<SetChoice[]> {
++	const { sets } = await listCatalogueSets(prisma, { library: 'public' });
++	return sets.map((set, index) => ({ ref: index + 1, set }));
++}
++
++/** Lines the model reads, e.g. `17: Boutique Hotel · Reception · Looking At Desk (modern)`. */
++export function setChoicePromptLines(choices: readonly SetChoice[]): string[] {
++	return choices.map(({ ref, set }) => `${ref}: ${set.name} (${set.collection.replace(/_/g, ' ')})`);
++}
++
++/** The model's numbers as sets, best first. Unknown and repeated numbers are dropped and logged. */
++export function suggestedSetsFromRefs(
++	refs: readonly number[],
++	choices: readonly SetChoice[]
++): SuggestedSet[] {
++	const byRef = new Map(choices.map((choice) => [choice.ref, choice.set]));
++	const suggested: SuggestedSet[] = [];
++	const unknown: number[] = [];
++	for (const ref of refs) {
++		const set = byRef.get(ref);
++		if (!set) {
++			unknown.push(ref);
++			continue;
++		}
++		if (suggested.some((row) => row.setId === set.setId)) continue;
++		suggested.push({
++			setId: set.setId,
++			name: set.name,
++			thumbnailUrl: set.thumbnailUrl,
++			backgroundImage: set.backgroundImage,
++			foregroundImage: set.foregroundImage,
++			backdropId: set.backdropId,
++			collection: set.collection,
++			venue: set.venue,
++			setting: set.setting
++		});
++		if (suggested.length === MAX_SUGGESTED_SETS) break;
++	}
++	if (unknown.length > 0) {
++		console.warn('[experience.setup.details] suggested set numbers are not in the list', {
++			unknown,
++			offered: choices.length
++		});
++	}
++	return suggested;
++}
++
++/** The generator's details as the Studio receives them: the set numbers swapped for the sets. */
++export function setupDetailsResponse<T extends { readonly suggestedSetRefs: readonly number[] }>(
++	details: T,
++	choices: readonly SetChoice[]
++): Omit<T, 'suggestedSetRefs'> & { readonly suggestedSets: SuggestedSet[] } {
++	const { suggestedSetRefs, ...rest } = details;
++	return { ...rest, suggestedSets: suggestedSetsFromRefs(suggestedSetRefs, choices) };
++}
+diff --git a/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts b/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts
+index 3dbf1b8..a9ddc83 100644
+--- a/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts
++++ b/src/routes/internal/experiences/[experienceId]/setup-details/generate/+server.ts
+@@ -1,4 +1,5 @@
+ import { loadCharacterWardrobeChoices } from '$lib/server/platform/characterWardrobeChoices';
++import { loadPublicSetChoices, setupDetailsResponse } from '$lib/server/platform/setSuggestionChoices';
+ import { env } from '$env/dynamic/private';
+ import { json, type RequestHandler } from '@sveltejs/kit';
+ import { z } from 'zod';
+@@ -70,9 +71,13 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
+ 
+ 	try {
+ 		await admitAppGeneration(prisma, user.id, project.organizationId);
+-		const wardrobeChoices = await loadCharacterWardrobeChoices();
++		const [wardrobeChoices, setChoices] = await Promise.all([
++			loadCharacterWardrobeChoices(),
++			loadPublicSetChoices(prisma)
++		]);
+ 		const details = await generateExperienceSetupDetails({
+  wardrobeChoices,
++			setChoices,
+ 			prisma,
+ 			apiKey,
+ 			prompt: parsed.data.prompt,
+@@ -82,7 +87,7 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
+ 			actorUserId: user.id,
+ 			signal: request.signal
+ 		});
+-		return json(details, { headers: { 'Cache-Control': 'private, no-store' } });
++		return json(setupDetailsResponse(details, setChoices), { headers: { 'Cache-Control': 'private, no-store' } });
+ 	} catch (error) {
+ 		if (error instanceof SuggestionGenerationRateLimitedError) {
+ 			return generationRateLimitResponse(error, locals);
+diff --git a/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts b/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts
+index c5d3edc..ce90c85 100644
+--- a/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts
++++ b/src/routes/internal/projects/[projectId]/setup-details/generate/+server.ts
+@@ -1,4 +1,5 @@
+ import { loadCharacterWardrobeChoices } from '$lib/server/platform/characterWardrobeChoices';
++import { loadPublicSetChoices, setupDetailsResponse } from '$lib/server/platform/setSuggestionChoices';
+ import { env } from '$env/dynamic/private';
+ import { json, type RequestHandler } from '@sveltejs/kit';
+ import { z } from 'zod';
+@@ -62,9 +63,13 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
+ 
+ 	try {
+ 		await admitAppGeneration(prisma, user.id, project.organizationId);
+-		const wardrobeChoices = await loadCharacterWardrobeChoices();
++		const [wardrobeChoices, setChoices] = await Promise.all([
++			loadCharacterWardrobeChoices(),
++			loadPublicSetChoices(prisma)
++		]);
+ 		const details = await generateExperienceSetupDetails({
+  wardrobeChoices,
++			setChoices,
+ 			prisma,
+ 			apiKey,
+ 			prompt: parsed.data.prompt,
+@@ -73,7 +78,7 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
+ 			actorUserId: user.id,
+ 			signal: request.signal
+ 		});
+-		return json(details, { headers: { 'Cache-Control': 'private, no-store' } });
++		return json(setupDetailsResponse(details, setChoices), { headers: { 'Cache-Control': 'private, no-store' } });
+ 	} catch (error) {
+ 		if (error instanceof SuggestionGenerationRateLimitedError) {
+ 			return generationRateLimitResponse(error, locals);
+-- 
+2.50.1 (Apple Git-155)
+

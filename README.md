@@ -22,4 +22,7 @@ Work that is not on staging or production yet. Each folder has a README with wha
 | [`costume-keep-hair/`](./costume-keep-hair/) | Costumes keep the avatar's hair after the face paste (api + Studio), unfinished |
 | [`studio-stage-blinks/`](./studio-stage-blinks/) | No flicker on the character page when changing hair or clothes (Studio), old and unfinished |
 | [`small-local-bits/`](./small-local-bits/) | Eye corner layer, blue hair colour, Japanese/Chinese styles, image-lerp upgrades |
+| [`race-plates/`](./race-plates/) | One outfit in, race outfit plates out, with a viewer (24 - 28 Sep). Copy of what was merged into the team sandbox in its PR #2 on 9 Oct |
+| [`studio-wardrobe/`](./studio-wardrobe/) | The Studio clothes generation pipeline and hair picker (6 Oct). Copy from the team sandbox PR #2 |
+| [`player-eye-fix/`](./player-eye-fix/) | Race avatars' eye picture at full size (6 Oct). Copy from the team sandbox PR #2 |
 

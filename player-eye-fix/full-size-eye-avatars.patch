@@ -1,0 +1,76 @@
+From 66d57a0ef0c66231e0e7b15c8da0c474941f123c Mon Sep 17 00:00:00 2001
+From: Sayzal28 <Sayzal28@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 03:35:37 +0100
+Subject: [PATCH] Draw the race avatars' inner-eye picture at full size instead
+ of 0.9.
+
+The default iris scale (0.9) shrinks the whole inner-eye picture, not just the iris. The race avatars'
+eyelid dots sit on the painted eye's edge, so their eyes came out 15-21 % smaller than painted.
+FULL_SIZE_EYE_AVATARS lists them; every other avatar keeps the default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../runtime/face-session/FaceSessionView.ts   | 40 ++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/src/lib/runtime/face-session/FaceSessionView.ts b/src/lib/runtime/face-session/FaceSessionView.ts
+index b5b8129..eed547b 100644
+--- a/src/lib/runtime/face-session/FaceSessionView.ts
++++ b/src/lib/runtime/face-session/FaceSessionView.ts
+@@ -74,6 +74,40 @@ import {
+ import { requestMorphLayoutPresent } from '$lib/player/morph-engine/animate/render/morphCompositorInvalidate';
+ import { ViewLifecycle, ViewLifecycleCancelledError } from './viewLifecycle';
+ 
++/**
++ * Race avatars whose inner-eye picture is drawn at full size (see getIrisScale). Their eyelid dots sit on the painted
++ * eye's edge, so the default 0.9 drew their eyes 15-21 % smaller than painted.
++ */
++const FULL_SIZE_EYE_AVATARS: readonly string[] = [
++	// Women
++	'd9048f3b',
++	'5a5a0001',
++	'5a5a0002',
++	'ae5a0001',
++	'ae5a0002',
++	'9298d617',
++	'ea5a0002',
++	'3e621eb8',
++	'1d5a0001',
++	'ed5a0001',
++	'5e5a0001',
++	'0a5a0001',
++	'ac5a0001',
++	'af5a0001',
++	'e05a0001',
++	// Men
++	'0a5b0001',
++	'1d5b0001',
++	'5a5b0001',
++	'5e5b0001',
++	'ac5b0001',
++	'ae5b0001',
++	'af5b0001',
++	'ea5b0001',
++	'ed5b0001',
++	'e05b0001'
++];
++
+ export type FaceSessionViewOptions = {
+ 	readonly container: HTMLElement;
+ 	/**
+@@ -1009,7 +1043,11 @@ export class FaceSessionView {
+ 			getShowWireframe: () => false,
+ 			getShowPoints: () => false,
+ 			getShowRingDebug: () => false,
+-			getIrisScale: () => DEFAULT_IRIS_SCALE_MULTIPLIER,
++			// The 0.9 default shrinks the whole eye picture, not just the iris.
++			getIrisScale: () =>
++				FULL_SIZE_EYE_AVATARS.some((id) => this.opts.avatarId.includes(id))
++					? 1
++					: DEFAULT_IRIS_SCALE_MULTIPLIER,
+ 			getHiResMorph: () => {
+ 				const profile = liveProfile();
+ 				const { w, h } = this.resolveMorphTextureViewport();
+-- 
+2.50.1 (Apple Git-155)
+

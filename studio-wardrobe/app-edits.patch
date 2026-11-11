@@ -1,0 +1,804 @@
+diff --git a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+index 88efcf3..d04fae1 100644
+--- a/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
++++ b/packages/experience-studio/src/components/fields/AppearanceIdPicker.svelte
+@@ -1,4 +1,5 @@
+ <script lang="ts">
++	import type { Snippet } from 'svelte';
+ 	import LibraryCardGrid from '$lib/components/LibraryCardGrid.svelte';
+ 	import LibraryGridCard from '$lib/components/LibraryGridCard.svelte';
+ 	import AppearanceImageLightbox, {
+@@ -28,6 +29,8 @@
+ 		overlayImage?: string;
+ 		overlayFallbackImage?: string;
+ 		overlayPlacement?: 'over' | 'under';
++		/** `clothes` zooms each tile in on the outfit (neck down) instead of showing the whole plate. */
++		framing?: 'whole' | 'clothes';
+ 		pickerKind?: 'clothes' | 'hair' | 'costume';
+ 		supportsCostumes?: boolean;
+ 		canAuthor?: boolean;
+@@ -41,6 +44,11 @@
+ 		onClothesSaved?: (clothesId: string, option: Option) => void;
+ 		onClothesApplied?: (clothesId: string, option: Option) => void;
+ 		onClose?: () => void;
++		/**
++		 * Shown instead of the built-in create panel when "+ New clothes" is chosen; gets a function that goes back to
++		 * the picker. The local Studio passes its two-step ethnicity outfit maker here.
++		 */
++		createPanel?: Snippet<[() => void]>;
+ 	};
+ 
+ 	let {
+@@ -51,6 +59,7 @@
+ 		overlayImage = '',
+ 		overlayFallbackImage = '',
+ 		overlayPlacement = 'over',
++		framing = 'whole',
+ 		pickerKind,
+ 		supportsCostumes = false,
+ 		canAuthor = false,
+@@ -63,7 +72,8 @@
+ 		onSelect,
+ 		onClothesSaved,
+ 		onClothesApplied,
+-		onClose
++		onClose,
++		createPanel
+ 	}: Props = $props();
+ 
+ 	let previewOption = $state<Option | null>(null);
+@@ -121,6 +131,20 @@
+ 
+ 	const overlayActive = $derived(Boolean(overlayImage) && pickerKind !== 'costume');
+ 	const overlayUnder = $derived(overlayPlacement === 'under');
++	const clothesFraming = $derived(framing === 'clothes');
++
++	/** Zoomed tiles load the 512 plates so they stay sharp; the 256 ones are the first fallback. */
++	function tileSrc(url: string): string {
++		return clothesFraming ? lightboxSrc(url) : url;
++	}
++
++	/** After a failed load, try the next of the tile's pictures. */
++	function tryNextSrc(event: Event, ...urls: (string | undefined)[]) {
++		const img = event.currentTarget as HTMLImageElement;
++		const candidates = [...new Set(urls.filter((url): url is string => Boolean(url)))];
++		const next = candidates[candidates.indexOf(img.getAttribute('src') ?? '') + 1];
++		if (next) img.src = next;
++	}
+ 
+ 	const preview = $derived.by((): AppearanceLightboxPreview | null => {
+ 		if (!previewOption?.image?.trim()) return null;
+@@ -189,7 +213,9 @@
+ 	}
+ </script>
+ 
+-{#if showCreatePanel}
++{#if showCreatePanel && createPanel && createWardrobeKind === 'clothes'}
++	{@render createPanel(() => (viewMode = 'pick'))}
++{:else if showCreatePanel}
+ 	<CreateClothesPanel
+ 		projectId={projectId}
+ 		avatarId={avatarId}
+@@ -290,48 +316,36 @@
+ 							<span class="text-only-label">{optionLabel}</span>
+ 						</div>
+ 					{:else}
+-						<div class="stack layer-stack">
++						<div class="stack layer-stack" class:clothes-framing={clothesFraming}>
+ 							{#if overlayActive && overlayUnder}
+ 								<img
+-									src={overlayImage}
++									src={tileSrc(overlayImage)}
+ 									alt=""
+ 									loading="lazy"
+ 									width="96"
+ 									height="96"
+-									onerror={(event) => {
+-										const img = event.currentTarget as HTMLImageElement;
+-										if (overlayFallbackImage && img.src !== overlayFallbackImage) {
+-											img.src = overlayFallbackImage;
+-										}
+-									}}
++									onerror={(event) =>
++										tryNextSrc(event, tileSrc(overlayImage), overlayImage, overlayFallbackImage)}
+ 								/>
+ 							{/if}
+ 							<img
+-								src={option.image}
++								src={tileSrc(option.image)}
+ 								alt=""
+ 								loading="lazy"
+ 								width="96"
+ 								height="96"
+-								onerror={(event) => {
+-									const img = event.currentTarget as HTMLImageElement;
+-									if (option.fallbackImage && img.src !== option.fallbackImage) {
+-										img.src = option.fallbackImage;
+-									}
+-								}}
++								onerror={(event) =>
++									tryNextSrc(event, tileSrc(option.image), option.image, option.fallbackImage)}
+ 							/>
+ 							{#if overlayActive && !overlayUnder}
+ 								<img
+-									src={overlayImage}
++									src={tileSrc(overlayImage)}
+ 									alt=""
+ 									loading="lazy"
+ 									width="96"
+ 									height="96"
+-									onerror={(event) => {
+-										const img = event.currentTarget as HTMLImageElement;
+-										if (overlayFallbackImage && img.src !== overlayFallbackImage) {
+-											img.src = overlayFallbackImage;
+-										}
+-									}}
++									onerror={(event) =>
++										tryNextSrc(event, tileSrc(overlayImage), overlayImage, overlayFallbackImage)}
+ 								/>
+ 							{/if}
+ 						</div>
+@@ -384,6 +398,12 @@
+ 		pointer-events: none;
+ 	}
+ 
++	/* Neck down: every layer gets the same zoom, so hair stays where it sits on the plate. */
++	.option-picker :global(.layer-stack.clothes-framing img) {
++		transform: scale(1.65);
++		transform-origin: 50% 100%;
++	}
++
+ 	.new-clothes-card {
+ 		display: grid;
+ 		place-items: center;
+diff --git a/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte b/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte
+index eefbdd0..b92389b 100644
+--- a/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte
++++ b/packages/experience-studio/src/components/flow/CustomisableCharacterPanel.svelte
+@@ -2,6 +2,7 @@
+ 	import { untrack } from 'svelte';
+ 
+ 	import AppearanceIdPicker from '../fields/AppearanceIdPicker.svelte';
++	import HairStylePicker from '../fields/HairStylePicker.svelte';
+ 	import AvatarPicker from '../fields/AvatarPicker.svelte';
+ 	import ExperiencePreviewLightbox from '../ExperiencePreviewLightbox.svelte';
+ 	import IconHair from '~icons/tabler/scissors';
+@@ -11,8 +12,6 @@
+ 		appearanceAfterSelectingClothes,
+ 		appearanceAfterSelectingCostume,
+ 		appearanceAfterSelectingHair,
+-		BALD_HAIR_ID,
+-		BALD_HAIR_LABEL,
+ 		clothesOptionUrl,
+ 		ensureClothesLayerHair,
+ 		hairOptionUrl,
+@@ -24,6 +23,7 @@
+ 		wholeCostumeOptionUrl,
+ 		type CharacterAppearance
+ 	} from '../../lib/characterAppearance.js';
++	import { hairIdsForEthnicity, hairRaceOfAvatar } from '../../lib/hairStyles.js';
+ 	import { formatCharacterLabel } from '../../lib/characterLabel.js';
+ 	import {
+ 		canContinueCustomisableDetails,
+@@ -214,23 +214,14 @@
+ 		return options;
+ 	});
+ 
+-	const hairOptions = $derived.by((): WardrobeOption[] => {
++	// the hair this character is offered: the avatar's own race's fits (and Anna's/Adam's hair for styles it has no fit for), the
++	// hidden styles left out; HairStylePicker groups it into styles with the colour palette down the side (2026-10-04, user:
++	// "make sure that the color palette appears in every character that is made"). It used to be every id flat, every race's fits
++	// and colours included.
++	const offeredHairIds = $derived.by((): string[] => {
+ 		const avatar = selectedAvatar;
+ 		if (!avatar) return [];
+-		const options: WardrobeOption[] = (avatar.hairIds ?? [])
+-			.filter((id) => !isBaldHair(id))
+-			.map((id) => ({
+-				id,
+-				image: hairOptionUrl(cdnBaseUrl, avatar.id, id),
+-				kind: 'Hair'
+-			}));
+-		options.push({
+-			id: BALD_HAIR_ID,
+-			image: '',
+-			kind: 'Hair',
+-			name: BALD_HAIR_LABEL
+-		});
+-		return options;
++		return hairIdsForEthnicity(avatar.hairIds ?? [], hairRaceOfAvatar(avatar)).filter((id) => !isBaldHair(id));
+ 	});
+ 
+ 	const previewScene = $derived.by(() => {
+@@ -354,6 +345,10 @@
+ 		view = 'summary';
+ 	}
+ 
++	function recolourHair(id: string) {
++		appearance = appearanceAfterSelectingHair(appearance, id, selectedAvatar);
++	}
++
+ 	export async function submit(): Promise<boolean> {
+ 		if (!selectedAvatar || !avatarId.trim() || submitting) return false;
+ 		submitting = true;
+@@ -516,7 +511,7 @@
+ 								<button
+ 									type="button"
+ 									class="preview-overlay-btn"
+-									disabled={busy || !hairChangeEnabled || hairOptions.length === 0}
++									disabled={busy || !hairChangeEnabled}
+ 									aria-label="Change Hair"
+ 									onclick={() => (view = 'hair')}
+ 								>
+@@ -674,16 +669,20 @@
+ 		{/if}
+ 	{:else if view === 'hair'}
+ 		<div class="step-body">
+-			<AppearanceIdPicker
+-				label="Hair"
+-				options={hairOptions}
+-				selectedId={hairId}
+-				disabled={busy}
+-				overlayImage={hairClothesOverlayUrl}
+-				overlayPlacement="under"
+-				onSelect={applyHair}
+-				onClose={() => (view = 'summary')}
+-			/>
++			{#if selectedAvatar}
++				<HairStylePicker
++					hairIds={offeredHairIds}
++					wornId={hairId}
++					avatarId={selectedAvatar.id}
++					{cdnBaseUrl}
++					disabled={busy}
++					overlayImage={hairClothesOverlayUrl}
++					overlayPlacement="under"
++					onSelect={applyHair}
++					onRecolour={recolourHair}
++					onClose={() => (view = 'summary')}
++				/>
++			{/if}
+ 		</div>
+ 		<footer class="actions">
+ 			<button type="button" class="btn subtle" disabled={busy} onclick={() => (view = 'summary')}>
+diff --git a/packages/experience-studio/src/index.ts b/packages/experience-studio/src/index.ts
+index 20c6e0d..ba2c048 100644
+--- a/packages/experience-studio/src/index.ts
++++ b/packages/experience-studio/src/index.ts
+@@ -122,6 +122,7 @@ export {
+ } from './lib/weatherStudio.js';
+ export { default as AvatarPicker } from './components/fields/AvatarPicker.svelte';
+ export { default as AppearanceIdPicker } from './components/fields/AppearanceIdPicker.svelte';
++export { default as HairStylePicker } from './components/fields/HairStylePicker.svelte';
+ export { default as CreateClothesPanel } from './components/fields/CreateClothesPanel.svelte';
+ export { default as AppearanceLayerToggle } from './components/fields/AppearanceLayerToggle.svelte';
+ export { default as CharacterAppearanceFields } from './components/fields/CharacterAppearanceFields.svelte';
+diff --git a/packages/experience-studio/src/lib/characterAppearance.ts b/packages/experience-studio/src/lib/characterAppearance.ts
+index d694c26..6156f2a 100644
+--- a/packages/experience-studio/src/lib/characterAppearance.ts
++++ b/packages/experience-studio/src/lib/characterAppearance.ts
+@@ -446,9 +446,21 @@ export type WardrobePlateRef = {
+ 
+ const PRODUCTION_CDN_ORIGIN = 'https://cdn.liforma.ai';
+ 
++/**
++ * LOCAL ONLY (not for commit): in dev, wardrobe and avatar plates go through the local CDN relay
++ * (PUBLIC_CDN_BASE_URL, :3014). It serves local-only packs and falls back to cdn.liforma.ai for everything else.
++ */
++function devRelayBase(cdnBaseUrl: string): string | null {
++	if (!import.meta.env.DEV) return null;
++	const raw = cdnBaseUrl.trim().replace(/\/$/, '');
++	return raw || null;
++}
++
+ function publishedCdnOrigin(cdnBaseUrl: string): string {
+ 	const raw = cdnBaseUrl.trim().replace(/\/$/, '');
+ 	if (!raw) return PRODUCTION_CDN_ORIGIN;
++	const dev = devRelayBase(raw);
++	if (dev) return dev;
+ 	try {
+ 		const parsed = new URL(raw.includes('://') ? raw : `https://${raw}`);
+ 		const host = parsed.hostname.toLowerCase();
+@@ -468,7 +480,12 @@ function absoluteCdnUrl(cdnBaseUrl: string, pathOrUrl: string): string {
+ 		try {
+ 			const parsed = new URL(raw);
+ 			const host = parsed.hostname.toLowerCase();
+-			if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
++			const local = host === 'localhost' || host === '127.0.0.1' || host === '::1';
++			const dev = devRelayBase(cdnBaseUrl);
++			if (dev && (local || host === 'cdn.liforma.ai') && /^\/avatars\//i.test(parsed.pathname)) {
++				return `${dev}${parsed.pathname}${parsed.search}${parsed.hash}`;
++			}
++			if (local) {
+ 				return `${PRODUCTION_CDN_ORIGIN}${parsed.pathname}${parsed.search}${parsed.hash}`;
+ 			}
+ 		} catch {
+diff --git a/src/routes/(portal)/library/characters/[charId]/+page.svelte b/src/routes/(portal)/library/characters/[charId]/+page.svelte
+index 88302e2..0c93382 100644
+--- a/src/routes/(portal)/library/characters/[charId]/+page.svelte
++++ b/src/routes/(portal)/library/characters/[charId]/+page.svelte
+@@ -1,6 +1,25 @@
+ <script lang="ts">
+ 	import { untrack } from 'svelte';
++	import { dev } from '$app/environment';
+ 	import { resolve } from '$app/paths';
++	import {
++		OWN_RACE,
++		RACE_PLATE_AVATARS,
++		AVATAR_RACE_SET,
++		facePackForRace,
++		useRaceSetFor,
++		parseRaceClothesId,
++		raceClothesId,
++		racePlate,
++		racePlateNote,
++		raceBasePlateUrl,
++		saveChosenRacePlate,
++		noteCustomOutfits,
++		raceChoice,
++		BASE_OUTFIT
++	} from '$lib/raceOutfits/racePlates.svelte';
++	import { hairIdForEthnicity, hairIdsForEthnicity } from '$lib/raceOutfits/raceHair';
++	import NewRaceOutfitPanel from '$lib/components/NewRaceOutfitPanel.svelte';
+ 	import { showLibraryCaughtError } from '$lib/client/libraryAlert.svelte';
+ 	import { showToast } from '$lib/client/toast.svelte';
+ 	import { editorFingerprint } from '$lib/client/unsavedChangesNavigation';
+@@ -36,6 +55,7 @@
+ 	import {
+ 		AppearanceIdPicker,
+ 		AppearanceLayerToggle,
++		HairStylePicker,
+ 		AvatarPicker,
+ 		CharacterLabelChips,
+ 		CharacterTaxonomyFields,
+@@ -47,6 +67,7 @@
+ 		StudioLibraryAttachmentSection,
+ 		StudioNamedAssetSection,
+ 		StudioPickerDialog,
++		PERSONA_ETHNICITY_LABELS,
+ 		TaxonomyLabelsDialog,
+ 		StudioVoicePreviewButton,
+ 		VoiceLocaleChip,
+@@ -77,7 +98,6 @@
+ 		appearanceAfterSelectingHair,
+ 		ensureClothesLayerHair,
+ 		BALD_HAIR_ID,
+-		BALD_HAIR_LABEL,
+ 		isBaldHair,
+ 		normalizeCharacterAppearance,
+ 		preferredHairForComposite,
+@@ -292,6 +312,7 @@
+ 		editCountry = draftCountry.trim();
+ 		editGender = draftGender;
+ 		editAge = draftAge;
++		if (draftEthnicity !== editEthnicity) refitHairToEthnicity(draftEthnicity);
+ 		editEthnicity = draftEthnicity;
+ 		editSpecies = draftSpecies;
+ 		editStyleOverride = draftStyleOverride;
+@@ -509,10 +530,17 @@
+ 	/** Hair is only editable over a clothes layer, not a whole costume. */
+ 	const hairChangeEnabled = $derived(Boolean(resolvedClothes(editAppearance)));
+ 	/** Hair overlay for the clothes picker — keeps last/catalog hair while a whole costume is active. */
+-	const clothesPickerHairId = $derived(preferredHairForComposite(editAppearance, selectedAvatar));
++	/** LOCAL DEV ONLY: the race packs are bald and borrow another avatar's hair list (Anna's or Caleb's), whose first
++	 * style is a blonde bob or a beige cap; until hair is picked they stay bald under new clothes. */
++	const defaultHairCatalog = $derived(
++		selectedAvatar && RACE_PLATE_AVATARS.includes(editAvatarId) && !OWN_RACE[editAvatarId]
++			? { ...selectedAvatar, hairIds: [BALD_HAIR_ID] }
++			: selectedAvatar
++	);
++	const clothesPickerHairId = $derived(preferredHairForComposite(editAppearance, defaultHairCatalog));
+ 	/** Persist the same hair the clothes modal overlays when clothes were saved without hair. */
+ 	const appearanceForSave = $derived(
+-		ensureClothesLayerHair(editAppearance, selectedAvatar) ?? editAppearance
++		ensureClothesLayerHair(editAppearance, defaultHairCatalog) ?? editAppearance
+ 	);
+ 	const needsHairPersist = $derived(
+ 		Boolean(
+@@ -536,7 +564,7 @@
+ 		}
+ 		return map;
+ 	});
+-	const clothesOptions = $derived.by(() => {
++	const baseClothesOptions = $derived.by(() => {
+ 		const catalog = selectedAvatar;
+ 		const clothes = [...(catalog?.clothesIds ?? [])];
+ 		const seen: Record<string, true> = {};
+@@ -653,26 +681,105 @@
+ 		}
+ 		return options;
+ 	});
+-	const hairOptions = $derived.by(() => {
+-		const options: { id: string; image: string; name?: string }[] = (selectedAvatar?.hairIds ?? [])
+-			.filter((id) => !isBaldHair(id))
+-			.map((id) => ({
+-				id,
+-				image: hairOptionUrl(cdnBaseUrl, editAvatarId, id)
+-			}));
+-		if (hairId && !isBaldHair(hairId) && !options.some((option) => option.id === hairId)) {
+-			options.unshift({
+-				id: hairId,
+-				image: hairOptionUrl(cdnBaseUrl, editAvatarId, hairId)
++	// LOCAL DEV ONLY: ethnicity try-on (the sandbox race-plates method, branch Saizal). Anna's and Precious's avatars
++	// share the race plates' framing, so an ethnicity's outfit plate stands in for the clothes layer and the
++	// character's own hair layer is drawn straight over it (Anna's hair placement). Plates for ethnicities other than
++	// European and African are made in this browser when shown (racePlates.svelte.ts); only the one the character is
++	// saved wearing is kept (saveEdit).
++	const RACE_TRY_ON_RACES = [
++		'european',
++		'african',
++		'east-asian',
++		'southeast-asian',
++		'mediterranean',
++		'middle-eastern',
++		'north-african',
++		'south-asian',
++		'indigenous',
++		'pacific-islander'
++	] as const;
++	let racePickerOpen = $state(false);
++	/** Outfits the ethnicity plates can be made for (the same for every ethnicity). */
++	let raceOutfitList = $state<string[]>([]);
++	const raceTryOnAvailable = $derived(dev && supportsCostumes && RACE_PLATE_AVATARS.includes(editAvatarId));
++	const raceTryOn = $derived(
++		raceTryOnAvailable && (RACE_TRY_ON_RACES as readonly string[]).includes(editEthnicity)
++	);
++	/** Hair is drawn over a clothes layer, so a character with an ethnicity but no outfit yet (the race packs start
++	 * that way) puts on its ethnicity's white tee and jeans, the picture it already shows, when hair is picked. */
++	const hairOverBaseOutfit = $derived(raceTryOn && !clothesId);
++	function wearBaseOutfitForHair() {
++		if (hairOverBaseOutfit) applyClothes(raceClothesId(editAvatarId, editEthnicity, BASE_OUTFIT));
++	}
++	const raceOutfitNames = $derived(raceTryOn ? raceOutfitList : []);
++	/** The outfit the character wears, when the ethnicity plates can be made for it. */
++	const wornRaceOutfit = $derived.by(() => {
++		const outfit = parseRaceClothesId(clothesId)?.outfit ?? clothesId;
++		return raceOutfitList.includes(outfit) ? outfit : '';
++	});
++
++	// point the plate maker at this avatar's endpoint pair (Anna/Precious or Caleb/Malik) before
++	// anything asks for a plate; made plates are keyed by pair, so switching avatar cannot show
++	// the other pair's work
++	$effect(() => {
++		useRaceSetFor(editAvatarId);
++	});
++
++	$effect(() => {
++		if (!raceTryOnAvailable) return;
++		const set = AVATAR_RACE_SET[editAvatarId] ?? 'female';
++		const controller = new AbortController();
++		fetch(`/library/race-outfits?race=european&set=${set}`, { signal: controller.signal })
++			.then((res) => (res.ok ? res.json() : null))
++			.then((body: { outfits?: { name: string; custom?: true }[] } | null) => {
++				const outfits = body?.outfits ?? [];
++				noteCustomOutfits(outfits.filter((o) => o.custom).map((o) => o.name));
++				raceOutfitList = outfits.map((o) => o.name);
++			})
++			.catch(() => {
++				/* keep the avatar's own clothes */
+ 			});
+-		}
+-		options.push({
+-			id: BALD_HAIR_ID,
+-			image: '',
+-			name: BALD_HAIR_LABEL
++		return () => controller.abort();
++	});
++
++	function raceLabel(race: string): string {
++		return isPersonaEthnicity(race) ? PERSONA_ETHNICITY_LABELS[race] : race;
++	}
++
++	// LOCAL DEV ONLY (2026-10-02): "+ New clothes" makes the European plate, waits for the user's approval, then the
++	// African plate, and shows the outfit in this ethnicity (NewRaceOutfitPanel, raceOutfitGeneration.ts).
++	const newOutfitRace = $derived(raceTryOn ? editEthnicity : (OWN_RACE[editAvatarId] ?? 'european'));
++	function addMadeOutfit(outfit: string, replaces: string | null) {
++		noteCustomOutfits([outfit]);
++		raceOutfitList = [outfit, ...raceOutfitList.filter((name) => name !== outfit && name !== replaces)];
++	}
++	function wearMadeOutfit(outfit: string) {
++		applyClothes(raceClothesId(editAvatarId, newOutfitRace, outfit));
++		closeClothesPicker();
++	}
++
++	function prettyOutfit(outfit: string): string {
++		return outfit.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
++	}
++
++	const clothesOptions = $derived.by((): ClothesChooserOption[] => {
++		if (!raceOutfitNames.length) return baseClothesOptions;
++		return raceOutfitNames.map((outfit) => {
++			const plate = racePlate(editEthnicity, outfit);
++			return {
++				id: raceClothesId(editAvatarId, editEthnicity, outfit),
++				image: plate.url,
++				kind: raceLabel(editEthnicity),
++				name: prettyOutfit(outfit) + racePlateNote(plate)
++			};
+ 		});
+-		return options;
+ 	});
++	/** LOCAL DEV ONLY: hair made for one ethnicity's head (`<hair>--<race>`) is offered only while that ethnicity is
++	 * chosen (raceHair.ts). The picker (HairStylePicker) groups it into styles: the colour palette down the side, every
++	 * style shown in the chosen colour; choosing a style closes the picker. */
++	const offeredHairIds = $derived(
++		hairIdsForEthnicity(selectedAvatar?.hairIds ?? [], editEthnicity).filter((id) => !isBaldHair(id))
++	);
+ 	const selectedClothesOption = $derived(clothesOptions.find((option) => option.id === clothesId));
+ 	const selectedHairImage = $derived(
+ 		clothesPickerHairId && !isBaldHair(clothesPickerHairId)
+@@ -695,6 +802,37 @@
+ 			[]
+ 		)
+ 	);
++	/** Clothes and avatar as last saved: a plate kept then is served by the local CDN relay like any clothes. */
++	const savedLook = $derived({
++		clothes: resolvedWardrobeLook(character?.definition.appearance),
++		avatarId: character?.definition.avatarId ?? ''
++	});
++	/** The stage's picture as a plate with the character's own hair drawn over it. */
++	function plateOnStage(plate: string) {
++		const hair = hairId && !isBaldHair(hairId) ? hairOptionUrl(cdnBaseUrl, editAvatarId, hairId).replace('/256/', '/1024/') : '';
++		return {
++			...previewScene,
++			avatarImage: plate,
++			fallbackAvatarImage: plate,
++			avatarFallbacks: [],
++			avatarCompositePreview: hair ? { clothesUrl: plate, hairUrl: hair } : undefined
++		};
++	}
++	/**
++	 * With an ethnicity chosen and no outfit, the stage shows that ethnicity's base plate (white tee and blue jeans);
++	 * the avatar's own ethnicity keeps its own look. An ethnicity outfit chosen since the last save is not kept yet,
++	 * so the stage shows it from the browser.
++	 */
++	const shownPreview = $derived.by(() => {
++		if (raceTryOn && !clothesId && OWN_RACE[editAvatarId] !== editEthnicity) {
++			return plateOnStage(raceBasePlateUrl(editEthnicity));
++		}
++		const chosen = raceChoice(editAvatarId, clothesId);
++		if (!raceTryOnAvailable || !chosen) return previewScene;
++		if (clothesId === savedLook.clothes && editAvatarId === savedLook.avatarId) return previewScene;
++		const made = racePlate(chosen.race, chosen.outfit, true);
++		return made.ready ? plateOnStage(made.url) : previewScene;
++	});
+ 	const hasPreview = $derived(Boolean(previewScene.avatarImage || previewScene.fallbackAvatarImage));
+ 	const labelsDialogThumb = $derived(
+ 		previewScene.avatarImage || previewScene.fallbackAvatarImage || ''
+@@ -746,7 +884,7 @@
+ 	}
+ 
+ 	function applyClothes(id: string) {
+-		editAppearance = appearanceAfterSelectingClothes(editAppearance, id, selectedAvatar);
++		editAppearance = appearanceAfterSelectingClothes(editAppearance, id, defaultHairCatalog);
+ 	}
+ 
+ 	function applyCostume(id: string) {
+@@ -776,10 +914,54 @@
+ 	}
+ 
+ 	function selectHair(id: string) {
++		wearBaseOutfitForHair();
+ 		editAppearance = appearanceAfterSelectingHair(editAppearance, id, selectedAvatar);
++		// the colour is chosen first in the palette, then the style: choosing a style closes the picker so the whole avatar shows
++		// (user 2026-10-04: "Once they've clicked on the hairstyle, the hair dialog should close and we should see the whole avatar")
+ 		hairPickerOpen = false;
+ 	}
+ 
++	function selectHairColour(id: string) {
++		wearBaseOutfitForHair();
++		editAppearance = appearanceAfterSelectingHair(editAppearance, id, selectedAvatar);
++	}
++
++	/** LOCAL DEV ONLY: the talking face follows the ethnicity (user, 2026-10-01). The player animates the avatar's own
++	 * face over the ethnicity's body, so the character moves to that ethnicity's pack in the same pair; the voice stays.
++	 * An ethnicity with no face pack keeps the current face. */
++	function switchFaceToEthnicity(race: string) {
++		const face = facePackForRace(editAvatarId, race);
++		if (!face || face === editAvatarId) return;
++		const avatar = avatars.find((row) => row.id === face);
++		if (!avatar) return;
++		editAvatarId = face;
++		editThumbnailPath = avatar.thumbnailPath;
++	}
++
++	/** After the face moves, a hairstyle the new pack does not have would not draw (Priya's own local hair layers);
++	 * wear bald instead. */
++	function dropHairTheFaceLacks() {
++		if (!hairId || isBaldHair(hairId) || (selectedAvatar?.hairIds ?? []).includes(hairId)) return;
++		editAppearance = appearanceAfterSelectingHair(editAppearance, BALD_HAIR_ID, selectedAvatar);
++	}
++
++	/** LOCAL DEV ONLY: after the ethnicity changes, wear the same hairstyle (and colour) made for the new head, and
++	 * move the remembered hairstyles over the same way (raceHair.ts hairIdForEthnicity). */
++	function refitHairToEthnicity(race: string) {
++		const available = selectedAvatar?.hairIds ?? [];
++		if (!available.length || !editAppearance) return;
++		const next = hairId && !isBaldHair(hairId) ? hairIdForEthnicity(hairId, available, race) : null;
++		let appearance = next && next !== hairId ? appearanceAfterSelectingHair(editAppearance, next, selectedAvatar) : editAppearance;
++		const remembered = appearance?.additionalHairstyles;
++		if (appearance && remembered?.length) {
++			const moved = remembered.map((id) => (isBaldHair(id) ? id : (hairIdForEthnicity(id, available, race) ?? id)));
++			if (moved.some((id, i) => id !== remembered[i])) {
++				appearance = { ...appearance, additionalHairstyles: [...new Set(moved)] };
++			}
++		}
++		if (appearance !== editAppearance) editAppearance = appearance;
++	}
++
+ 	async function studioJson<T>(
+ 		path: string,
+ 		init?: { method?: string; body?: string; signal?: AbortSignal }
+@@ -1033,6 +1215,12 @@
+ 		if (!project || !character || !canAuthor || !isDirty) return false;
+ 		saving = true;
+ 		try {
++			// LOCAL DEV ONLY: keep the ethnicity plate the character is being saved wearing (made in this browser).
++			const wornClothes = resolvedWardrobeLook(appearanceForSave);
++			const chosen = dev ? raceChoice(editAvatarId, wornClothes) : null;
++			if (chosen && (wornClothes !== savedLook.clothes || editAvatarId !== savedLook.avatarId)) {
++				await saveChosenRacePlate(editAvatarId, chosen.race, chosen.outfit);
++			}
+ 			const body = await studioJson<{ character?: LibraryCharacterSummary }>(
+ 				`/api/studio/projects/${project.id}/characters/${character.charId}`,
+ 				{
+@@ -1138,12 +1326,12 @@
+ 				<div class="preview-with-badge">
+ 					<LibraryPreviewKindBadge name="characters" label="Character" />
+ 					<ExperiencePreviewLightbox
+-						avatarImage={previewScene.avatarImage}
++						avatarImage={shownPreview.avatarImage}
+ 						backgroundImage={null}
+ 						foregroundImage={null}
+-						fallbackAvatarImage={previewScene.fallbackAvatarImage}
+-						avatarFallbacks={previewScene.avatarFallbacks}
+-						avatarCompositePreview={previewScene.avatarCompositePreview}
++						fallbackAvatarImage={shownPreview.fallbackAvatarImage}
++						avatarFallbacks={shownPreview.avatarFallbacks}
++						avatarCompositePreview={shownPreview.avatarCompositePreview}
+ 						placement={previewScene.placement}
+ 						alt={previewScene.characterName}
+ 						studioTone="character"
+@@ -1155,7 +1343,7 @@
+ 								<button
+ 									type="button"
+ 									class="preview-overlay-btn"
+-									disabled={!canAuthor || saving || !hairChangeEnabled || hairOptions.length === 0}
++									disabled={!canAuthor || saving || !(hairChangeEnabled || hairOverBaseOutfit)}
+ 									aria-label="Change Hair"
+ 									onclick={() => {
+ 										hairPickerOpen = true;
+@@ -1176,6 +1364,21 @@
+ 									<NavIcon name="clothes" size={28} />
+ 									<span>Clothes</span>
+ 								</button>
++								{#if raceTryOnAvailable}
++									<!-- LOCAL DEV ONLY: race try-on -->
++									<button
++										type="button"
++										class="preview-overlay-btn"
++										disabled={!canAuthor || saving}
++										aria-label="Change Ethnicity"
++										onclick={() => {
++											racePickerOpen = true;
++										}}
++									>
++										<NavIcon name="characters" size={28} />
++										<span>Ethnicity</span>
++									</button>
++								{/if}
+ 							</div>
+ 							<div class="preview-wardrobe-right">
+ 								<button
+@@ -1439,6 +1642,16 @@
+ 	/>
+ </StudioPickerDialog>
+ 
++{#snippet newRaceOutfit(back: () => void)}
++	<NewRaceOutfitPanel
++		avatarId={editAvatarId}
++		race={newOutfitRace}
++		onBack={back}
++		onMade={addMadeOutfit}
++		onWear={wearMadeOutfit}
++	/>
++{/snippet}
++
+ <StudioPickerDialog
+ 	bind:open={clothesPickerOpen}
+ 	title="Change Clothes"
+@@ -1468,6 +1681,7 @@
+ 		bind:labelsEditorOpen={clothesLabelsEditorOpen}
+ 		onSelect={selectClothes}
+ 		onClose={closeClothesPicker}
++		createPanel={raceTryOnAvailable ? newRaceOutfit : undefined}
+ 		onClothesSaved={(id, option) => {
+ 			if (!generatedClothesOptions.some((row) => row.id === id)) {
+ 				generatedClothesOptions = [
+@@ -1553,21 +1767,65 @@
+ 	/>
+ </StudioPickerDialog>
+ 
++{#if raceTryOnAvailable}
++	<!-- LOCAL DEV ONLY: ethnicity try-on. Each tile is that ethnicity's base plate (white tee and blue jeans) with
++		the current hair on top. Picking one sets the ethnicity; its costumes are then made in this browser, and the
++		character's outfit switches to that ethnicity's version (kept only when the character is saved). -->
++	<StudioPickerDialog bind:open={racePickerOpen} title="Change Ethnicity" size="spacious">
++		{#snippet headerCenter()}
++			{#if selectedHairImage}
++				<AppearanceLayerToggle bind:checked={showHairOnClothes} label="Show hair" />
++			{/if}
++		{/snippet}
++		<AppearanceIdPicker
++			label="Ethnicity"
++			options={RACE_TRY_ON_RACES.map((race) => ({
++				id: race,
++				image: raceBasePlateUrl(race),
++				name: raceLabel(race) + (facePackForRace(editAvatarId, race) ? '' : ' · face not made yet')
++			}))}
++			selectedId={raceTryOn ? editEthnicity : ''}
++			disabled={!canAuthor || saving}
++			overlayImage={showHairOnClothes ? selectedHairImage : ''}
++			overlayPlacement="over"
++			onSelect={(race) => {
++				// the outfit worn, read before the face moves: the new pack wears the same outfit in the new ethnicity
++				const outfit = wornRaceOutfit;
++				const faceBefore = editAvatarId;
++				switchFaceToEthnicity(race);
++				const faceMoved = editAvatarId !== faceBefore;
++				if (race !== editEthnicity || faceMoved) refitHairToEthnicity(race);
++				if (faceMoved) dropHairTheFaceLacks();
++				editEthnicity = race;
++				racePickerOpen = false;
++				if (outfit) applyClothes(raceClothesId(editAvatarId, race, outfit));
++				// clothes the new face cannot wear (a costume of the old avatar's own) give way to the ethnicity's base outfit
++				else if (faceMoved && clothesId && raceOutfitList.length)
++					applyClothes(raceClothesId(editAvatarId, race, BASE_OUTFIT));
++			}}
++		/>
++	</StudioPickerDialog>
++{/if}
++
+ <StudioPickerDialog bind:open={hairPickerOpen} title="Change Hair" size="spacious">
+ 	{#snippet headerCenter()}
+-		{#if selectedClothesOption}
+-			<AppearanceLayerToggle bind:checked={showClothesOnHair} label="Show clothes" />
+-		{/if}
++		<div class="hair-header-tools">
++			{#if selectedClothesOption}
++				<AppearanceLayerToggle bind:checked={showClothesOnHair} label="Show clothes" />
++			{/if}
++		</div>
+ 	{/snippet}
+-	<AppearanceIdPicker
+-		label="Hair"
+-		options={hairOptions}
+-		selectedId={hairId}
++	<HairStylePicker
++		hairIds={offeredHairIds}
++		wornId={hairId}
++		avatarId={editAvatarId}
++		{cdnBaseUrl}
+ 		disabled={!canAuthor || saving}
+ 		overlayImage={showClothesOnHair ? (selectedClothesOption?.image ?? '') : ''}
+ 		overlayFallbackImage={showClothesOnHair ? (selectedClothesOption?.fallbackImage ?? '') : ''}
+ 		overlayPlacement="under"
+ 		onSelect={selectHair}
++		onRecolour={selectHairColour}
+ 	/>
+ </StudioPickerDialog>
+ 
+@@ -1647,6 +1905,13 @@
+ </StudioPickerDialog>
+ 
+ <style>
++	.hair-header-tools {
++		display: flex;
++		flex-wrap: wrap;
++		align-items: center;
++		justify-content: center;
++		gap: 0.5rem 1.25rem;
++	}
+ 	.page {
+ 		display: grid;
+ 		gap: 1.5rem;

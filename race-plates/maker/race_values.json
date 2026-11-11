@@ -1,0 +1,250 @@
+{
+ "east-asian": {
+  "values": [
+   -0.04,
+   -0.02,
+   0.09
+  ],
+  "target": {
+   "forearms": [
+    208.0,
+    148.0,
+    105.0
+   ],
+   "hands": [
+    208.0,
+    146.0,
+    104.0
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    4.2,
+    3.8,
+    2.4
+   ],
+   "hands": [
+    0.5,
+    -0.4,
+    -0.7
+   ]
+  }
+ },
+ "southeast-asian": {
+  "values": [
+   0.11,
+   0.24,
+   0.48
+  ],
+  "target": {
+   "forearms": [
+    195.0,
+    129.0,
+    82.0
+   ],
+   "hands": [
+    192.0,
+    122.0,
+    76.0
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    1.7,
+    -0.8,
+    -3.0
+   ],
+   "hands": [
+    2.6,
+    3.0,
+    2.8
+   ]
+  }
+ },
+ "mediterranean": {
+  "values": [
+   0.14,
+   0.25,
+   0.47
+  ],
+  "target": {
+   "forearms": [
+    191.0,
+    126.0,
+    81.0
+   ],
+   "hands": [
+    191.0,
+    123.0,
+    78.0
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    2.6,
+    1.2,
+    -1.3
+   ],
+   "hands": [
+    0.7,
+    1.2,
+    1.4
+   ]
+  }
+ },
+ "middle-eastern": {
+  "values": [
+   0.2,
+   0.31,
+   0.58
+  ],
+  "target": {
+   "forearms": [
+    187.0,
+    123.0,
+    74.0
+   ],
+   "hands": [
+    184.0,
+    117.0,
+    69.7
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    0.5,
+    -1.2,
+    -2.3
+   ],
+   "hands": [
+    2.0,
+    2.3,
+    2.6
+   ]
+  }
+ },
+ "north-african": {
+  "values": [
+   0.18,
+   0.31,
+   0.57
+  ],
+  "target": {
+   "forearms": [
+    187.0,
+    121.4,
+    74.0
+   ],
+   "hands": [
+    187.0,
+    118.0,
+    71.0
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    2.6,
+    0.4,
+    -1.6
+   ],
+   "hands": [
+    0.9,
+    1.3,
+    2.0
+   ]
+  }
+ },
+ "south-asian": {
+  "values": [
+   0.26,
+   0.5,
+   0.87
+  ],
+  "target": {
+   "forearms": [
+    176.0,
+    102.0,
+    52.0
+   ],
+   "hands": [
+    181.0,
+    104.0,
+    53.0
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    5.3,
+    2.5,
+    -1.5
+   ],
+   "hands": [
+    -0.4,
+    0.0,
+    1.1
+   ]
+  }
+ },
+ "indigenous": {
+  "values": [
+   0.27,
+   0.55,
+   0.82
+  ],
+  "target": {
+   "forearms": [
+    177.0,
+    100.0,
+    56.0
+   ],
+   "hands": [
+    180.0,
+    99.0,
+    55.0
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    3.3,
+    0.0,
+    -1.9
+   ],
+   "hands": [
+    -0.3,
+    1.1,
+    2.2
+   ]
+  }
+ },
+ "pacific-islander": {
+  "values": [
+   0.29,
+   0.5,
+   0.85
+  ],
+  "target": {
+   "forearms": [
+    174.0,
+    103.0,
+    53.0
+   ],
+   "hands": [
+    178.0,
+    104.0,
+    54.0
+   ]
+  },
+  "typical_result_minus_target": {
+   "forearms": [
+    4.3,
+    1.5,
+    -1.0
+   ],
+   "hands": [
+    -0.1,
+    0.0,
+    1.3
+   ]
+  }
+ }
+}

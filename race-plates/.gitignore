@@ -1,0 +1,7 @@
+node_modules
+.svelte-kit
+.DS_Store
+.env
+# pulled from the private bucket / made locally
+plates/
+out/
